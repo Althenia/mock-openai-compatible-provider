@@ -1,14 +1,14 @@
 # Source and rebuilding
 
 AIPassport is licensed under **AGPL-3.0-only**. The release's
-`aipass-browser-provider-1.0.1-complete-source.tar.gz` consolidates the application
+`aipass-browser-provider-0.1.1-complete-source.tar.gz` consolidates the application
 source archive, bundled-component source archives, license/notices, rebuilding
 instructions, installer, and offline checksums. Its nested
-`aipass-browser-provider-1.0.1-source.tar.gz` contains the application source,
+`aipass-browser-provider-0.1.1-source.tar.gz` contains the application source,
 locked dependency manifest, tests, and build/installation scripts from the exact
-release commit. The same commit is available through the `v1.0.1` Git tag.
+release commit. The same commit is available through the `v0.1.1` Git tag.
 The included `release.json` identifies that commit, version, compiler, and target.
-The existing `v0.1.0` release remains unchanged. Supporting files for `v1.0.1`
+The existing `v0.1.0` release remains unchanged. Supporting files for `v0.1.1`
 are inside its complete source bundle rather than separate release attachments.
 
 Keep this document, `LICENSE`, `THIRD_PARTY_NOTICES`, and corresponding source

@@ -1,4 +1,4 @@
-AIPassport v1.0.1 — third-party notices
+AIPassport v0.1.1 — third-party notices
 
 The project is AGPL-3.0-only. Third-party components retain their own licenses.
 The macOS arm64 executable embeds Bun 1.3.14 and playwright-core 1.62.1.
