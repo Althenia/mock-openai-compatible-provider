@@ -141,8 +141,9 @@ before use; a successful build does not erase the recorded live-model failures.
 The project is **AGPL-3.0-only**; see [LICENSE](LICENSE),
 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES), and [SOURCE.md](SOURCE.md) for
 third-party licenses and rebuilding/relinking. Notices are generated from
-identified upstream texts with `bun scripts/sync-notices.ts --webkit-source PATH`,
-where `PATH` is the accompanying WebKit source archive; `--check` compares without
+identified upstream texts with
+`bun scripts/sync-notices.ts --bun-source BUN_ARCHIVE --webkit-source WEBKIT_ARCHIVE`,
+using the accompanying Bun and WebKit source archives; `--check` compares without
 writing. Source archive checksums are pinned in
 `third-party/sources.sha256`. Never replace failed retrievals with placeholders.
 

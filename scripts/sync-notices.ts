@@ -3,10 +3,15 @@ import { readFile } from "node:fs/promises"
 import { createReadStream } from "node:fs"
 import { createHash } from "node:crypto"
 import { version } from "../package.json"
+import { rustNotices } from "./rust-notices.ts"
 
 const bunRef = "bun-v1.4.0"
 const webkitRef = "autobuild-0f966e81b78c84bb23213e391bc679c4ef83e56b"
 const raw = (repo: string, ref: string, path: string) => `https://raw.githubusercontent.com/${repo}/${ref}/${path}`
+const bunArchiveOption = process.argv.indexOf("--bun-source")
+const bunArchive = bunArchiveOption >= 0 ? process.argv[bunArchiveOption + 1] : undefined
+if (!bunArchive || bunArchive.startsWith("--"))
+  throw new Error("supply --bun-source PATH to the accompanying Bun source archive")
 const archiveOption = process.argv.indexOf("--webkit-source")
 const webkitArchive = archiveOption >= 0 ? process.argv[archiveOption + 1] : undefined
 if (!webkitArchive || webkitArchive.startsWith("--"))
@@ -65,12 +70,16 @@ const documents: [string, string, "header"?][] = [
 ]
 
 async function text(url: string) {
-  const prefix = raw("oven-sh/WebKit", webkitRef, "")
-  if (url.startsWith(prefix)) {
-    const path = `webkit-${webkitRef.slice("autobuild-".length)}/${url.slice(prefix.length)}`
-    const result = Bun.spawnSync(["tar", "-xOf", webkitArchive!, path])
-    if (result.exitCode !== 0 || result.stdout.length === 0) throw new Error(`source notice missing: ${path}`)
-    return result.stdout.toString()
+  for (const [prefix, archive, directory] of [
+    [raw("oven-sh/WebKit", webkitRef, ""), webkitArchive!, `webkit-${webkitRef.slice("autobuild-".length)}`],
+    [raw("oven-sh/bun", bunRef, ""), bunArchive!, `bun-${bunRef}`],
+  ] as const) {
+    if (url.startsWith(prefix)) {
+      const path = `${directory}/${url.slice(prefix.length)}`
+      const result = Bun.spawnSync(["tar", "-xOf", archive, path])
+      if (result.exitCode !== 0 || result.stdout.length === 0) throw new Error(`source notice missing: ${path}`)
+      return result.stdout.toString()
+    }
   }
   const response = await fetch(url, { signal: AbortSignal.timeout(30_000) })
   if (!response.ok) throw new Error(`upstream notice returned ${response.status}: ${url}`)
@@ -80,6 +89,7 @@ async function text(url: string) {
 }
 
 const license = await text("https://www.gnu.org/licenses/agpl-3.0.txt")
+const rust = await rustNotices(bunArchive)
 const sections = [
   `AIPassport v${version} — third-party notices\n\n` +
   "The project is AGPL-3.0-only. Third-party components retain their own licenses.\n" +
@@ -101,6 +111,7 @@ for (const [name, url, mode] of documents) {
   }
   sections.push(`\n${"=".repeat(78)}\n${name}\nSource: ${url}\n\n${value.trimEnd()}\n`)
 }
+sections.push(...rust.sections)
 const playwright = await Bun.file("node_modules/playwright-core/package.json").json()
 if (playwright.version !== "1.62.1") throw new Error("review notices before changing playwright-core")
 for (const name of ["LICENSE", "NOTICE", "ThirdPartyNotices.txt"]) {
@@ -115,4 +126,4 @@ if (process.argv.includes("--check")) {
   await Bun.write("LICENSE", license)
   await Bun.write("THIRD_PARTY_NOTICES", notices)
 }
-console.log(`Verified project license and ${documents.length + 3} upstream notice documents`)
+console.log(`Verified project license, ${documents.length + 3} upstream notice documents, and ${rust.crateCount} Rust registry crates`)

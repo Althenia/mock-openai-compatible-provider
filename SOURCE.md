@@ -38,6 +38,12 @@ corpora `JSTests`, `LayoutTests`, `ManualTests`, `PerformanceTests`,
 recreates that archive from the published upstream Git tag, since GitHub's
 archive endpoint rejects that repository.
 
+Rust registry crate sources are not vendored in Bun's Git archive. Each Rust
+registry section in `THIRD_PARTY_NOTICES` identifies its versioned `.crate`
+source-download URL and SHA-256 checksum from Bun's supplied `Cargo.lock`.
+Those archives provide the crate sources, including MPL-2.0 components such as
+`selectors`. Preserve these source-obtainment notices with redistributed binaries.
+
 The complete upstream repositories remain available at:
 
 - <https://github.com/oven-sh/bun/tree/bun-v1.4.0>
@@ -96,17 +102,28 @@ Full source is provided rather than an object-only relinking package.
 
 ## Updating notices
 
-The Bun 1.4.0 upgrade's macOS-arm64 Rust dependency notice inventory is not yet
-complete. The generator includes the individually verified rust-argon2 notices,
-but not the full production Rust crate dependency set, including bcrypt and
-getrandom. Complete that inventory before redistributing a Bun 1.4.0 executable.
-A successful `--check` verifies the listed documents, not inventory completeness.
+The Rust inventory includes every registry crate in Bun's pinned `Cargo.lock`,
+including transitive dependencies of `bcrypt`, `getrandom`, and the vendored
+`rust-argon2` and `lol_html` forks. This is a conservative cross-platform,
+build, and test dependency superset, not a claim that every listed crate is
+linked into the macOS executable. The two vendored forks retain their separately
+identified upstream license texts; Bun's own workspace crates use Bun's notices.
+Crate archives are verified against lockfile checksums before their original
+license and notice text is included. Unknown sources and missing license text
+stop generation rather than silently reducing the inventory.
+
+`third-party/rust-notice-supplements.json` records reviewed exceptions for exact
+crate versions whose license text is outside the usual archive paths. Each
+exception must match the crate's declared license and packaged Git revision.
+It identifies either an original archive member (`r-efi`'s `AUTHORS`) or a
+checksum-pinned upstream document. Repository documents use the crate's recorded
+revision; `selectors` uses the canonical MPL 2.0 text linked by its source header.
 
 `LICENSE` and `THIRD_PARTY_NOTICES` are generated from canonical/upstream text by
-`bun scripts/sync-notices.ts --webkit-source PATH`, with `PATH` pointing to the
-accompanying WebKit source archive; use `--check` to compare without writing. The
-archive is checksum-verified before its original notice text is read. The
-generator normalizes line endings and trailing whitespace, not license wording. Review
-the component inventory, source revisions, and `third-party/sources.sha256`
+`bun scripts/sync-notices.ts --bun-source BUN_ARCHIVE --webkit-source WEBKIT_ARCHIVE`,
+using the accompanying Bun and WebKit archives; use `--check` to compare without
+writing. Both source archives are checksum-verified. The generator normalizes
+line endings and trailing whitespace, not license wording. Review
+the component inventory, source revisions, notice supplements, and `third-party/sources.sha256`
 whenever the bundled runtime or dependencies change. Do not edit copyright or
 license text manually, and do not replace failed retrievals with placeholders.
