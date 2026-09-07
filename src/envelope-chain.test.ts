@@ -199,6 +199,14 @@ describe("envelope-chain upgrade", () => {
     ]);
   });
 
+  test("default bare-chain parsing preserves legacy prose without dispatching unoffered actions", () => {
+    const shim = new TypedEnvelopeShim(new Set(["read"]));
+    const chain = JSON.stringify({ type: "thinking", key: "k", text: "r1" }) + "\n" +
+      JSON.stringify({ type: "tool", key: "k", name: "unoffered", input: {} });
+    expect(shim.push(chain)).toEqual([]);
+    expect(shim.finish()).toEqual([{ type: "text", delta: chain }]);
+  });
+
   test("start prompt carries full name index but budgets schemas (stall guard)", () => {
     const tools = ["read", "glob", "grep", "shell", "write", "edit", "question"].map((name) => ({
       type: "function" as const,
@@ -244,11 +252,11 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(14);
+    expect(PROMPT_CONTRACT_VERSION).toBe(15);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(14);
+    expect(parsed.turn.promptContractVersion).toBe(15);
   });
 });

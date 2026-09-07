@@ -40,10 +40,27 @@ EOF
 make_release v0.1.0 0.1.0
 make_release v0.2.0 0.2.0
 make_release v0.3.0 0.3.0
+make_release v0.5.0 0.5.0
+make_release v0.6.0 0.6.0
+make_release v0.7.0 0.7.0
+make_release v0.8.0 0.8.0
+make_release v0.9.0 0.9.0
 printf '%064d  %s\n' 0 "$asset" > "$work/releases/v0.3.0/checksums.txt"
 mkdir -p "$work/releases/v0.4.0"
 printf '#!/bin/sh\nexit 1\n' > "$work/releases/v0.4.0/$asset"
 printf '%s  %s\n' "$(checksum "$work/releases/v0.4.0/$asset")" "$asset" > "$work/releases/v0.4.0/checksums.txt"
+
+for directory in "$work/releases/"*; do
+  version=${directory##*/}
+  digest=$(awk '{print $1}' "$directory/checksums.txt")
+  printf '{"tag_name":"%s","assets":[{"name":"unrelated","state":"uploaded","digest":null},{"name":"%s","state":"uploaded","digest":"sha256:%s"}]}\n' \
+    "$version" "$asset" "$digest" > "$directory/metadata.json"
+done
+printf '{"tag_name":"v0.5.0","assets":[{"name":"%s","state":"uploaded","digest":null}]}\n' "$asset" > "$work/releases/v0.5.0/metadata.json"
+printf 'invalid JSON\n' > "$work/releases/v0.6.0/metadata.json"
+printf '{"tag_name":"v0.7.0","assets":[]}\n' > "$work/releases/v0.7.0/metadata.json"
+printf '{"tag_name":"v9.9.9","assets":[]}\n' > "$work/releases/v0.8.0/metadata.json"
+rm "$work/releases/v0.9.0/$asset"
 
 cat > "$work/bin/curl" <<'EOF'
 #!/bin/sh
@@ -70,6 +87,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$url" in
+  https://api.github.com/repos/owner/repository/releases/tags/*)
+    version=${url##*/}
+    cp "$FAKE_RELEASES_ROOT/$version/metadata.json" "$output"
+    ;;
   */releases/latest)
     [ -n "$write_out" ] || exit 2
     printf '%s/releases/tag/%s' "$FAKE_REPOSITORY_URL" "$FAKE_LATEST_VERSION"
@@ -79,6 +100,7 @@ case "$url" in
     version=${relative%%/*}
     file=${relative#*/}
     [ -n "$output" ] || exit 2
+    [ "$file" != checksums.txt ] || exit 22
     cp "$FAKE_RELEASES_ROOT/$version/$file" "$output"
     ;;
   *) exit 22 ;;
@@ -105,8 +127,8 @@ run_installer_at() {
     AIPASS_INSTALL_DIR="$destination" \
     FAKE_LATEST_VERSION="$latest" \
     FAKE_RELEASES_ROOT="$work/releases" \
-    FAKE_REPOSITORY_URL="https://github.test/owner/repository" \
-    AIPASS_REPOSITORY_URL="https://github.test/owner/repository" \
+    FAKE_REPOSITORY_URL="https://github.com/owner/repository" \
+    AIPASS_REPOSITORY_URL="https://github.com/owner/repository" \
     sh -s -- "$@" < "$installer"
 }
 
@@ -161,6 +183,17 @@ if run_installer v0.4.0 --version v0.4.0 >/dev/null 2>&1; then
 fi
 [ "$("$work/install dir/aipass-browser-provider")" = "0.2.0" ] || fail "help-check failure replaced the installed binary"
 
+for version in 0.5.0 0.6.0 0.7.0 0.8.0 0.9.0; do
+  if run_installer "v$version" --version "$version" >/dev/null 2>&1; then
+    fail "invalid metadata or missing executable was accepted for $version"
+  fi
+  [ "$("$work/install dir/aipass-browser-provider")" = "0.2.0" ] || fail "failed metadata/download replaced the installed binary"
+done
+if (FAKE_CURL_FAIL=1 run_installer v0.2.0 --version 0.2.0 >/dev/null 2>&1); then
+  fail "failed metadata retrieval was accepted"
+fi
+[ "$("$work/install dir/aipass-browser-provider")" = "0.2.0" ] || fail "network failure replaced the installed binary"
+
 if run_installer v0.2.0 --version ../unsafe >/dev/null 2>&1; then
   fail "unsafe version was accepted"
 fi
@@ -176,8 +209,8 @@ if env \
   FAKE_UNAME_M=x86_64 \
   FAKE_LATEST_VERSION=v0.2.0 \
   FAKE_RELEASES_ROOT="$work/releases" \
-  FAKE_REPOSITORY_URL="https://github.test/owner/repository" \
-  AIPASS_REPOSITORY_URL="https://github.test/owner/repository" \
+  FAKE_REPOSITORY_URL="https://github.com/owner/repository" \
+  AIPASS_REPOSITORY_URL="https://github.com/owner/repository" \
   sh -s -- < "$installer" >/dev/null 2>&1; then
   fail "unsupported platform was accepted"
 fi

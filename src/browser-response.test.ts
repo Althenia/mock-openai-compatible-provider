@@ -20,6 +20,101 @@ const completed: Parameters<BrowserResponse<BrowserFrame>["confirm"]>[0] = {
 }
 
 describe("browser response completion", () => {
+  test("publishes only append-only attributed thinking suffixes with bounded accounting", () => {
+    const response = new BrowserResponse(protocol)
+    const snapshot = { ...completed, complete: false, settled: false, text: "", attributed: true, thinking: [{ title: "Check", body: "Visible" }] }
+    expect(response.progress({ ...snapshot, attributed: false }, "turn")).toEqual([])
+    expect(response.progress(snapshot, "")).toEqual([])
+    expect(response.progress(snapshot, "turn")).toEqual([{ type: "reasoning", delta: "Check\nVisible", domTurnKey: "turn" }])
+    expect(response.progress(snapshot, "turn")).toEqual([])
+    expect(response.progress({ ...snapshot, thinking: [] }, "turn")).toEqual([])
+    expect(response.progress({ ...snapshot, thinking: [{ title: "Renamed", body: "revised" }] }, "turn")).toEqual([])
+    const thinking = [{ title: "Check", body: "Visible summary." }, { title: "Next", body: "Second." }]
+    expect(response.progress({ ...snapshot, thinking }, "turn")).toEqual([{ type: "reasoning", delta: " summary.\n\nNext\nSecond.", domTurnKey: "turn" }])
+    response.push(wire({ type: "reasoning-delta", delta: "duplicate native summary" }))
+    expect(response.confirm({ ...completed, attributed: true, thinking }, 1)).toEqual([
+      { type: "text", delta: "confirmed answer" }, { type: "finish", reason: "stop" },
+    ])
+    expect(response.outputEstimate).toBe(estimateTokens("Check\nVisible summary.\n\nNext\nSecond.") + estimateTokens(completed.text))
+    expect(response.progress({ ...snapshot, thinking }, "turn")).toEqual([])
+  })
+
+  test("includes only the final residual DOM reasoning once", () => {
+    const response = new BrowserResponse(protocol)
+    response.progress({ ...completed, attributed: true, thinking: [{ title: "", body: "Visible" }] }, "turn")
+    expect(response.confirm({ ...completed, attributed: true, thinking: [{ title: "", body: "Visible summary." }] }, 1)).toEqual([
+      { type: "reasoning", delta: " summary.", domTurnKey: "turn" },
+      { type: "text", delta: "confirmed answer" }, { type: "finish", reason: "stop" },
+    ])
+    expect(response.outputEstimate).toBe(estimateTokens("Visible summary.") + estimateTokens(completed.text))
+  })
+
+  for (const tagged of [false, true]) test(`counts semantic captured ${tagged ? "tagged" : "bare"} output without charging DOM reasoning twice`, () => {
+    const response = new BrowserResponse(protocol)
+    const thought = "Visible summary. ".repeat(20).trim()
+    response.progress({ ...completed, attributed: true, thinking: [{ title: "", body: thought }] }, "turn")
+    const values = [{ type: "thinking", key: "turn", text: thought }, { type: "chat", key: "turn", text: "Answer." }]
+    const chain = values.map(value => tagged ? `<aipass-envelope>${JSON.stringify(value)}</aipass-envelope>` : JSON.stringify(value)).join("")
+    response.push(wire({ type: "text-delta", delta: chain.slice(0, 20) }))
+    response.push(wire({ type: "text-delta", delta: chain.slice(20) }))
+    const frames = response.finish()
+    expect(frames.filter(frame => frame.type === "text").map(frame => frame.delta).join("")).toBe(chain)
+    expect(frames.at(-1)).toEqual({ type: "finish", reason: "stop" })
+    expect(response.outputEstimate).toBe(estimateTokens(thought) + estimateTokens("Answer."))
+  })
+
+  for (const action of [
+    { type: "tool", name: "read", input: { path: "fixture.txt" } },
+    { type: "plan", steps: [{ name: "read", input: { path: "fixture.txt" } }] },
+  ]) test(`keeps ${action.type} argument accounting after DOM reasoning`, () => {
+    const response = new BrowserResponse(protocol)
+    response.progress({ ...completed, attributed: true, thinking: [{ title: "", body: "Visible." }] }, "turn")
+    const text = `<aipass-envelope>${JSON.stringify({ ...action, key: "turn", id: "read_1" })}</aipass-envelope>`
+    response.push(wire({ type: "text", delta: text }))
+    expect(response.finish()).toEqual([{ type: "text", delta: text }, { type: "finish", reason: "stop" }])
+    expect(response.outputEstimate).toBe(estimateTokens("Visible.") + estimateTokens('read{"path":"fixture.txt"}'))
+  })
+
+  test("passive accounting leaves malformed actions for runtime rejection", () => {
+    const response = new BrowserResponse(protocol)
+    response.progress({ ...completed, attributed: true, thinking: [{ title: "", body: "Visible." }] }, "turn")
+    const text = '<aipass-envelope>{"type":"tool","key":"turn","name":"read","input":"invalid"}</aipass-envelope>'
+    response.push(wire({ type: "text", delta: text }))
+    expect(response.finish()).toEqual([{ type: "text", delta: text }, { type: "finish", reason: "stop" }])
+    expect(response.outputEstimate).toBe(estimateTokens("Visible.") + estimateTokens(text))
+  })
+
+  test("preserves raw per-frame context accounting when no DOM reasoning was streamed", () => {
+    const response = new BrowserResponse(protocol)
+    const text = '<aipass-envelope>{"type":"chat","key":"turn","text":"Answer."}</aipass-envelope>'
+    const parts = [text.slice(0, 7), text.slice(7)]
+    for (const delta of parts) response.push(wire({ type: "text", delta }))
+    expect(response.finish()).toEqual([...parts.map(delta => ({ type: "text" as const, delta })), { type: "finish", reason: "stop" }])
+    expect(response.outputEstimate).toBe(parts.reduce((sum, part) => sum + estimateTokens(part), 0))
+  })
+
+  test("retains native completion while attributed DOM suffixes are still arriving", () => {
+    const response = new BrowserResponse(protocol)
+    const snapshot = { ...completed, attributed: true, thinking: [{ title: "", body: "Visible" }] }
+    response.progress(snapshot, "turn")
+    const text = '<aipass-envelope>{"type":"chat","key":"turn","text":"Answer."}</aipass-envelope>'
+    response.push(wire({ type: "reasoning", delta: "Visible summary." }) + wire({ type: "text", delta: text }))
+    expect(response.finish(0, true)).toEqual([])
+    expect(response.progress({ ...snapshot, thinking: [{ title: "", body: "Visible summary." }] }, "turn")).toEqual([
+      { type: "reasoning", delta: " summary.", domTurnKey: "turn" },
+    ])
+    expect(response.finish()).toEqual([{ type: "text", delta: text }, { type: "finish", reason: "stop" }])
+    expect(response.outputEstimate).toBe(estimateTokens("Visible summary.") + estimateTokens("Answer."))
+    expect(response.finish()).toEqual([])
+  })
+
+  test("does not retain a native terminal envelope when no DOM reasoning started", () => {
+    const response = new BrowserResponse(protocol)
+    const text = '<aipass-envelope>{"type":"chat","key":"turn","text":"Answer."}</aipass-envelope>'
+    response.push(wire({ type: "text", delta: text }))
+    expect(response.finish(0, true)).toEqual([{ type: "text", delta: text }, { type: "finish", reason: "stop" }])
+  })
+
   test("does not mix partial native records with a sibling JSON response", () => {
     const response = new BrowserResponse(protocol)
     const native = wire({ type: "reasoning-delta", delta: "native reasoning ไทย" })

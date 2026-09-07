@@ -5,7 +5,7 @@ import { basename, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright-core"
 import { estimateTokens } from "./context.ts"
-import { INSTRUCTION_DIGEST_PREFIX_LENGTH, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
+import { INSTRUCTION_DIGEST_PREFIX_LENGTH, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
 
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "max"
 
@@ -66,6 +66,7 @@ export interface TurnAttachment {
 
 const ATTACHMENT_STAGE_CAP = 15_000_000
 const THINKING_REVEAL_TIMEOUT_MS = 2_000
+const DOM_STABILITY_MS = 4_000
 
 export function safeAttachmentBasename(name?: string, index = 0) {
   const raw = basename(name ?? "")
@@ -555,9 +556,24 @@ export class BrowserResponse<Frame extends BrowserFrame> {
   private readonly streams = new Map<number, { decoder: FrameDecoder<Frame>; hasText: boolean; finished: boolean }>()
   private readonly frames: Frame[] = []
   private completed = false
+  private domThinking = ""
+  private domTurnKey: string | undefined
   outputEstimate = 0
 
   constructor(private readonly protocol: BrowserProtocol<Frame>) {}
+
+  progress(completion: DomCompletion, turnKey: string): readonly Frame[] {
+    if (this.completed || !completion.attributed || !turnKey || !this.protocol.reasoning) return []
+    const text = completion.thinking.map(formatThinkingSegment).join("\n\n")
+    // SSE cannot retract content. Ignore DOM rewrites/remounts until the
+    // original prefix reappears; never replay a revised or repeated panel.
+    if (!text.startsWith(this.domThinking) || text.length <= this.domThinking.length) return []
+    const delta = text.slice(this.domThinking.length)
+    this.outputEstimate += estimateTokens(text) - estimateTokens(this.domThinking)
+    this.domThinking = text
+    this.domTurnKey = turnKey
+    return [{ ...this.protocol.reasoning(delta), domTurnKey: turnKey }]
+  }
 
   push(chunk: string, responseID = 0): readonly Frame[] {
     if (this.completed) return []
@@ -570,14 +586,22 @@ export class BrowserResponse<Frame extends BrowserFrame> {
     return []
   }
 
-  finish(responseID = 0): readonly Frame[] {
+  finish(responseID = 0, deferDomThinking = false): readonly Frame[] {
     if (this.completed) return []
     const stream = this.streams.get(responseID)
-    if (!stream || stream.finished) return []
-    this.append(stream.decoder.finish(), stream)
-    stream.finished = true
+    if (!stream) return []
+    if (!stream.finished) {
+      this.append(stream.decoder.finish(), stream)
+      stream.finished = true
+    }
     const textPending = [...this.streams.values()].some((item) => item.hasText && !item.finished)
-    return stream.hasText && !textPending && this.hasCapturedTerminalEnvelope() ? this.publishCapturedFrames() : []
+    return stream.hasText && !textPending && this.hasCapturedTerminalEnvelope() && !(deferDomThinking && this.domTurnKey)
+      ? this.publishCapturedFrames() : []
+  }
+
+  get pendingDomCompletion(): boolean {
+    return !this.completed && !!this.domTurnKey && this.hasCapturedTerminalEnvelope() &&
+      ![...this.streams.values()].some(stream => stream.hasText && !stream.finished)
   }
 
   confirm(completion: DomCompletion, baseline: number): readonly Frame[] {
@@ -592,7 +616,9 @@ export class BrowserResponse<Frame extends BrowserFrame> {
   }
 
   private publishDomCompletion(completion: DomCompletion): readonly Frame[] {
-    const reasoning = completion.thinking.length
+    const reasoning = this.domTurnKey
+      ? this.progress(completion, this.domTurnKey)
+      : completion.thinking.length
       ? completion.thinking.flatMap((segment) => {
           const delta = formatThinkingSegment(segment)
           return delta && this.protocol.reasoning ? [this.protocol.reasoning(delta)] : []
@@ -638,10 +664,14 @@ export class BrowserResponse<Frame extends BrowserFrame> {
 
   private publish(frames: Frame[]): readonly Frame[] {
     this.completed = true
+    if (this.domTurnKey) frames = frames.filter((frame) => frame.type !== "reasoning" || frame.domTurnKey === this.domTurnKey)
+    let text = ""
     for (const frame of frames) {
-      if (frame.type === "text" || frame.type === "reasoning") this.outputEstimate += estimateTokens(frame.delta)
+      if (frame.type === "text" && this.domTurnKey) text += frame.delta
+      else if (frame.type === "text" || (frame.type === "reasoning" && !frame.domTurnKey)) this.outputEstimate += estimateTokens(frame.delta)
       else if (frame.type === "tool-call") this.outputEstimate += estimateTokens(JSON.stringify(frame.input))
     }
+    if (this.domTurnKey) this.outputEstimate += estimateCapturedTextTokens(text)
     return frames
   }
 }
@@ -1255,6 +1285,12 @@ class CaptureQueue {
     for (const waiter of this.waiters.splice(0)) waiter.resolve(undefined)
   }
 
+  hasPendingSelected(accepted: ReadonlySet<number>) {
+    return this.stopped || this.events.some(event => event.type === "response"
+      ? event.selected && event.bodyPresent
+      : event.type !== "dom" && accepted.has(event.responseID))
+  }
+
   next(options: { readonly signal?: AbortSignal; readonly timeoutMs?: number } = {}) {
     const event = this.events.shift()
     if (event) return Promise.resolve(event)
@@ -1289,6 +1325,7 @@ class CaptureQueue {
 export interface ActivePageCapture {
   readonly generation: string
   next(options?: { readonly signal?: AbortSignal; readonly timeoutMs?: number }): Promise<CaptureEvent | undefined>
+  hasPendingSelected(accepted: ReadonlySet<number>): boolean
   cleanup(): Promise<void>
 }
 
@@ -1337,6 +1374,7 @@ export class PageStreamCapture {
     return {
       generation,
       next: (options) => queue.next(options),
+      hasPendingSelected: (accepted) => queue.hasPendingSelected(accepted),
       cleanup: async () => {
         if (!live) return
         live = false
@@ -1714,6 +1752,7 @@ interface DomCompletion {
   readonly text: string
   readonly settled: boolean
   readonly thinking: readonly { readonly title: string; readonly body: string }[]
+  readonly attributed?: boolean
 }
 
 export function isSettledResponse(input: { complete: boolean; text: string; settled: boolean }): boolean {
@@ -1752,7 +1791,7 @@ export function formatThinkingSegment(segment: { readonly title: string; readonl
   return segment.title ? `${segment.title}\n${segment.body}` : segment.body
 }
 
-function readDomSnapshotValue() {
+function readDomSnapshotValue(attribution?: { generation: string; baseline: number }) {
     const primary = [...document.querySelectorAll('[data-role="assistant"]')]
     const assistants = primary.length
       ? primary
@@ -1760,10 +1799,14 @@ function readDomSnapshotValue() {
         ? [...document.querySelectorAll('[data-message-author-role="assistant"]')]
         : [...document.querySelectorAll('[data-testid*="assistant" i], [data-testid*="bot" i]')]
     const latest = assistants.at(-1)
+    const attributed = !!attribution && assistants.length === attribution.baseline + 1 &&
+      (globalThis as unknown as Record<string, unknown>).__aipassStreamGeneration === attribution.generation
+    if (attribution && !attributed)
+      return { assistantCount: assistants.length, complete: false, text: "", settled: false, rawThinking: [], thinkingReveal: false, attributed: false }
     const thinkingRoots = (scope: ParentNode) =>
       [...scope.querySelectorAll('[data-no-copy="true"] > [data-slot="collapsible"]')].filter((root) => {
         const trigger = root.querySelector('[data-slot="collapsible-trigger"][aria-expanded]') as HTMLElement | null
-        return !!trigger && /ประมวลผล|thinking|reasoning/i.test((trigger.innerText ?? trigger.textContent ?? "").trim())
+        return !!trigger && /ประมวลผล|\b(?:thinking|thought|reasoning|processing|processed)\b/i.test((trigger.innerText ?? trigger.textContent ?? "").trim())
       })
     let thinkingReveal = false
     if (latest) {
@@ -1775,18 +1818,21 @@ function readDomSnapshotValue() {
       }
     }
     const rawThinking: { title: string; body: string }[] = []
+    const visible = (element: Element) => element.getClientRects().length > 0 && getComputedStyle(element).visibility === "visible"
     try {
       if (latest) {
         for (const root of thinkingRoots(latest)) {
           if (rawThinking.length >= 8) break
           const panel = root.querySelector('[data-slot="collapsible-content"]')
-          if (!panel) continue
-          let current: { title: string; body: string[] } | undefined
+          if (!panel || !visible(panel)) continue
+          let current: { title: string; body: string } | undefined
           const append = () => {
-            if (!current || current.body.length === 0 || rawThinking.length >= 8) return
-            rawThinking.push({ title: current.title, body: current.body.join("\n") })
+            if (!current?.body || rawThinking.length >= 8) return
+            rawThinking.push(current)
           }
-          for (const paragraph of [...panel.querySelectorAll("p")]) {
+          for (const paragraph of panel.querySelectorAll("p")) {
+            if (rawThinking.length >= 8) break
+            if (!visible(paragraph)) continue
             const children = [...paragraph.children]
             const hasBodyText = [...paragraph.childNodes].some((node) =>
               node.nodeType === Node.TEXT_NODE && (node.textContent ?? "").trim().length > 0,
@@ -1794,16 +1840,17 @@ function readDomSnapshotValue() {
             const titleChild = !hasBodyText && children.length === 1 && children[0]?.getAttribute("data-streamdown") === "strong"
               ? children[0] as HTMLElement
               : undefined
-            const title = titleChild ? (titleChild.innerText ?? titleChild.textContent ?? "").trim() : ""
+            const title = titleChild ? (titleChild.innerText ?? titleChild.textContent ?? "").trim().slice(0, 200) : ""
             if (title) {
               append()
-              current = { title, body: [] }
+              current = { title, body: "" }
               continue
             }
-            const body = ((paragraph as HTMLElement).innerText ?? paragraph.textContent ?? "").trim()
+            if (current && current.body.length >= 2000) continue
+            const body = ((paragraph as HTMLElement).innerText ?? paragraph.textContent ?? "").trim().slice(0, 2000)
             if (!body) continue
-            if (!current) current = { title: "", body: [] }
-            current.body.push(body)
+            if (!current) current = { title: "", body: "" }
+            current.body = `${current.body}${current.body ? "\n" : ""}${body}`.slice(0, 2000)
           }
           append()
         }
@@ -1811,6 +1858,8 @@ function readDomSnapshotValue() {
     } catch {
       rawThinking.length = 0
     }
+    if (attribution)
+      return { assistantCount: assistants.length, complete: false, text: "", settled: false, rawThinking, thinkingReveal, attributed }
     const answer = latest?.cloneNode(true) as HTMLElement | undefined
     if (answer) for (const root of thinkingRoots(answer)) root.remove()
     let text = ""
@@ -1851,7 +1900,7 @@ function readDomSnapshotValue() {
       const dislikes = matchingButtons("M16.1898 12.75H18.1898")
       settled = likes.some((like) => dislikes.some((dislike) => like !== dislike))
     }
-    return { assistantCount: assistants.length, complete, text, settled, rawThinking, thinkingReveal }
+    return { assistantCount: assistants.length, complete, text, settled, rawThinking, thinkingReveal, attributed }
 }
 
 function thinkingContentMounted() {
@@ -1862,15 +1911,20 @@ function thinkingContentMounted() {
   if (!latest) return false
   const roots = [...latest.querySelectorAll('[data-no-copy="true"] > [data-slot="collapsible"]')].filter((root) => {
     const trigger = root.querySelector('[data-slot="collapsible-trigger"][aria-expanded]') as HTMLElement | null
-    return !!trigger && /ประมวลผล|thinking|reasoning/i.test((trigger.innerText ?? trigger.textContent ?? "").trim())
+    return !!trigger && /ประมวลผล|\b(?:thinking|thought|reasoning|processing|processed)\b/i.test((trigger.innerText ?? trigger.textContent ?? "").trim())
   })
   return roots.length > 0 && roots.every((root) => root.querySelectorAll('[data-slot="collapsible-content"] p').length > 0)
 }
 
-export async function readDomSnapshot(page: Page, signal?: AbortSignal): Promise<DomCompletion> {
+export async function readDomSnapshot(
+  page: Page,
+  signal?: AbortSignal,
+  attribution?: { generation: string; baseline: number },
+): Promise<DomCompletion> {
   aborted(signal)
-  let snapshot = await page.evaluate(readDomSnapshotValue)
-  if (snapshot.thinkingReveal) {
+  let snapshot = await abortable(page.evaluate(readDomSnapshotValue, attribution), signal)
+  aborted(signal)
+  if (snapshot.thinkingReveal && !attribution) {
     try {
       aborted(signal)
       await abortable(page.waitForFunction(thinkingContentMounted, undefined, { timeout: THINKING_REVEAL_TIMEOUT_MS }), signal)
@@ -1878,7 +1932,8 @@ export async function readDomSnapshot(page: Page, signal?: AbortSignal): Promise
       if (error instanceof BrowserTurnAbortedError) throw error
     }
     aborted(signal)
-    snapshot = await page.evaluate(readDomSnapshotValue)
+    snapshot = await abortable(page.evaluate(readDomSnapshotValue, attribution), signal)
+    aborted(signal)
   }
   let thinking: { title: string; body: string }[]
   try {
@@ -1896,6 +1951,7 @@ export async function readDomSnapshot(page: Page, signal?: AbortSignal): Promise
     text: snapshot.text,
     settled: snapshot.settled,
     thinking,
+    attributed: snapshot.attributed,
   }
 }
 
@@ -1908,7 +1964,7 @@ export async function readDomCompletion(page: Page, signal?: AbortSignal): Promi
   const first = await readDomSnapshot(page, signal)
   if (first.assistantCount === 0 || !first.complete || !first.settled || !first.text.trim())
     return { ...first, complete: false }
-  await abortable(new Promise<void>((resolve) => setTimeout(resolve, 4000)), signal)
+  await abortable(new Promise<void>((resolve) => setTimeout(resolve, DOM_STABILITY_MS)), signal)
   const second = await readDomSnapshot(page, signal)
   if (
     !second.complete ||
@@ -2342,16 +2398,51 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         return frames
       }
 
+      let nextThinkingAt = performance.now()
+      let thinkingChangedAt = performance.now()
+      let thinkingSnapshot: DomCompletion | undefined
+      let pendingFinish: number | undefined
+      let thinkingSettleDeadline = Infinity
+      const readProgress = async (): Promise<readonly Frame[]> => {
+        nextThinkingAt = performance.now() + 250
+        if (!input.promptKey || accepted.size === 0) return []
+        const snapshot = await readDomSnapshot(page!, signal, { generation: capture!.generation, baseline })
+        if (!sameThinkingSegments(snapshot.thinking, thinkingSnapshot?.thinking ?? [])) thinkingChangedAt = performance.now()
+        thinkingSnapshot = snapshot
+        const frames = response.progress(snapshot, input.promptKey)
+        if (frames.length) idleDeadline = performance.now() + effectiveIdleTimeout(this.config)
+        return frames
+      }
+
       while (true) {
+        const sampled = performance.now() >= nextThinkingAt
+        if (sampled) yield* await readProgress()
         const now = performance.now()
+        if (pendingFinish !== undefined) {
+          if (now >= thinkingSettleDeadline) throw new Error("browser thinking panel did not stabilize")
+          if (!thinkingSnapshot?.attributed) throw new Error("browser thinking panel lost turn attribution")
+          // Selected events must be drained before completion, but unrelated
+          // traffic cannot prevent publication of a freshly sampled stable panel.
+          if (sampled && response.pendingDomCompletion && now - thinkingChangedAt >= DOM_STABILITY_MS && !capture.hasPendingSelected(accepted)) {
+            for (const frame of response.finish(pendingFinish)) {
+              terminal ||= this.protocol.isTerminal(frame)
+              yield frame
+            }
+            if (terminal) break
+          }
+        }
         const evidenceDeadline = submittedAt + evidenceTimeoutMs
-        const wakeAt = evidenceChecked ? idleDeadline : Math.min(idleDeadline, evidenceDeadline)
+        const deadline = pendingFinish !== undefined ? thinkingSettleDeadline : evidenceChecked ? idleDeadline : Math.min(idleDeadline, evidenceDeadline)
+        const wakeAt = input.promptKey && accepted.size > 0 ? Math.min(deadline, nextThinkingAt) : deadline
         let event: CaptureEvent | undefined
         try {
           event = await capture.next({ signal, timeoutMs: Math.max(0, wakeAt - now) })
         } catch (error) {
           if (!(error instanceof BrowserCaptureTimeoutError)) throw error
+          if (pendingFinish !== undefined) continue
+          if (performance.now() < deadline) continue
           const completion = await readDomCompletion(page, signal)
+          yield* await readProgress()
           currentAssistantCount = completion.assistantCount
           if (completion.complete && completion.assistantCount > baseline && completion.text) {
             yield* emitFallback(completion)
@@ -2410,8 +2501,10 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         idleDeadline = performance.now() + effectiveIdleTimeout(this.config)
         if (event.type === "dom") {
           currentAssistantCount = event.assistantCount
+          if (pendingFinish !== undefined) continue
           if (event.complete && event.assistantCount > baseline && event.text) {
             const completion = await readDomCompletion(page, signal)
+            yield* await readProgress()
             currentAssistantCount = completion.assistantCount
             if (!completion.complete || completion.assistantCount <= baseline || !completion.text) continue
             yield* emitFallback(completion)
@@ -2425,12 +2518,24 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
           response.push(event.chunk, event.responseID)
           continue
         }
-        for (const frame of response.finish(event.responseID)) {
+        yield* await readProgress()
+        const finishedFrames = response.finish(event.responseID, true)
+        if (response.pendingDomCompletion && pendingFinish === undefined) {
+          // Native completion can precede the final React render. Keep
+          // processing capture events and attributed DOM suffixes through
+          // the bounded stability window, never copying unseen native text.
+          pendingFinish = event.responseID
+          thinkingChangedAt = performance.now()
+          thinkingSettleDeadline = thinkingChangedAt + effectiveIdleTimeout(this.config)
+        }
+        for (const frame of finishedFrames) {
           terminal ||= this.protocol.isTerminal(frame)
           yield frame
         }
+        if (pendingFinish !== undefined) continue
         if (!terminal) {
           const completion = await readDomCompletion(page, signal)
+          yield* await readProgress()
           currentAssistantCount = completion.assistantCount
           if (completion.complete && completion.assistantCount > baseline && completion.text) {
             yield* emitFallback(completion)

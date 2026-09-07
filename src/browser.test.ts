@@ -261,6 +261,27 @@ class FakeCapturePage implements CaptureTransport {
 }
 
 describe("fetch capture lifecycle", () => {
+  test("completion waits for selected queued events, not unrelated traffic, and cannot accept a stopped capture", async () => {
+    const page = new FakeCapturePage()
+    const installed = await PageStreamCapture.install(page, {})
+    const active = await installed.activate(0)
+    const accepted = new Set<number>()
+    await page.emit({ generation: active.generation, responseID: 2, type: "error", message: "unrelated" })
+    expect(active.hasPendingSelected(accepted)).toBe(false)
+    await page.emit({ generation: active.generation, type: "response", matched: true, bodyPresent: true, contentType: "sse" })
+    expect(active.hasPendingSelected(accepted)).toBe(true)
+    expect(await active.next()).toMatchObject({ responseID: 2, type: "error" })
+    expect(await active.next()).toMatchObject({ responseID: 1, type: "response" })
+    expect(active.hasPendingSelected(accepted)).toBe(false)
+    accepted.add(1)
+    await page.emit({ generation: active.generation, type: "error", message: "selected failure" })
+    expect(active.hasPendingSelected(accepted)).toBe(true)
+    expect(await active.next()).toMatchObject({ responseID: 1, type: "error", message: "selected failure" })
+    expect(active.hasPendingSelected(accepted)).toBe(false)
+    await active.cleanup()
+    expect(active.hasPendingSelected(accepted)).toBe(true)
+  })
+
   test("preserves response identity without ending the generation on a sibling error", async () => {
     const page = new FakeCapturePage()
     const installed = await PageStreamCapture.install(page, {})

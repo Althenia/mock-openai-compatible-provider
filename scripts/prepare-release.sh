@@ -7,6 +7,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 destination=${1:-release}
 sources=${2:-}
+[ ! -e "$destination" ] || { echo 'release destination already exists' >&2; exit 1; }
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]
 [ "$(bun --version)" = 1.3.14 ]
 version=$(bun -p 'require("./package.json").version')
@@ -25,28 +26,29 @@ bun run build
 dist/aipass-browser-provider help >/dev/null
 file dist/aipass-browser-provider | grep -q 'Mach-O 64-bit executable arm64'
 for file in LICENSE THIRD_PARTY_NOTICES SOURCE.md "docs/releases/v$version.md"; do test -s "$file"; done
-mkdir "$destination"
-destination=$(cd "$destination" && pwd)
-cp dist/aipass-browser-provider "$destination/aipass-browser-provider-darwin-arm64"
-cp LICENSE THIRD_PARTY_NOTICES SOURCE.md "$destination/"
-cp site/install.sh "$destination/install.sh"
+assets=$(mktemp -d "${TMPDIR:-/tmp}/aipass-release-assets.XXXXXX")
+trap 'rm -rf "$assets"' EXIT
+cp dist/aipass-browser-provider "$assets/aipass-browser-provider-darwin-arm64"
+cp LICENSE THIRD_PARTY_NOTICES SOURCE.md "$assets/"
+cp site/install.sh "$assets/install.sh"
 git archive --format=tar.gz --prefix="aipass-browser-provider-$version/" \
-  --output="$destination/aipass-browser-provider-$version-source.tar.gz" HEAD
+  --output="$assets/aipass-browser-provider-$version-source.tar.gz" HEAD
 if [ -n "$sources" ]; then
   for name in bun-1.3.14-source playwright-1.62.1-source tinycc-12882eee-source webkit-5488984d-source; do
-    cp "$sources/$name.tar.gz" "$destination/"
+    cp "$sources/$name.tar.gz" "$assets/"
   done
 else
-  curl -fL --connect-timeout 15 --max-time 180 --retry 2 -o "$destination/bun-1.3.14-source.tar.gz" \
+  curl -fL --connect-timeout 15 --max-time 180 --retry 2 -o "$assets/bun-1.3.14-source.tar.gz" \
     https://codeload.github.com/oven-sh/bun/tar.gz/refs/tags/bun-v1.3.14
-  curl -fL --connect-timeout 15 --max-time 180 --retry 2 -o "$destination/playwright-1.62.1-source.tar.gz" \
+  curl -fL --connect-timeout 15 --max-time 180 --retry 2 -o "$assets/playwright-1.62.1-source.tar.gz" \
     https://codeload.github.com/microsoft/playwright/tar.gz/refs/tags/v1.62.1
-  curl -fL --connect-timeout 15 --max-time 180 --retry 2 -o "$destination/tinycc-12882eee-source.tar.gz" \
+  curl -fL --connect-timeout 15 --max-time 180 --retry 2 -o "$assets/tinycc-12882eee-source.tar.gz" \
     https://codeload.github.com/oven-sh/tinycc/tar.gz/12882eee073cfe5c7621bcfadf679e1372d4537b
-  bash scripts/archive-webkit.sh "$destination/webkit-5488984d-source.tar.gz"
+  bash scripts/archive-webkit.sh "$assets/webkit-5488984d-source.tar.gz"
 fi
-(cd "$destination" && shasum -a 256 -c "$root/third-party/sources.sha256")
+(cd "$assets" && shasum -a 256 -c "$root/third-party/sources.sha256")
 export AIPASS_RELEASE_COMMIT=$(git rev-parse HEAD)
-bun -e 'const p = await Bun.file("package.json").json(); console.log(JSON.stringify({version:p.version,license:p.license,bun:Bun.version,target:"darwin-arm64",commit:process.env.AIPASS_RELEASE_COMMIT},null,2))' > "$destination/release.json"
-(cd "$destination" && shasum -a 256 * > checksums.txt && shasum -a 256 -c checksums.txt)
+bun -e 'const p = await Bun.file("package.json").json(); console.log(JSON.stringify({version:p.version,license:p.license,bun:Bun.version,target:"darwin-arm64",commit:process.env.AIPASS_RELEASE_COMMIT},null,2))' > "$assets/release.json"
+(cd "$assets" && shasum -a 256 * > checksums.txt && shasum -a 256 -c checksums.txt)
+bash scripts/package-release.sh "$assets" "$destination"
 printf 'Prepared release %s\n' "$version"

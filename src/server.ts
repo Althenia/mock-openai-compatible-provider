@@ -81,6 +81,7 @@ function streamResponse(
   promptTokens: number,
   includeUsage: boolean,
   requireTool: boolean,
+  onCancel: () => void,
 ) {
   const output = openAIChatSSEChunks(model, prepend(first, iterator), offered, {
     promptTokens,
@@ -99,6 +100,7 @@ function streamResponse(
       }
     },
     async cancel(reason) {
+      onCancel()
       await output.return?.(reason)
     },
   })
@@ -164,6 +166,7 @@ function responsesStreamResponse(
   requireTool: boolean,
   onComplete: (output: readonly Record<string, unknown>[]) => void,
   onAbort: () => Promise<void>,
+  onCancel: () => void,
 ) {
   let completedOutput: readonly Record<string, unknown>[] = []
   const output = openAIResponsesSSEChunks(responseID, model, prepend(first, iterator), offered, {
@@ -203,6 +206,7 @@ function responsesStreamResponse(
       }
     },
     async cancel(reason) {
+      onCancel()
       try {
         await output.return?.(reason)
       } finally {
@@ -290,8 +294,10 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
       }
       let iterator: AsyncIterator<BrowserFrame>
       let first: IteratorResult<BrowserFrame>
+      const streamAbort = new AbortController()
       try {
-        iterator = dependencies.browser.turn(parsed.turn, request.signal)[Symbol.asyncIterator]()
+        const signal = parsed.stream ? AbortSignal.any([request.signal, streamAbort.signal]) : request.signal
+        iterator = dependencies.browser.turn(parsed.turn, signal)[Symbol.asyncIterator]()
         first = await iterator.next()
       } catch (error) {
         if (previous !== undefined) responseReservations.delete(previous)
@@ -342,6 +348,7 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
             if (previous !== undefined) forgetResponse(previous)
             await dependencies.browser.discard?.(parsed.turn.sessionMarker)
           },
+          () => streamAbort.abort(),
         )
       }
       try {
@@ -366,8 +373,10 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
       )
       let iterator: AsyncIterator<BrowserFrame>
       let first: IteratorResult<BrowserFrame>
+      const streamAbort = new AbortController()
       try {
-        iterator = dependencies.browser.turn(parsed.turn, request.signal)[Symbol.asyncIterator]()
+        const signal = parsed.stream ? AbortSignal.any([request.signal, streamAbort.signal]) : request.signal
+        iterator = dependencies.browser.turn(parsed.turn, signal)[Symbol.asyncIterator]()
         first = await iterator.next()
       } catch (error) {
         return browserError(error)
@@ -390,6 +399,7 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
           parsed.promptTokens,
           parsed.includeUsage,
           parsed.requireTool,
+          () => streamAbort.abort(),
         )
       try {
         return json(

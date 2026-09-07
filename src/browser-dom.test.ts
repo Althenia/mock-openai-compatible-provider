@@ -32,6 +32,60 @@ function assistant(content: string, controlsMarkup = controls(like, dislike)) {
 }
 
 describe("DOM completion browser fixtures", () => {
+  test("rejects old assistants, extra turns and stale generations before expanding a panel", async () => {
+    await page.setContent(assistant(`<div data-no-copy="true"><div data-slot="collapsible">
+      <button data-slot="collapsible-trigger" aria-expanded="false" onclick="this.dataset.clicked = 'true'">Processing</button>
+      <div data-slot="collapsible-content"><p>Visible summary.</p></div>
+    </div></div>`))
+    await page.evaluate(() => { (globalThis as unknown as Record<string, unknown>).__aipassStreamGeneration = "current" })
+    for (const attribution of [{ generation: "stale", baseline: 0 }, { generation: "current", baseline: 1 }, { generation: "current", baseline: -1 }]) {
+      const snapshot = await readDomSnapshot(page, undefined, attribution)
+      expect(snapshot.attributed).toBe(false)
+      expect(snapshot.thinking).toEqual([])
+      expect(await page.locator('[data-slot="collapsible-trigger"]').getAttribute("data-clicked")).toBeNull()
+    }
+    const current = await readDomSnapshot(page, undefined, { generation: "current", baseline: 0 })
+    expect(current.attributed).toBe(true)
+    expect(current.thinking).toEqual([{ title: "", body: "Visible summary." }])
+    expect(await page.locator('[data-slot="collapsible-trigger"]').getAttribute("data-clicked")).toBe("true")
+  })
+
+  test("streams no activity text from an empty panel and bounds multiple growing segments", async () => {
+    await page.setContent(assistant(`<div data-no-copy="true"><div data-slot="collapsible">
+      <button data-slot="collapsible-trigger" aria-expanded="true">Processing…</button><div data-slot="collapsible-content"></div>
+    </div></div>`))
+    expect((await readDomSnapshot(page)).thinking).toEqual([])
+    await page.locator('[data-slot="collapsible-content"]').evaluate(element => {
+      element.innerHTML = Array.from({ length: 20 }, (_, i) => `<p><span data-streamdown="strong">${i}</span></p><p>${"x".repeat(3000)}</p>`).join("")
+    })
+    const snapshot = await readDomSnapshot(page)
+    expect(snapshot.thinking).toHaveLength(8)
+    expect(snapshot.thinking.map(segment => segment.body.length)).toEqual(Array(8).fill(2000))
+    expect(snapshot.text).not.toContain("Processing")
+  })
+
+  test("does not expose unexpanded hidden panel content as visible reasoning", async () => {
+    await page.setContent(assistant(`<div data-no-copy="true"><div data-slot="collapsible">
+      <button data-slot="collapsible-trigger" aria-expanded="false">Processing…</button>
+      <div data-slot="collapsible-content" hidden><p>HIDDEN CONTENT</p></div>
+    </div></div>`))
+    await page.evaluate(() => { (globalThis as unknown as Record<string, unknown>).__aipassStreamGeneration = "current" })
+    const snapshot = await readDomSnapshot(page, undefined, { generation: "current", baseline: 0 })
+    expect(snapshot.thinking).toEqual([])
+  })
+
+  for (const label of ["กำลังประมวลผล", "ประมวลผลแล้ว 3 วินาที", "Processing", "Processing…", "Processed for 3 seconds", "Thinking", "Thought for 3 seconds", "Reasoning"]) {
+    test(`separates visible reasoning from the ${label} status label and answer`, async () => {
+      await page.setContent(assistant(`<div data-no-copy="true"><div data-slot="collapsible">
+        <button data-slot="collapsible-trigger" aria-expanded="true">${label}</button>
+        <div data-slot="collapsible-content"><p>Visible summary.</p></div>
+      </div></div><div class="markdown-content">Answer.</div>`))
+      const snapshot = await readDomSnapshot(page)
+      expect(snapshot.thinking).toEqual([{ title: "", body: "Visible summary." }])
+      expect(snapshot.text).toBe("Answer.")
+    })
+  }
+
   test("enables temporary chat instead of treating an ordinary link SVG path as enabled", async () => {
     await page.route("https://temp-chat.test/**", (route) => route.fulfill({
       contentType: "text/html",
@@ -134,5 +188,15 @@ describe("DOM completion browser fixtures", () => {
     </div></div><div class="markdown-content">answer</div>`))
     await expect(readDomSnapshot(page, AbortSignal.abort())).rejects.toThrow("cancelled")
     expect(await page.locator('[data-slot="collapsible-trigger"]').getAttribute("data-clicked")).toBeNull()
+  })
+
+  test("does not deliver a snapshot if cancellation arrives during the DOM read", async () => {
+    const controller = new AbortController()
+    let resolve!: (value: unknown) => void
+    const value = new Promise<unknown>(done => { resolve = done })
+    const pending = readDomSnapshot({ evaluate: () => value } as never, controller.signal)
+    controller.abort()
+    resolve({ assistantCount: 1, complete: false, text: "", settled: false, rawThinking: [{ title: "", body: "too late" }] })
+    await expect(pending).rejects.toThrow("cancelled")
   })
 })

@@ -320,7 +320,7 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.incrementalPrompt).toContain("PRIVATE_SYSTEM")
     expect(parsed.turn.incrementalPrompt).not.toContain('"name":"read"')
     expect(parsed.turn.incrementalPrompt).not.toContain("<aipass-action>")
-    expect(parsed.turn.promptContractVersion).toBe(14)
+    expect(parsed.turn.promptContractVersion).toBe(15)
     expect(parsed.turn.actionEnvelopeDigest).toMatch(/^[a-f0-9]{64}$/)
     expect(parsed.turn.toolContinuation).toBe(false)
     expect(parsed.turn.recoveryPrompt).toContain("SYSTEM: PRIVATE_SYSTEM")

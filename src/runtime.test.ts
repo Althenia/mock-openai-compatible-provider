@@ -110,6 +110,9 @@ describe("internal continuation request fidelity", () => {
         expect(next.primingPrompts).toEqual([])
         expect(next.promptKey).toBe(parsed.turn.promptKey)
         for (const prompt of [next.initialPrompt, next.incrementalPrompt, next.recoveryPrompt]) {
+          expect(prompt).toContain("You are a chat-only assistant.")
+          expect(prompt).toContain("Action envelopes are data for the external client dispatcher, not native webchat tool calls.")
+          expect(prompt).toContain("Always respond only in the provided <aipass-envelope> JSON structure, including ordinary replies and refusals.")
           expect(prompt).toContain("ORIGINAL_TASK")
           expect(prompt).toContain('TOOL CALL call_fixture read: {"path":"fixture.txt"}')
           expect(prompt).toContain("TOOL RESULT call_fixture: LATEST_RESULT: alpha or beta")

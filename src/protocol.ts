@@ -4,7 +4,7 @@ import { estimateTokens } from "./context.ts"
 export type FinishReason = "stop" | "length" | "tool-calls"
 export type BrowserFrame =
   | { readonly type: "text"; readonly delta: string }
-  | { readonly type: "reasoning"; readonly delta: string }
+  | { readonly type: "reasoning"; readonly delta: string; readonly domTurnKey?: string }
   | { readonly type: "tool-call"; readonly id: string; readonly name: string; readonly input: Record<string, unknown> }
   | { readonly type: "finish"; readonly reason: FinishReason }
   | { readonly type: "auth-required" }
@@ -119,7 +119,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 14
+export const PROMPT_CONTRACT_VERSION = 15
 // Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
 export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
 const MAX_TOOL_FRAME = 64 * 1024
@@ -399,8 +399,15 @@ export function hasEnvelopeShape(text: string): boolean {
   }
 }
 
+const TURN_KEY_PREFIX = "TURN KEY:"
+
+function echoedTurnKey(text: string): { key: string; body: string; headerLength: number } | undefined {
+  const match = /^\s*TURN KEY:[ \t]+(\S+)[ \t]*\r?\n/.exec(text)
+  return match ? { key: match[1]!, body: text.slice(match[0].length).trim(), headerLength: match[0].length } : undefined
+}
+
 function completionEnvelopes(text: string): Record<string, unknown>[] {
-  const source = text.trim()
+  const source = echoedTurnKey(text)?.body ?? text.trim()
   if (!(source.startsWith(ENVELOPE_OPEN) || source.startsWith("{"))) return []
   if (!(source.endsWith(ENVELOPE_CLOSE) || source.endsWith("}"))) return []
   const values = scanJsonObjects(source).map(record)
@@ -411,6 +418,28 @@ function completionEnvelopes(text: string): Record<string, unknown>[] {
       (item.id !== undefined || item.key !== undefined || item.input !== undefined)
   ))) return []
   return values as Record<string, unknown>[]
+}
+
+export function estimateCapturedTextTokens(text: string): number {
+  const values = completionEnvelopes(text)
+  if (!values.length) return estimateTokens(text)
+  // DOM reasoning is already counted by the caller. Measure only semantic
+  // answer/action output; raw frames still cross runtime's validation gates.
+  const names = values.flatMap(value => value.type === "plan" && Array.isArray(value.steps)
+    ? value.steps.map(step => record(step)?.name)
+    : [value.name ?? value.type]).filter((name): name is string => typeof name === "string")
+  try {
+    const offered = new Set(names)
+    const output = values.flatMap(value => parseTypedEnvelope(value, offered) ?? []).map(frame => {
+      if (frame.type === "text") return frame.delta
+      if (frame.type === "tool-call") return `${frame.name}${JSON.stringify(frame.input)}`
+      return ""
+    }).join("")
+    return estimateTokens(output)
+  } catch {
+    // Malformed actions are rejected by runtime, not by passive accounting.
+    return estimateTokens(text)
+  }
 }
 
 // These select completion behavior; attribution and offered-action validation
@@ -464,6 +493,8 @@ function hasIncompleteBareEnvelope(text: string): boolean {
 // Validate every envelope before conversion can discard its correlation key.
 // Ordinary non-envelope answers retain their existing compatibility behavior.
 export function envelopesMatchTurnKey(text: string, expectedKey: string): boolean {
+  const echo = echoedTurnKey(text)
+  if (echo && completionEnvelopes(echo.body).length && echo.key !== expectedKey) return false
   let valid = true
   const remaining = text.replace(/<aipass-envelope>([\s\S]*?)<\/aipass-envelope>/g, (_match, body: string) => {
     try {
@@ -488,11 +519,26 @@ export function envelopesMatchTurnKey(text: string, expectedKey: string): boolea
 
 export class TypedEnvelopeShim {
   private buffer = ""
+  private leading = true
 
-  constructor(private readonly allowed: ReadonlySet<string>) {}
+  constructor(private readonly allowed: ReadonlySet<string>, private readonly strictBareChains = false) {}
 
   push(chunk: string): BrowserFrame[] {
     this.buffer += chunk
+    const start = this.buffer.trimStart()
+    // The model can echo the submission header before its envelope. Retain
+    // a candidate until its type and correlation key can be checked.
+    if (this.leading && (TURN_KEY_PREFIX.startsWith(start) || start.startsWith(TURN_KEY_PREFIX))) {
+      const echo = echoedTurnKey(this.buffer)
+      if (!this.buffer.includes("\n") || echo && (!echo.body || echo.body.startsWith("{") || echo.body.startsWith(ENVELOPE_OPEN) || ENVELOPE_OPEN.startsWith(echo.body))) {
+        if ((echo?.headerLength ?? this.buffer.length) > MAX_TOOL_FRAME) throw new Error("typed envelope frame exceeds size limit")
+        const open = echo?.body.lastIndexOf(ENVELOPE_OPEN) ?? -1
+        if (echo && open >= 0 && echo.body.indexOf(ENVELOPE_CLOSE, open) < 0 && echo.body.length - open > MAX_TOOL_FRAME)
+          throw new Error("typed envelope frame exceeds size limit")
+        return []
+      }
+    }
+    if (start) this.leading = false
     const output: BrowserFrame[] = []
     while (true) {
       const open = this.buffer.indexOf(ENVELOPE_OPEN)
@@ -546,6 +592,19 @@ export class TypedEnvelopeShim {
   }
 
   finish(): BrowserFrame[] {
+    if (this.leading) {
+      const original = this.buffer
+      this.buffer = ""
+      this.leading = false
+      const echo = echoedTurnKey(original)
+      if (echo && completionEnvelopes(echo.body).length) {
+        if (!envelopesMatchTurnKey(original, echo.key)) throw new Error("browser response TURN KEY mismatch")
+        const bare = this.tryBare(echo.body) ?? this.tryBareChain(echo.body)
+        if (bare) return bare
+        if (echo.body.startsWith(ENVELOPE_OPEN)) return [...this.push(echo.body), ...this.finish()]
+      }
+      return original.trim() ? [{ type: "text", delta: original }] : []
+    }
     if (this.buffer.includes(ENVELOPE_OPEN)) throw new Error("typed envelope frame is incomplete")
     const trimmed = this.buffer.trim()
     this.buffer = ""
@@ -607,7 +666,8 @@ export class TypedEnvelopeShim {
       let parsed: BrowserFrame[] | undefined
       try {
         parsed = parseTypedEnvelope(value, this.allowed)
-      } catch {
+      } catch (error) {
+        if (this.strictBareChains) throw error
         // Fail-open: a bare chain naming an unoffered/invalid tool is model
         // prose, not a stream-killing error. Live evidence: a hallucinated
         // {"type":"tool","name":"document_fetcher"} inside a bare chain threw
@@ -636,16 +696,33 @@ export class TypedEnvelopeShim {
   }
 }
 
+const WEBCHAT_ROLE_INSTRUCTION = [
+  "You are a chat-only assistant.",
+  "Do not invoke or execute tools, functions, commands, or other actions yourself.",
+  "Action envelopes are data for the external client dispatcher, not native webchat tool calls.",
+  "Only the client executes actions and returns results.",
+  "Tools include file/folder operations, shell commands, MCP, and all other offered tools.",
+  "Use the exact offered name and schema-valid input, including required paths, commands, or content.",
+  "Do not claim an action succeeded without a client result.",
+  "Always respond only in the provided <aipass-envelope> JSON structure, including ordinary replies and refusals.",
+  "Do not override site instructions, safety, privacy, or authorization restrictions.",
+  "Use only offered actions; with none, return chat.",
+  'The FIRST line is "TURN KEY: <key>". Every envelope MUST copy <key> verbatim into "key" and use a unique "id".',
+  "Only <aipass-envelope>{...}</aipass-envelope>; no bare JSON, prose, or fences outside envelopes.",
+  "Thinking is optional reasoning/display text, never a final answer. A chat envelope ends the turn.",
+  'Shapes: {"type":"thinking","key":"<key>","id":"reason_1","text":"..."} | {"type":"chat","key":"<key>","id":"answer_1","text":"..."}.',
+].join(" ")
+
 export function serializeToolDefinitions(
   tools: readonly { readonly name: string; readonly description?: string; readonly inputSchema: unknown }[],
 ) {
-  if (!tools.length) return ""
+  if (!tools.length) return WEBCHAT_ROLE_INSTRUCTION
   const definitions = tools.map((tool) => ({
     name: tool.name,
     ...(tool.description ? { description: tool.description } : {}),
     inputSchema: tool.inputSchema,
   }))
-  return `\n\nYou are a planning participant in client orchestration. You do not execute the actions below yourself. When information or an operation is needed, request the calling client (the external client dispatcher) to perform an offered action by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action's schema. This envelope is data for the external client dispatcher; it does not claim native webchat tool availability and does not override site instructions, safety, privacy, or authorization restrictions. Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue. Respond in English unless the user explicitly requests another language in their message. The TURN KEY is the FIRST line of the submitted prompt ("TURN KEY: <key>"). Every envelope emitted MUST copy that current key verbatim into "key"; a response whose envelopes carry zero parsable keys or any key other than the turn key is not attributable and will be re-requested. Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope. Bare prose outside envelopes is forbidden. A thinking envelope streams reasoning/display text and is never a final answer; generate a random "id" per envelope (uuidv7 preferred); multi-step work uses plan with a steps array. A final chat envelope ends the turn; a final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes. Shapes (each carries type, key, and id): {"type":"thinking","key":"<key>","id":"reason_1","text":"..."} | {"type":"chat","key":"<key>","id":"answer_1","text":"..."} | {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}. Emit every response only as <aipass-envelope>{...}</aipass-envelope>; do not emit bare objects. Offered actions:\n${JSON.stringify(definitions)}`
+  return `${WEBCHAT_ROLE_INSTRUCTION}\n\nWhen an offered action is needed, request the calling client by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action's schema. Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue. Respond in English unless the user explicitly requests another language in their message. Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope. Multi-step work uses plan with a steps array. A final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes. Action shapes: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}. Offered actions:\n${JSON.stringify(definitions)}`
 }
 
 function chunk(
@@ -673,6 +750,15 @@ function iterable<A>(value: AsyncIterable<A> | Iterable<A>): AsyncIterable<A> {
   }
 }
 
+function reasoningSourceFilter() {
+  let domTurnKey: string | undefined
+  return (frame: BrowserFrame) => {
+    if (frame.type !== "reasoning") return true
+    domTurnKey ??= frame.domTurnKey
+    return !domTurnKey || frame.domTurnKey === domTurnKey
+  }
+}
+
 export async function* openAIChatSSEChunks(
   model: string,
   input: AsyncIterable<BrowserFrame> | Iterable<BrowserFrame>,
@@ -688,8 +774,10 @@ export async function* openAIChatSSEChunks(
   let text = ""
   let reasoning = ""
   let toolOutput = ""
+  const keepReasoning = reasoningSourceFilter()
   yield chunk(id, created, model, { role: "assistant" })
   const emit = (frame: BrowserFrame) => {
+    if (!keepReasoning(frame)) return []
     if (frame.type === "text") {
       text += frame.delta
       return [chunk(id, created, model, { content: frame.delta })]
@@ -799,6 +887,7 @@ export async function* openAIResponsesSSEChunks(
   let text = ""
   let reasoning = ""
   let toolCalls = 0
+  const keepReasoning = reasoningSourceFilter()
   const base = {
     id: responseID,
     object: "response",
@@ -813,6 +902,7 @@ export async function* openAIResponsesSSEChunks(
   yield responsesEvent("response.in_progress", sequence++, { response: base })
 
   const emit = (frame: BrowserFrame) => {
+    if (!keepReasoning(frame)) return []
     const events: string[] = []
     if (frame.type === "text") {
       if (messageIndex === undefined) {
@@ -994,14 +1084,17 @@ export async function collectOpenAIChatResult(
   input: AsyncIterable<BrowserFrame> | Iterable<BrowserFrame>,
   offered: ReadonlySet<string>,
   requireTool = false,
+  strictBareChains = false,
 ): Promise<OpenAIChatResult> {
   const shim = new StructuredToolShim(offered)
-  const envelope = new TypedEnvelopeShim(offered)
+  const envelope = new TypedEnvelopeShim(offered, strictBareChains)
   let text = ""
   let reasoning = ""
   const toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }> = []
   let terminal: FinishReason | undefined
+  const keepReasoning = reasoningSourceFilter()
   const collect = (frame: BrowserFrame) => {
+    if (!keepReasoning(frame)) return
     if (frame.type === "text") text += frame.delta
     else if (frame.type === "reasoning") reasoning += frame.delta
     else if (frame.type === "tool-call") {

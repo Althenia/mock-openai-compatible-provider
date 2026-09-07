@@ -308,7 +308,7 @@ function toolNameIndex(offered: readonly { readonly name: string; readonly descr
     const short = shortDescription(tool.description)
     return short ? `- ${tool.name}: ${short}` : `- ${tool.name}`
   })
-  return `Offered tool index (always complete, declare intent via typed envelope; full schemas follow for declared tools within budget). Respond in English unless the user explicitly requests another language in their message. Typed envelope shapes: {"type":"thinking","text":"..."} | {"type":"chat","text":"..."} | {"type":"tool","name":"offered_name"} | {"type":"plan"} | {"type":"subagent"|"skill"|"question"|"permission"}.\n${lines.join("\n")}`
+  return `Offered tool index (complete; schemas follow within budget). Respond in English unless the user explicitly requests another language in their message. Tool shape: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}}.\n${lines.join("\n")}`
 }
 
 function declaredToolNames(messages: unknown): string[] {
@@ -585,7 +585,9 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
     instructionDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH - 2),
     rawActionEnvelopeDigest.slice(INSTRUCTION_DIGEST_PREFIX_LENGTH),
   ].join("")
-  const incrementalPrompt = instructionMode === "preserve" ? initialPrompt : incrementalTranscript
+  const incrementalPrompt = instructionMode === "preserve"
+    ? initialPrompt
+    : [incrementalTranscript, serializeToolDefinitions([])].filter(Boolean).join("\n\n")
   // A recovery reload has no bound remote history. Tool continuations need
   // their preceding request as well as the latest tool result to resume.
   const recoveryConversation = continuingTool ? conversation : incrementalTranscript

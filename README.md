@@ -21,31 +21,28 @@ A standalone TypeScript provider compiled with Bun and backed by Playwright plus
 ## Requirements
 
 - Google Chrome (macOS default: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`)
-- Bun **1.3.14** for the reproducible release build (other Bun versions are not the release baseline)
-- GitHub CLI (`gh`) authenticated for private release downloads
+- macOS on Apple silicon for the prebuilt executable
+- Bun **1.3.14** only when building from source (not required for installation)
 
 ## Install or update
 
-The `v0.1.0` prebuilt target is macOS on Apple silicon (`darwin-arm64`). From an
-authorized clone of this repository, download the release with GitHub CLI:
+Install the latest release with one command. Run the same command to update:
 
 ```sh
-release_dir=$(mktemp -d)
-gh release download v0.1.0 --dir "$release_dir"
-(cd "$release_dir" && shasum -a 256 -c checksums.txt)
-sh "$release_dir/install.sh" --version 0.1.0 --from-dir "$release_dir"
+curl -fsSL https://raw.githubusercontent.com/Althenia/mock-openai-compatible-provider/main/site/install.sh | sh
 ```
 
-Keep the downloaded license, notices, and source material when redistributing.
-The repository's visibility is unchanged; unauthenticated download URLs cannot
-access a private release. GitHub Pages deployment is intentionally limited to
-public repositories with Pages already enabled in repository settings.
+No repository clone, Bun installation, or GitHub login is required. The installer
+uses macOS's built-in `plutil` and checks the executable against GitHub's SHA-256
+asset metadata before running it. This trusts the public repository and GitHub
+over HTTPS; it is not a separate publisher signature. If metadata is unavailable
+or GitHub rate-limits the request, installation stops without replacing the
+existing binary; retry later.
 
-For a public repository with installer Pages enabled, the HTTP installer also
-supports selecting a release:
+To select a specific version:
 
 ```sh
-sh site/install.sh --version 0.1.0
+curl -fsSL https://raw.githubusercontent.com/Althenia/mock-openai-compatible-provider/main/site/install.sh | sh -s -- --version 0.1.0
 ```
 
 The installer verifies the executable's SHA-256 checksum, runs its `help` check,
@@ -56,11 +53,21 @@ provider. Stop it before replacing the binary. Check the installed version with
 `aipass-browser-provider --version`; it must print `0.1.0` for this release.
 The binaries are ad-hoc signed, not Developer ID signed or notarized.
 
-To restore a downloaded earlier release, stop the provider and use the same
-`--from-dir` command with that release's directory and version. This first release
-has no earlier published version: retain a verified copy of any source-built
-executable before upgrading. Preserve the state/config directories during a
-restore; process-memory Responses IDs do not survive a restart.
+For offline installation or restoration, download the executable and complete
+source archive into one directory, then run these commands there:
+
+```sh
+tar -xzf aipass-browser-provider-0.1.0-complete-source.tar.gz
+shasum -a 256 -c checksums.txt
+sh install.sh --version 0.1.0 --from-dir .
+```
+
+The archive contains the installer and checksums needed by `--from-dir`, plus
+the licenses and corresponding source to keep when redistributing. Use the
+matching directory/version for a restore. This first release has no earlier
+published version: retain a verified copy of any source-built executable before
+upgrading. Preserve state/config directories during a restore; process-memory
+Responses IDs do not survive a restart.
 
 Then authenticate and start it:
 
@@ -114,8 +121,10 @@ aipass-browser-provider start
 `.github/workflows/release.yml` validates and builds `main` and version tags using
 Bun 1.3.14. It runs typechecking, the full test suite, installer checks, binary
 help/version/architecture checks, and redistribution-file checks. It packages
-the executable, installer, notices, exact application source, and bundled LGPL
-component sources, then verifies checksums. Only a `vX.Y.Z` tag publishes a
+the executable and one complete source archive containing the exact application
+source, bundled-component sources, notices, installer, and offline checksums.
+CI verifies an internal checksum manifest, but publishes only the executable and
+complete source archive as release attachments. Only a `vX.Y.Z` tag publishes a
 GitHub Release; the tag must equal `v` plus `package.json`'s version. Existing
 releases are not overwritten. Review [v0.1.0's limitations](docs/releases/v0.1.0.md)
 before use; a successful build does not erase the recorded live-model failures.
@@ -128,9 +137,11 @@ where `PATH` is the accompanying WebKit source archive; `--check` compares witho
 writing. Source archive checksums are pinned in
 `third-party/sources.sha256`. Never replace failed retrievals with placeholders.
 
-`.github/workflows/pages.yml` always checks the installer when triggered. It
-deploys `site/install.sh` only for public repositories with Pages configured;
-private release installation uses the authenticated download path above.
+The raw GitHub installer URL above does not require GitHub Pages.
+`.github/workflows/pages.yml` checks the installer on macOS; manual dispatch can
+deploy it to Pages when Pages is configured. The published v0.1.0 tag and executable remain
+unchanged by the packaging update; use the maintained URL above rather than a
+saved old installer for online downloads.
 
 ## Development
 
@@ -214,7 +225,7 @@ aipass-browser-provider help
 
 ## Browser behavior
 
-Playwright locator auto-waits replace custom DOM polling. Model selection re-resolves controls after React rerenders, handles collapsed/expanded thinking cards, and uses one 20-second cold-page safety deadline. Response capture uses a page binding plus a fetch wrapper and DOM-completion observer; timeouts are safety deadlines rather than polling mechanisms.
+Playwright locator auto-waits handle model and upload controls. Model selection re-resolves controls after React rerenders, handles collapsed/expanded thinking cards, and uses one 20-second cold-page safety deadline. Response capture uses a page binding, fetch wrapper, and DOM-completion observer. After matching the current submission, a 250 ms sampling tick streams new visible thinking-panel text from that turn through both APIs; Thai and English Processing/Processed/Thinking labels are not reasoning. Answers and tool requests remain buffered for turn-key and offered-action validation. If native completion arrives after DOM reasoning has started, terminal output waits for a four-second unchanged-panel window, capped by the stream idle timeout, while selected-stream errors and cancellation remain active. Unseen native suffixes are never substituted for DOM text. Repeated text, non-prefix rewrites, and duplicate native or envelope reasoning are not replayed after DOM reasoning starts. Extraction retains the existing limits of eight segments, 200 title characters, and 2,000 body characters per segment.
 
 When an initial action-enabled submission produces verified background activity but no stream or assistant response, the provider marks that attempt failed and performs one bounded internal recovery in the same Playwright page. It reloads the durable conversation URL, re-arms a fresh capture generation, and resubmits a recovery-safe prompt inside the original HTTP request.
 
@@ -229,6 +240,8 @@ The AIPass website has no native function-calling API. The provider therefore pr
 ```
 
 The `key` must copy the current submission's `TURN KEY` verbatim; `current_turn_key` above is an example value. The frame is never executed by the website. The provider validates attribution and the action against the complete set offered by the calling client and converts it to an OpenAI `tool_calls` delta. The client executes the call and sends its result in a subsequent `tool` message so the model can continue. Legacy `<aipass-action>` frames remain accepted by the parser, but are no longer the generated instruction format.
+
+Recognized typed replies also accept bare JSON and a leading echoed `TURN KEY` line. The echoed key and envelope keys must agree with the current turn before conversion. `chat` becomes answer text, `thinking` becomes reasoning, and offered action types become client-dispatched function calls rather than visible JSON. MCP tools use this same path: their exact offered names and arguments are preserved, and results return through the client's normal tool-result continuation. Quoted JSON inside a chat envelope remains answer text, not another tool call.
 
 Tool capability metadata describes the bridge's supported format, not a guarantee that a browser model will follow the dispatcher protocol. Live validation has encountered refusals, premature answers, and extra final-answer prose. A passing local test suite does not establish reliable live tool execution.
 

@@ -68,8 +68,18 @@ machine=$(uname -m)
 os=darwin
 arch=arm64
 
+if [ -z "$source_dir" ]; then
+  command -v plutil >/dev/null 2>&1 || fail "macOS plutil is required"
+  case "$repository_url" in
+    https://github.com/*) repository=${repository_url#https://github.com/} ;;
+    *) fail "repository URL must be https://github.com/OWNER/REPOSITORY" ;;
+  esac
+  printf '%s\n' "$repository" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+    || fail "invalid GitHub repository URL"
+fi
+
 if [ -z "$requested_version" ]; then
-  latest_url=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$repository_url/releases/latest") \
+  latest_url=$(curl -fsSL --connect-timeout 15 --max-time 30 -o /dev/null -w '%{url_effective}' "$repository_url/releases/latest") \
     || fail "could not resolve the latest release"
   requested_version=${latest_url##*/}
 fi
@@ -95,15 +105,41 @@ trap 'rm -rf "$work"; [ -z "$stage" ] || rm -f "$stage"' EXIT HUP INT TERM
 if [ -n "$source_dir" ]; then
   cp "$source_dir/$asset" "$work/$asset" || fail "downloaded release asset is missing"
   cp "$source_dir/checksums.txt" "$work/checksums.txt" || fail "downloaded checksums are missing"
+  expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$work/checksums.txt")
 else
-  curl -fsSL -o "$work/$asset" "$release_url/$asset" \
+  curl -fsSL --connect-timeout 15 --max-time 30 -o "$work/release.json" \
+    "https://api.github.com/repos/$repository/releases/tags/$version" \
+    || fail "could not retrieve release verification metadata (GitHub may be rate-limiting; retry later)"
+  tag=$(plutil -extract tag_name raw -expect string -o - "$work/release.json") \
+    || fail "invalid release metadata"
+  [ "$tag" = "$version" ] || fail "release metadata does not match $version"
+  count=$(plutil -extract assets raw -expect array -o - "$work/release.json") \
+    || fail "release assets are missing"
+  expected=
+  index=0
+  while [ "$index" -lt "$count" ]; do
+    name=$(plutil -extract "assets.$index.name" raw -expect string -o - "$work/release.json") \
+      || fail "invalid release asset metadata"
+    if [ "$name" = "$asset" ]; then
+      state=$(plutil -extract "assets.$index.state" raw -expect string -o - "$work/release.json") \
+        || fail "invalid release asset state"
+      [ "$state" = uploaded ] || fail "release asset is not ready"
+      digest=$(plutil -extract "assets.$index.digest" raw -expect string -o - "$work/release.json") \
+        || fail "GitHub SHA-256 digest is missing"
+      case "$digest" in
+        sha256:*) expected=${digest#sha256:} ;;
+        *) fail "GitHub SHA-256 digest is missing" ;;
+      esac
+      break
+    fi
+    index=$((index + 1))
+  done
+  [ -n "$expected" ] || fail "release asset $asset was not found for $version"
+  curl -fsSL --connect-timeout 15 --max-time 180 -o "$work/$asset" "$release_url/$asset" \
     || fail "release asset $asset was not found for $version"
-  curl -fsSL -o "$work/checksums.txt" "$release_url/checksums.txt" \
-    || fail "checksums were not found for $version"
 fi
 
-expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { print $1; exit }' "$work/checksums.txt")
-[ -n "$expected" ] || fail "checksum for $asset is missing"
+printf '%s\n' "$expected" | grep -Eq '^[a-f0-9]{64}$' || fail "valid SHA-256 checksum for $asset is missing"
 if command -v sha256sum >/dev/null 2>&1; then
   actual=$(sha256sum "$work/$asset" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then

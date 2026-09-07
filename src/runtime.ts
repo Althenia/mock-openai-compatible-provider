@@ -16,7 +16,7 @@ import {
 } from "./browser.ts"
 import { LOOPBACK_HOST, MODELS, model, persistRuntimeConfig, readRuntimeConfig, type Settings } from "./config.ts"
 import type { ProjectedTurn } from "./http.ts"
-import { envelopesMatchTurnKey, isActionEnvelopeType, serializeToolDefinitions, StreamFrameParser, type BrowserFrame, type FinishReason } from "./protocol.ts"
+import { collectOpenAIChatResult, envelopesMatchTurnKey, isActionEnvelopeType, serializeToolDefinitions, StreamFrameParser, type BrowserFrame, type FinishReason } from "./protocol.ts"
 import { createRequestHandler, type BrowserService } from "./server.ts"
 import { BindingStore, pendingDecision, ProfileLock, readOrCreateToken, type Attempt } from "./state.ts"
 
@@ -473,28 +473,53 @@ export class StandaloneBrowserService implements BrowserService {
       for (const name of input.provisionedActions ?? []) shown.add(name)
       const collected: BrowserFrame[] = []
       try {
-        const collectOne = async (projected: ProjectedTurn): Promise<BrowserFrame[]> => {
+        let progressed = false
+        const validate = async (frames: BrowserFrame[], projected: ProjectedTurn) => {
+          try {
+            if (isEnvelopeKeyMismatch(frames, projected.promptKey))
+              throw new Error(`browser response TURN KEY mismatch${progressed ? " after reasoning progress" : ""}`)
+            // Validate a copy of the terminal chain, but publish the original
+            // envelopes so quoted examples cannot be decoded a second time.
+            await collectOpenAIChatResult(frames, new Set(projected.offeredActions), false, progressed)
+          } catch (error) {
+            if (progressed) await this.adapter.discard(marker)
+            throw error
+          }
+        }
+        const collectOne = async function* (projected: ProjectedTurn, progressive: boolean): AsyncGenerator<BrowserFrame, BrowserFrame[]> {
           const source = recoverNoResponseEvidence(
             (recovery) => adapterTurn(projected, recovery),
             projected.initialPrompt !== projected.incrementalPrompt,
           )
           const raw: BrowserFrame[] = []
-          for await (const frame of source) raw.push(frame)
+          for await (const frame of source) {
+            if (signal?.aborted) throw new Error("browser turn was cancelled")
+            // Only browser-attributed DOM text may cross the validation gate.
+            // Native payloads cannot set domTurnKey through StreamFrameParser.
+            if (progressive && frame.type === "reasoning" && projected.promptKey && frame.domTurnKey === projected.promptKey) {
+              progressed = true
+              collected.push(frame)
+              yield frame
+            } else raw.push(frame)
+          }
           if (isEnvelopeKeyMismatch(raw, projected.promptKey)) return raw
           const frames: BrowserFrame[] = []
           for await (const frame of repairToolRefusal(raw, repair, projected.offeredActions)) frames.push(frame)
           return frames
         }
-        const collectValidated = async (projected: ProjectedTurn): Promise<BrowserFrame[]> => {
-          let frames = await collectOne(projected)
-          if (isEnvelopeKeyMismatch(frames, projected.promptKey)) {
+        const collectValidated = async function* (projected: ProjectedTurn, progressive = false): AsyncGenerator<BrowserFrame, BrowserFrame[]> {
+          let frames = yield* collectOne(projected, progressive)
+          if (isEnvelopeKeyMismatch(frames, projected.promptKey) && !progressed) {
             console.error("aipass turn key mismatch retry=true")
-            frames = await collectOne(projected)
+            frames = yield* collectOne(projected, progressive)
           }
-          if (isEnvelopeKeyMismatch(frames, projected.promptKey)) throw new Error("browser response TURN KEY mismatch")
+          await validate(frames, projected)
           return frames
         }
-        const initialCollected = await collectValidated(input)
+        const initialCollected = yield* collectValidated(input, true)
+        // Leave envelopes intact for the serializer: decoding here would
+        // let quoted envelope examples in chat text be interpreted twice.
+        const finalFrames = (frames: BrowserFrame[]) => progressed ? frames.filter(frame => frame.type !== "reasoning") : frames
         const schemasByName = new Map((input.offeredToolSchemas ?? []).map((schema) => [schema.name, schema]))
         const seen = new Set<string>()
         const need: string[] = []
@@ -507,7 +532,7 @@ export class StandaloneBrowserService implements BrowserService {
           need.push(declared.name)
         }
         if (need.length === 0) {
-          for (const frame of initialCollected) {
+          for (const frame of finalFrames(initialCollected)) {
             collected.push(frame)
             yield frame
           }
@@ -525,9 +550,9 @@ export class StandaloneBrowserService implements BrowserService {
             compactionDigest: undefined,
             toolRepairPrompt: undefined,
           }
-          const provisionCollected = await collectValidated(provisionInput)
+          const provisionCollected = yield* collectValidated(provisionInput)
           console.error(`aipass turn provision done tools=${need.join(",")} frames=${provisionCollected.length}`)
-          for (const frame of provisionCollected) {
+          for (const frame of finalFrames(provisionCollected)) {
             collected.push(frame)
             yield frame
           }

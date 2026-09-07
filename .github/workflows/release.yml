@@ -77,4 +77,9 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --notes-file "docs/releases/$GITHUB_REF_NAME.md" --title "$GITHUB_REF_NAME"
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release/aipass-browser-provider-darwin-arm64 \
+            release/aipass-browser-provider-*-complete-source.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md" --title "$GITHUB_REF_NAME"
