@@ -1,0 +1,25 @@
+{
+  "name": "aipass-browser-provider",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "aipass-browser-provider": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "sh scripts/build.sh",
+    "test:build": "sh scripts/test-build.sh",
+    "test": "bun test",
+    "test:install": "sh scripts/test-install.sh",
+    "test:release": "bash scripts/test-release.sh",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "playwright-core": "1.62.1"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.14",
+    "typescript": "5.9.3"
+  }
+}
