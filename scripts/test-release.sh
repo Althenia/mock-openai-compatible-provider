@@ -16,13 +16,22 @@ cp "$root/package.json" "$root/LICENSE" "$root/THIRD_PARTY_NOTICES" "$root/SOURC
 cp "$root/site/install.sh" "$fixture/site/"
 version=$(cd "$root" && bun -p 'require("./package.json").version')
 cp "$root/docs/releases/v$version.md" "$fixture/docs/releases/"
-for name in bun-1.3.14-source playwright-1.62.1-source tinycc-12882eee-source webkit-5488984d-source; do
+for name in bun-1.4.0-source playwright-1.62.1-source tinycc-05f0fafa-source webkit-0f966e81-source; do
   printf 'inert preflight fixture\n' > "$work/sources/$name.tar.gz"
 done
 (cd "$work/sources" && shasum -a 256 *.tar.gz) > "$fixture/third-party/sources.sha256"
 git -C "$fixture" init -q
 git -C "$fixture" add package.json LICENSE THIRD_PARTY_NOTICES SOURCE.md scripts site docs third-party
 git -C "$fixture" -c user.name=ReleaseFixture -c user.email=release-fixture@example.invalid commit -qm fixture
+cp "$root/bunfig.toml" "$fixture/"
+if bash "$fixture/scripts/prepare-release.sh" "$work/untracked-config-candidate" "$work/sources" > "$work/untracked-config.log" 2>&1; then
+  echo 'release preflight accepted untracked test configuration' >&2
+  exit 1
+fi
+grep -q 'untracked release inputs' "$work/untracked-config.log"
+test ! -e "$work/untracked-config-candidate"
+git -C "$fixture" add bunfig.toml
+git -C "$fixture" -c user.name=ReleaseFixture -c user.email=release-fixture@example.invalid commit -qm fixture-test-config
 printf 'export const fixture = true\n' > "$fixture/src/uncommitted.ts"
 if bash "$fixture/scripts/prepare-release.sh" "$work/untracked-candidate" "$work/sources" > "$work/untracked.log" 2>&1; then
   echo 'release preflight accepted an untracked source file' >&2
@@ -53,6 +62,10 @@ cp "$work/candidate/aipass-browser-provider-darwin-arm64" "$work/unpacked/"
 test -s "$work/unpacked/LICENSE"
 test -s "$work/unpacked/THIRD_PARTY_NOTICES"
 test -s "$work/unpacked/SOURCE.md"
+sh "$work/unpacked/install.sh" --version "$version" --from-dir "$work/unpacked" --install-dir "$work/offline install"
+test "$("$work/offline install/aipass-browser-provider" --version)" = "$version"
+test "$(stat -f '%Lp' "$work/offline install/aipass-browser-provider")" = 700
+cmp "$work/candidate/aipass-browser-provider-darwin-arm64" "$work/offline install/aipass-browser-provider"
 git -C "$fixture" archive --format=tar.gz --prefix="aipass-browser-provider-$version/" \
   --output="$work/expected-source.tar.gz" HEAD
 cmp "$work/expected-source.tar.gz" "$work/unpacked/aipass-browser-provider-$version-source.tar.gz"
@@ -61,7 +74,7 @@ if bash "$fixture/scripts/prepare-release.sh" "$work/candidate" "$work/sources" 
   exit 1
 fi
 (cd "$work/candidate" && shasum -a 256 -c checksums.txt)
-printf 'tampered\n' >> "$work/sources/bun-1.3.14-source.tar.gz"
+printf 'tampered\n' >> "$work/sources/bun-1.4.0-source.tar.gz"
 if bash "$fixture/scripts/prepare-release.sh" "$work/tampered-candidate" "$work/sources" > "$work/tampered.log" 2>&1; then
   echo 'tampered bundled source was accepted' >&2
   exit 1

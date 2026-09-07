@@ -24,10 +24,10 @@ The complete source archive also contains:
 
 | Component | Source revision | Archive |
 | --- | --- | --- |
-| Bun | `bun-v1.3.14` | `bun-1.3.14-source.tar.gz` |
+| Bun | `bun-v1.4.0` | `bun-1.4.0-source.tar.gz` |
 | Playwright | `v1.62.1` | `playwright-1.62.1-source.tar.gz` |
-| WebKit/JavaScriptCore | `5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b` | `webkit-5488984d-source.tar.gz` |
-| TinyCC | `12882eee073cfe5c7621bcfadf679e1372d4537b` | `tinycc-12882eee-source.tar.gz` |
+| WebKit/JavaScriptCore | `0f966e81b78c84bb23213e391bc679c4ef83e56b` | `webkit-0f966e81-source.tar.gz` |
+| TinyCC | `05f0fafaa3be31e31d7b4b5c17dc60f62c991171` | `tinycc-05f0fafa-source.tar.gz` |
 
 Bun's `scripts/build/deps/webkit.ts` and `scripts/build/deps/tinycc.ts` identify
 the LGPL component revisions. Bun's archive includes its bindings, dependency
@@ -40,14 +40,14 @@ archive endpoint rejects that repository.
 
 The complete upstream repositories remain available at:
 
-- <https://github.com/oven-sh/bun/tree/bun-v1.3.14>
+- <https://github.com/oven-sh/bun/tree/bun-v1.4.0>
 - <https://github.com/microsoft/playwright/tree/v1.62.1>
-- <https://github.com/oven-sh/WebKit/tree/autobuild-5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b>
-- <https://github.com/oven-sh/tinycc/tree/12882eee073cfe5c7621bcfadf679e1372d4537b>
+- <https://github.com/oven-sh/WebKit/tree/autobuild-0f966e81b78c84bb23213e391bc679c4ef83e56b>
+- <https://github.com/oven-sh/tinycc/tree/05f0fafaa3be31e31d7b4b5c17dc60f62c991171>
 
 ## Application build
 
-On macOS arm64, use Bun **1.3.14**, the version pinned in the release workflow:
+On macOS arm64, use Bun **1.4.0**, the version pinned in the release workflow:
 
 ```sh
 bun install --frozen-lockfile
@@ -95,6 +95,12 @@ by its path, as `scripts/build.sh` does; compilation changes the runtime's signe
 Full source is provided rather than an object-only relinking package.
 
 ## Updating notices
+
+The Bun 1.4.0 upgrade's macOS-arm64 Rust dependency notice inventory is not yet
+complete. The generator includes the individually verified rust-argon2 notices,
+but not the full production Rust crate dependency set, including bcrypt and
+getrandom. Complete that inventory before redistributing a Bun 1.4.0 executable.
+A successful `--check` verifies the listed documents, not inventory completeness.
 
 `LICENSE` and `THIRD_PARTY_NOTICES` are generated from canonical/upstream text by
 `bun scripts/sync-notices.ts --webkit-source PATH`, with `PATH` pointing to the

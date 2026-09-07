@@ -22,7 +22,7 @@ A standalone TypeScript provider compiled with Bun and backed by Playwright plus
 
 - Google Chrome (macOS default: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`)
 - macOS on Apple silicon for the prebuilt executable
-- Bun **1.3.14** only when building from source (not required for installation)
+- Bun **1.4.0** only when building from source (not required for installation)
 
 ## Install or update
 
@@ -92,6 +92,12 @@ bun run test:build
 bun run test:release
 ```
 
+`bun test` discovers the maintained tests under `src/`; local diagnostic files
+under `output/` are not part of the release suite. `test:release` also installs
+the packaged executable through the archive's offline installer into a temporary
+directory and checks its version, permissions, and exact bytes. Its component
+source archives are inert fixtures, not upstream-source verification.
+
 The compiled executable is written to:
 
 ```text
@@ -122,7 +128,7 @@ aipass-browser-provider start
 ## Release
 
 `.github/workflows/release.yml` validates and builds `main` and version tags using
-Bun 1.3.14. It runs typechecking, the full test suite, installer checks, binary
+Bun 1.4.0. It runs typechecking, the full test suite, installer checks, binary
 help/version/architecture checks, and redistribution-file checks. It packages
 the executable and one complete source archive containing the exact application
 source, bundled-component sources, notices, installer, and offline checksums.

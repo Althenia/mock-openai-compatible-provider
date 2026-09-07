@@ -115,6 +115,10 @@ test("native authentication rejects visible login or a missing composer but acce
     decoder: () => new StreamFrameParser(), text: delta => ({ type: "text", delta }),
     finish: reason => ({ type: "finish", reason }), isTerminal: frame => frame.type === "finish",
   }
+  // Bun 1.4.0's test runner can stall Playwright pipe callbacks until a timer
+  // wakes it; plain `bun` does not. Remove after the unchanged test passes
+  // without the pulse on a newer runner, not by extending its deadlines.
+  const transportPulse = setInterval(() => {}, 10).unref()
   try {
     for (const candidate of ["visible", "hidden", "missing"] as const) {
       mode = candidate
@@ -138,5 +142,5 @@ test("native authentication rejects visible login or a missing composer but acce
       } finally { await adapter.close(); await rm(profilePath, { recursive: true, force: true }) }
     }
     expect(submissions).toBe(1)
-  } finally { await server.stop(true) }
+  } finally { clearInterval(transportPulse); await server.stop(true) }
 }, 20_000)
