@@ -2,6 +2,7 @@
 import { readFile } from "node:fs/promises"
 import { createReadStream } from "node:fs"
 import { createHash } from "node:crypto"
+import { version } from "../package.json"
 
 const bunRef = "bun-v1.3.14"
 const webkitRef = "autobuild-5488984d20e0dbfe4be2c3ba8fb18eb81a5e0e8b"
@@ -77,7 +78,7 @@ async function text(url: string) {
 
 const license = await text("https://www.gnu.org/licenses/agpl-3.0.txt")
 const sections = [
-  "AIPassport v0.1.0 — third-party notices\n\n" +
+  `AIPassport v${version} — third-party notices\n\n` +
   "The project is AGPL-3.0-only. Third-party components retain their own licenses.\n" +
   "The macOS arm64 executable embeds Bun 1.3.14 and playwright-core 1.62.1.\n" +
   "Chrome is installed separately and is not redistributed.\n\n" +

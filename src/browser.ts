@@ -3,8 +3,9 @@ import { copyFile, mkdir, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { chromium, type BrowserContext, type Locator, type Page } from "playwright-core"
+import { chromium, errors, type BrowserContext, type Locator, type Page } from "playwright-core"
 import { estimateTokens } from "./context.ts"
+import { browserControlState } from "./browser-diagnostics.ts"
 import { INSTRUCTION_DIGEST_PREFIX_LENGTH, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
 
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "max"
@@ -711,7 +712,10 @@ function aborted(signal?: AbortSignal) {
 
 function abortable<A>(operation: Promise<A>, signal?: AbortSignal): Promise<A> {
   if (!signal) return operation
-  if (signal.aborted) return Promise.reject(new BrowserTurnAbortedError())
+  if (signal.aborted) {
+    void operation.catch(() => undefined)
+    return Promise.reject(new BrowserTurnAbortedError())
+  }
   return new Promise((resolve, reject) => {
     const onAbort = () => {
       signal.removeEventListener("abort", onAbort)
@@ -789,14 +793,14 @@ export function classifyNoResponseEvidence(evidence: NoResponseEvidence) {
 }
 
 export interface ModelControl {
-  click(timeoutMs: number): Promise<void>
+  click(timeoutMs: number, signal?: AbortSignal): Promise<void>
 }
 
 export interface ModelSelectionSurface {
-  open(modelName: string, timeoutMs: number): Promise<void>
-  headerControls(modelName: string, timeoutMs: number): Promise<readonly ModelControl[]>
-  expandedControls(modelName: string, timeoutMs: number): Promise<readonly ModelControl[]>
-  thinkingLevels(timeoutMs: number): Promise<readonly ModelControl[]>
+  open(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  headerControls(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<readonly ModelControl[]>
+  expandedControls(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<readonly ModelControl[]>
+  thinkingLevels(timeoutMs: number, signal?: AbortSignal): Promise<readonly ModelControl[]>
 }
 
 interface ModelSelectionInput extends BrowserModel {
@@ -806,6 +810,9 @@ interface ModelSelectionInput extends BrowserModel {
 interface SelectionDeadline {
   readonly timeoutMs?: number
   readonly now?: () => number
+  readonly signal?: AbortSignal
+  readonly onStage?: (stage: string) => void
+  readonly onDeadline?: () => void
 }
 
 /**
@@ -817,78 +824,79 @@ export async function selectModel(
   input: ModelSelectionInput,
   options: SelectionDeadline = {},
 ) {
+  aborted(options.signal)
   if (input.reasoning !== "none" && !input.thinking.includes(input.reasoning))
     throw new Error(`AIPass model ${input.id} does not support thinking level ${input.reasoning}`)
 
   const now = options.now ?? performance.now.bind(performance)
   const started = now()
   const budget = Math.min(options.timeoutMs ?? 20_000, 20_000)
+  const deadline = new AbortController()
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal
   const remaining = () => {
     const value = Math.ceil(budget - (now() - started))
     if (value <= 0) throw new Error("AIPass model selection exceeded its 20 second deadline")
     return value
   }
-  const within = <A>(stage: string, operation: (timeoutMs: number) => Promise<A>) => {
+  const within = async <A>(stage: string, operation: (timeoutMs: number) => Promise<A>) => {
+    aborted(signal)
     const timeoutMs = remaining()
-    return new Promise<A>((resolve, reject) => {
-      const timer = setTimeout(
-        () => reject(new Error(`AIPass model ${stage} exceeded the 20 second selection deadline`)),
-        timeoutMs,
-      )
-      operation(timeoutMs).then(
-        (value) => {
-          clearTimeout(timer)
-          resolve(value)
-        },
-        (error) => {
-          clearTimeout(timer)
-          reject(error)
-        },
-      )
-    })
+    options.onStage?.(stage)
+    const timer = setTimeout(() => { options.onDeadline?.(); deadline.abort() }, timeoutMs)
+    try {
+      const value = await abortable(operation(timeoutMs), signal)
+      aborted(signal)
+      return value
+    } catch (error) {
+      aborted(options.signal)
+      if (deadline.signal.aborted) throw new Error(`AIPass model ${stage} exceeded the 20 second selection deadline`)
+      throw error
+    } finally { clearTimeout(timer) }
   }
 
-  await within("selector open", (timeout) => surface.open(input.name, timeout))
-  let header = await within("card controls", (timeout) => surface.headerControls(input.name, timeout))
+  await within("selector open", (timeout) => surface.open(input.name, timeout, signal))
+  let header = await within("card controls", (timeout) => surface.headerControls(input.name, timeout, signal))
   if (header.length === 0) throw new Error(`AIPass model ${input.id} has no actionable controls`)
 
   if (input.reasoning === "none") {
     if (input.thinking.length === 0) {
-      await within("selection", (timeout) => header.at(-1)!.click(timeout))
+      await within("selection", (timeout) => header.at(-1)!.click(timeout, signal))
       return
     }
     if (header.length === 1) {
-      await within("card expansion", (timeout) => header[0]!.click(timeout))
-      header = await within("card controls", (timeout) => surface.headerControls(input.name, timeout))
+      await within("card expansion", (timeout) => header[0]!.click(timeout, signal))
+      header = await within("card controls", (timeout) => surface.headerControls(input.name, timeout, signal))
     }
     if (header.length < 2)
       throw new Error(`AIPass model ${input.id} could not return to collapsed controls`)
-    await within("selection", (timeout) => header.at(-1)!.click(timeout))
+    await within("selection", (timeout) => header.at(-1)!.click(timeout, signal))
     return
   }
 
-  if (header.length >= 2) await within("thinking expansion", (timeout) => header[0]!.click(timeout))
-  const expanded = await within("thinking controls", (timeout) => surface.expandedControls(input.name, timeout))
+  if (header.length >= 2) await within("thinking expansion", (timeout) => header[0]!.click(timeout, signal))
+  const expanded = await within("thinking controls", (timeout) => surface.expandedControls(input.name, timeout, signal))
   if (expanded.length < 4)
     throw new Error(`AIPass model ${input.id} did not expose thinking controls`)
-  await within("thinking dialog", (timeout) => expanded[1]!.click(timeout))
+  await within("thinking dialog", (timeout) => expanded[1]!.click(timeout, signal))
 
-  const levels = await within("thinking levels", (timeout) => surface.thinkingLevels(timeout))
+  const levels = await within("thinking levels", (timeout) => surface.thinkingLevels(timeout, signal))
   const level = input.thinking.indexOf(input.reasoning)
   if (!levels[level]) throw new Error(`AIPass model ${input.id} did not expose the requested thinking level`)
-  await within("thinking level", (timeout) => levels[level]!.click(timeout))
+  await within("thinking level", (timeout) => levels[level]!.click(timeout, signal))
 
-  header = await within("confirmation controls", (timeout) => surface.headerControls(input.name, timeout))
+  header = await within("confirmation controls", (timeout) => surface.headerControls(input.name, timeout, signal))
   if (header.length === 0) throw new Error(`AIPass model ${input.id} has no confirmation control`)
-  await within("confirmation", (timeout) => header[0]!.click(timeout))
+  await within("confirmation", (timeout) => header[0]!.click(timeout, signal))
 }
 
 class LocatorControl implements ModelControl {
   constructor(private readonly locator: Locator) {}
 
-  async click(timeoutMs: number) {
-    await this.locator.waitFor({ state: "visible", timeout: timeoutMs })
-    await this.locator.evaluate((element) => (element as HTMLElement).click(), undefined, { timeout: timeoutMs })
+  async click(timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    await this.locator.waitFor({ state: "visible", timeout: timeoutMs, signal })
+    aborted(signal)
+    await this.locator.click({ timeout: timeoutMs, signal })
   }
 }
 
@@ -911,39 +919,54 @@ export class PlaywrightModelSelectionSurface implements ModelSelectionSurface {
     return scope.getByText(name, { exact: true })
   }
 
-  private async controls(locator: Locator, timeoutMs: number) {
+  private async controls(locator: Locator, limit: number, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
     const visible = locator.filter({ visible: true })
-    await visible.first().waitFor({ state: "visible", timeout: timeoutMs })
-    const count = await visible.count()
-    return Array.from({ length: count }, (_, index) => new LocatorControl(visible.nth(index)))
+    await visible.first().waitFor({ state: "visible", timeout: timeoutMs, signal })
+    const controls = [new LocatorControl(visible.first())]
+    for (let index = 1; index < limit; index++) {
+      aborted(signal)
+      try {
+        await visible.nth(index).waitFor({ state: "visible", timeout: Math.min(timeoutMs, 250), signal })
+      } catch (error) {
+        aborted(signal)
+        if (!(error instanceof errors.TimeoutError)) throw error
+        break
+      }
+      controls.push(new LocatorControl(visible.nth(index)))
+    }
+    return { controls, visible }
   }
 
-  async open(modelName: string, timeoutMs: number) {
+  async open(modelName: string, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
     const names = this.modelNames.length ? this.modelNames : [modelName]
     const pattern = new RegExp(`^(?:${names.map(escapeRegex).join("|")})(?: (?:${names.map(escapeRegex).join("|")}))?$`)
     const loader = this.selectors.modelLoader
       ? this.page.locator(this.selectors.modelLoader).first()
       : this.page.getByRole("button", { name: pattern }).first()
-    await loader.click({ timeout: timeoutMs })
-    await this.dialog().waitFor({ state: "visible", timeout: timeoutMs })
+    await loader.click({ timeout: timeoutMs, signal })
+    aborted(signal)
+    await this.dialog().waitFor({ state: "visible", timeout: timeoutMs, signal })
   }
 
-  async headerControls(modelName: string, timeoutMs: number) {
+  async headerControls(modelName: string, timeoutMs: number, signal?: AbortSignal) {
     const controls = this.modelName(modelName)
       .locator("xpath=ancestor::*[.//button][1]")
       .getByRole("button")
-    return this.controls(controls, timeoutMs)
+    const result = await this.controls(controls, 2, timeoutMs, signal)
+    return result.controls.length === 1 ? result.controls : [result.controls[0]!, new LocatorControl(result.visible.last())]
   }
 
-  async expandedControls(modelName: string, timeoutMs: number) {
+  async expandedControls(modelName: string, timeoutMs: number, signal?: AbortSignal) {
     const controls = this.modelName(modelName)
       .locator("xpath=ancestor::*[count(.//button) >= 4][1]")
       .getByRole("button")
-    return this.controls(controls, timeoutMs)
+    return (await this.controls(controls, 4, timeoutMs, signal)).controls
   }
 
-  async thinkingLevels(timeoutMs: number) {
-    return this.controls(this.page.getByRole("dialog").last().getByRole("button"), timeoutMs)
+  async thinkingLevels(timeoutMs: number, signal?: AbortSignal) {
+    return (await this.controls(this.page.getByRole("dialog").last().getByRole("button"), 4, timeoutMs, signal)).controls
   }
 }
 
@@ -952,50 +975,57 @@ function escapeRegex(value: string) {
 }
 
 export interface TempChatControl {
-  state(timeoutMs: number): Promise<"on" | "off" | "unknown">
-  click(timeoutMs: number): Promise<void>
+  state(timeoutMs: number, signal?: AbortSignal): Promise<"on" | "off" | "unknown">
+  click(timeoutMs: number, signal?: AbortSignal): Promise<void>
 }
 
 export interface TempChatSurface {
-  control(timeoutMs: number): Promise<TempChatControl | undefined>
+  control(timeoutMs: number, signal?: AbortSignal): Promise<TempChatControl | undefined>
 }
+
+type SetupOperationOwner = <A>(operation: Promise<A>) => Promise<A>
 
 class LocatorTempChatControl implements TempChatControl {
   constructor(
     private readonly locator: Locator,
     private readonly kind: "checkbox" | "switch" | "button" | "link",
+    private readonly ownOperation: SetupOperationOwner,
   ) {}
 
-  async state(timeoutMs: number): Promise<"on" | "off" | "unknown"> {
+  async state(timeoutMs: number, signal?: AbortSignal): Promise<"on" | "off" | "unknown"> {
+    aborted(signal)
     if (this.kind === "checkbox" || this.kind === "switch") {
       try {
-        return (await this.locator.isChecked({ timeout: timeoutMs })) ? "on" : "off"
+        return (await this.locator.isChecked({ timeout: timeoutMs, signal })) ? "on" : "off"
       } catch {
+        aborted(signal)
         // Fall through to aria attributes below.
       }
     }
-    if (this.kind === "link") return this.linkState(timeoutMs)
+    if (this.kind === "link") return this.linkState(timeoutMs, signal)
     for (const attribute of ["aria-checked", "aria-pressed"]) {
-      const value = await this.locator.getAttribute(attribute, { timeout: timeoutMs }).catch(() => null)
+      const value = await this.locator.getAttribute(attribute, { timeout: timeoutMs, signal }).catch(() => null)
+      aborted(signal)
       if (value === "true") return "on"
       if (value === "false") return "off"
     }
-    await this.logFingerprint().catch(() => undefined)
+    await this.logFingerprint(timeoutMs, signal)
     return "unknown"
   }
 
-  private async linkState(timeoutMs: number): Promise<"on" | "off" | "unknown"> {
+  private async linkState(timeoutMs: number, signal?: AbortSignal): Promise<"on" | "off" | "unknown"> {
     const [pressed, dataState, shape] = await Promise.all([
-      this.locator.getAttribute("aria-pressed", { timeout: timeoutMs }).catch(() => null),
-      this.locator.getAttribute("data-state", { timeout: timeoutMs }).catch(() => null),
-      this.locator
+      this.locator.getAttribute("aria-pressed", { timeout: timeoutMs, signal }).catch(() => null),
+      this.locator.getAttribute("data-state", { timeout: timeoutMs, signal }).catch(() => null),
+      this.ownOperation(this.locator
         .evaluate((element: Element) => ({
           temporaryUrl: element.ownerDocument.location.href.includes("temporary-chat"),
           circles: element.querySelectorAll("circle").length,
           paths: element.querySelectorAll("path").length,
-        }))
+        }), undefined, { timeout: timeoutMs, signal }))
         .catch(() => null),
     ])
+    aborted(signal)
     const state = interpretToggleIcon({
       pressed,
       dataState,
@@ -1004,20 +1034,20 @@ class LocatorTempChatControl implements TempChatControl {
       paths: shape?.paths ?? 0,
       shapeOk: shape !== null,
     })
-    if (state === "unknown") await this.logFingerprint().catch(() => undefined)
+    if (state === "unknown") await this.logFingerprint(timeoutMs, signal)
     return state
   }
 
   /**
-   * Failure-path structure only: tag/attribute shapes, parent chain, and
-   * icon geometry. Never reads text content.
+   * Failure-path structure only: tag/attribute presence, parent chain, and
+   * icon counts. Never reads text or arbitrary attribute values.
    */
-  private async logFingerprint() {
-    const fingerprint = await this.locator
+  private async logFingerprint(timeoutMs: number, signal?: AbortSignal) {
+    const fingerprint = await this.ownOperation(this.locator
       .evaluate((element: Element) => {
         const pick = (node: Element | null) => {
           if (!node) return null
-          const attributes: Record<string, string> = {}
+          const attributes: string[] = []
           for (const name of [
             "data-testid",
             "data-role",
@@ -1029,48 +1059,48 @@ class LocatorTempChatControl implements TempChatControl {
             "type",
             "role",
           ]) {
-            const value = node.getAttribute(name)
-            if (value) attributes[name] = value.slice(0, 80)
+            if (node.hasAttribute(name)) attributes.push(name)
           }
-          return `${node.tagName.toLowerCase()}${Object.entries(attributes)
-            .map(([key, value]) => `[${key}="${value}"]`)
-            .join("")}`
+          return `${node.tagName.toLowerCase().slice(0, 80)}${attributes.map(name => `[${name}]`).join("")}`
         }
-        const path = element.querySelector("path")
         const siblings: Array<string | null> = []
         let next: Element | null = element.nextElementSibling
         while (next && siblings.length < 3) {
-          siblings.push(`${pick(next)}.${(next.getAttribute("class") ?? "").slice(0, 60)}`)
+          siblings.push(pick(next))
           next = next.nextElementSibling
         }
         return {
           self: pick(element),
           children: [...element.children]
             .slice(0, 6)
-            .map((child) => `${child.tagName.toLowerCase()}.${(child.getAttribute("class") ?? "").slice(0, 60)}`),
+            .map((child) => child.tagName.toLowerCase().slice(0, 80)),
           siblings,
           parent: pick(element.parentElement),
           grandparent: pick(element.parentElement?.parentElement ?? null),
-          pathD: (path?.getAttribute("d") ?? "").slice(0, 80),
           svg: element.querySelectorAll("svg").length,
           paths: element.querySelectorAll("path").length,
-          classes: (element.getAttribute("class") ?? "").slice(0, 120),
+          circles: element.querySelectorAll("circle").length,
         }
-      })
+      }, undefined, { timeout: timeoutMs, signal }))
       .catch(() => null)
+    aborted(signal)
     if (fingerprint) console.error(`aipass temp chat unreadable kind=${this.kind} ${JSON.stringify(fingerprint)}`)
   }
 
-  async click(timeoutMs: number) {
-    await this.locator.click({ timeout: timeoutMs })
-    if (this.kind !== "link") return
+  async click(timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
     const deadline = Date.now() + Math.max(timeoutMs, 0)
+    await this.locator.click({ timeout: timeoutMs, signal })
+    aborted(signal)
+    if (this.kind !== "link") return
     while (Date.now() < deadline) {
-      const temporary = await this.locator
-        .evaluate((element: Element) => element.ownerDocument.location.href.includes("temporary-chat"))
+      const temporary = await this.ownOperation(this.locator
+        .evaluate((element: Element) => element.ownerDocument.location.href.includes("temporary-chat"), undefined,
+          { timeout: Math.max(1, deadline - Date.now()), signal }))
         .catch(() => false)
+      aborted(signal)
       if (temporary) return
-      await new Promise((resolve) => setTimeout(resolve, 250))
+      await abortable(new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now())))), signal)
     }
   }
 }
@@ -1101,82 +1131,101 @@ export function interpretToggleIcon(input: {
 }
 
 export class PlaywrightTempChatSurface implements TempChatSurface {
-  constructor(private readonly page: Page) {}
+  constructor(
+    private readonly page: Page,
+    private readonly ownOperation: SetupOperationOwner = operation => operation,
+  ) {}
 
-  private async visible(locator: Locator, timeoutMs: number) {
+  private async visible(locator: Locator, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
     try {
-      await locator.waitFor({ state: "visible", timeout: timeoutMs })
+      await locator.waitFor({ state: "visible", timeout: timeoutMs, signal })
+      aborted(signal)
       return true
     } catch {
+      aborted(signal)
       return false
     }
   }
 
-  async control(timeoutMs: number): Promise<TempChatControl | undefined> {
+  async control(timeoutMs: number, signal?: AbortSignal): Promise<TempChatControl | undefined> {
     const per = Math.max(500, Math.floor(Math.min(Math.max(timeoutMs, 0), 6000) / 8))
     const stages: Record<string, boolean> = {}
     const named = this.page.getByRole("checkbox", { name: /temp|temporary|ชั่วคราว/i }).first()
-    stages.checkbox = await this.visible(named, per)
-    if (stages.checkbox) return new LocatorTempChatControl(named, "checkbox")
+    stages.checkbox = await this.visible(named, per, signal)
+    if (stages.checkbox) return new LocatorTempChatControl(named, "checkbox", this.ownOperation)
     const switched = this.page.getByRole("switch", { name: /temp|temporary|ชั่วคราว/i }).first()
-    stages.switch = await this.visible(switched, per)
-    if (stages.switch) return new LocatorTempChatControl(switched, "switch")
+    stages.switch = await this.visible(switched, per, signal)
+    if (stages.switch) return new LocatorTempChatControl(switched, "switch", this.ownOperation)
     const toggle = this.page.getByRole("button", { name: /temp|temporary|ชั่วคราว/i }).first()
-    stages.button = await this.visible(toggle, per)
-    if (stages.button) return new LocatorTempChatControl(toggle, "button")
+    stages.button = await this.visible(toggle, per, signal)
+    if (stages.button) return new LocatorTempChatControl(toggle, "button", this.ownOperation)
     const chatLink = this.page.getByRole("link", { name: /แชทใหม่|new chat/i }).first()
-    stages.chat_link = await this.visible(chatLink, per)
+    stages.chat_link = await this.visible(chatLink, per, signal)
     stages.toggle_link = false
     if (stages.chat_link) {
       const toggleLink = chatLink.locator("xpath=following::a[1]")
-      if (await this.visible(toggleLink, per)) {
-        const [linkBox, toggleBox] = await Promise.all([chatLink.boundingBox(), toggleLink.boundingBox()])
+      if (await this.visible(toggleLink, per, signal)) {
+        const [linkBox, toggleBox] = await Promise.all([
+          this.ownOperation(chatLink.boundingBox({ timeout: per, signal })),
+          this.ownOperation(toggleLink.boundingBox({ timeout: per, signal })),
+        ])
+        aborted(signal)
         const sameRow =
           !!linkBox && !!toggleBox && Math.abs(toggleBox.y - linkBox.y) <= 40 && toggleBox.x >= linkBox.x
         stages.toggle_link = sameRow
-        if (sameRow) return new LocatorTempChatControl(toggleLink, "link")
+        if (sameRow) return new LocatorTempChatControl(toggleLink, "link", this.ownOperation)
         const describe = (box: { x: number; y: number } | null) =>
           box ? `${Math.round(box.x)},${Math.round(box.y)}` : "none"
         console.error(`aipass temp chat toggle link off-row link=${describe(linkBox)} toggle=${describe(toggleBox)}`)
       }
     }
     const menu = this.page.getByRole("button", { name: /menu|เมนู|sidebar|แถบด้านข้าง/i }).first()
-    stages.menu = await this.visible(menu, per)
-    const complementary = await this.page
-      .getByRole("complementary")
-      .count()
-      .catch(() => 0)
-    const navigation = await this.page
-      .getByRole("navigation")
-      .count()
-      .catch(() => 0)
+    stages.menu = await this.visible(menu, per, signal)
     console.error(
-      `aipass temp chat not found checkbox=${stages.checkbox} switch=${stages.switch} button=${stages.button} chat_link=${stages.chat_link} toggle_link=${stages.toggle_link} menu=${stages.menu} complementary=${complementary} navigation=${navigation}`,
+      `aipass temp chat not found checkbox=${stages.checkbox} switch=${stages.switch} button=${stages.button} chat_link=${stages.chat_link} toggle_link=${stages.toggle_link} menu=${stages.menu}`,
     )
     return undefined
   }
 }
 
 /**
- * Ensures the chat runs in temporary (unsaved) mode. Never throws: when the
- * toggle cannot be found, read, or switched, the turn proceeds and the
- * resulting state is reported for diagnostics.
+ * Attempts temporary mode within one eight-second budget. Lookup failures
+ * stay fail-open, but caller cancellation must not continue prompt setup.
  */
 export async function ensureTempChat(
   surface: TempChatSurface,
-  options: { readonly timeoutMs?: number } = {},
+  options: { readonly timeoutMs?: number; readonly signal?: AbortSignal } = {},
 ): Promise<"on" | "off" | "unavailable"> {
+  aborted(options.signal)
+  const budget = Math.min(options.timeoutMs ?? 8000, 8000)
+  if (budget <= 0) return "unavailable"
+  const deadline = new AbortController()
+  const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal
+  const started = performance.now()
+  const timer = setTimeout(() => deadline.abort(), budget)
+  const step = async <A>(limit: number, operation: (timeoutMs: number) => Promise<A>) => {
+    const remaining = Math.ceil(budget - (performance.now() - started))
+    if (remaining <= 0) deadline.abort()
+    aborted(signal)
+    const value = await abortable(operation(Math.min(limit, remaining)), signal)
+    aborted(signal)
+    return value
+  }
   try {
-    const budget = Math.min(options.timeoutMs ?? 8000, 8000)
-    const control = await surface.control(budget)
+    const control = await step(budget, timeout => surface.control(timeout, signal))
     if (!control) return "unavailable"
-    const before = await control.state(Math.min(budget, 3000))
+    const before = await step(3000, timeout => control.state(timeout, signal))
     if (before === "on") return "on"
     if (before === "unknown") return "unavailable"
-    await control.click(Math.min(budget, 5000))
-    return (await control.state(Math.min(budget, 3000))) === "on" ? "on" : "off"
-  } catch {
+    await step(5000, timeout => control.click(timeout, signal))
+    return (await step(3000, timeout => control.state(timeout, signal))) === "on" ? "on" : "off"
+  } catch (error) {
+    aborted(options.signal)
+    if (error instanceof BrowserTurnAbortedError && !deadline.signal.aborted) throw error
     return "unavailable"
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -1280,6 +1329,7 @@ class CaptureQueue {
   }
 
   stop() {
+    this.events.length = 0
     if (this.stopped) return
     this.stopped = true
     for (const waiter of this.waiters.splice(0)) waiter.resolve(undefined)
@@ -1334,13 +1384,22 @@ const STREAM_GENERATION = "__aipassStreamGeneration"
 const STREAM_ARM = "__aipassStreamArm"
 
 export class PageStreamCapture {
-  private active: { readonly generation: string; readonly queue: CaptureQueue } | undefined
+  private active: { readonly generation: string; readonly queue: CaptureQueue; readonly stop: () => Promise<void> } | undefined
+  private readonly operations = new Set<Promise<unknown>>()
 
   private constructor(private readonly page: CaptureTransport) {}
 
-  static async install(page: CaptureTransport, config: { readonly streamURLPattern?: string }) {
+  static async install(page: CaptureTransport, config: {
+    readonly streamURLPattern?: string
+    readonly signal?: AbortSignal
+    readonly onStage?: (stage: string) => void
+  }) {
+    aborted(config.signal)
     const capture = new PageStreamCapture(page)
+    config.onStage?.("capture-binding")
     await page.exposeBinding(STREAM_BINDING, (_source, value) => capture.receive(value))
+    aborted(config.signal)
+    config.onStage?.("capture-script")
     await page.addInitScript(installCaptureScript, {
       bindingName: STREAM_BINDING,
       generationKey: STREAM_GENERATION,
@@ -1357,41 +1416,53 @@ export class PageStreamCapture {
     this.active.queue.push(event)
   }
 
+  private track<A>(operation: Promise<A>): Promise<A> {
+    this.operations.add(operation)
+    return operation.finally(() => this.operations.delete(operation))
+  }
+
+  stop(): Promise<void> {
+    this.active?.stop()
+    return Promise.allSettled([...this.operations]).then(() => undefined)
+  }
+
   async activate(baselineAssistantCount: number, prompt = ""): Promise<ActivePageCapture> {
     this.active?.queue.stop()
     const generation = crypto.randomUUID()
     const queue = new CaptureQueue()
-    this.active = { generation, queue }
-    await this.page.evaluate(
+    const armed = this.track(Promise.resolve().then(() => this.page.evaluate(
       ({ armKey, generation, baseline, prompt }: { armKey: string; generation: string; baseline: number; prompt: string }) => {
         const arm = (globalThis as unknown as Record<string, unknown>)[armKey]
         if (typeof arm !== "function") throw new Error("browser stream capture is unavailable")
         ;(arm as (generation: string, baseline: number, prompt: string) => void)(generation, baseline, prompt)
       },
       { armKey: STREAM_ARM, generation, baseline: baselineAssistantCount, prompt },
-    )
-    let live = true
+    )))
+    let cleanup: Promise<void> | undefined
+    const stop = () => {
+      queue.stop()
+      if (this.active?.generation !== generation) return cleanup ?? Promise.resolve()
+      this.active = undefined
+      // A cancelled activate() may still arm remotely. Own its settlement and
+      // disarm afterward, without touching a newer generation on this page.
+      cleanup = this.track(armed.catch(() => undefined).then(() => this.page.evaluate(
+        ({ armKey, generationKey, generation, value }: { armKey: string; generationKey: string; generation: string; value: string }) => {
+          const scope = globalThis as unknown as Record<string, unknown>
+          const arm = scope[armKey]
+          if (scope[generationKey] === generation && typeof arm === "function")
+            (arm as (generation: string, baseline: number) => void)(value, 0)
+        },
+        { armKey: STREAM_ARM, generationKey: STREAM_GENERATION, generation, value: "" },
+      )).then(() => undefined, () => undefined))
+      return cleanup
+    }
+    this.active = { generation, queue, stop }
+    await armed
     return {
       generation,
       next: (options) => queue.next(options),
       hasPendingSelected: (accepted) => queue.hasPendingSelected(accepted),
-      cleanup: async () => {
-        if (!live) return
-        live = false
-        queue.stop()
-        if (this.active?.generation !== generation) return
-        this.active = undefined
-        await this.page
-          .evaluate(
-            ({ armKey, generation: _generation, value }: { armKey: string; generation: string; value: string }) => {
-              const arm = (globalThis as unknown as Record<string, unknown>)[armKey]
-              if (typeof arm === "function")
-                (arm as (generation: string, baseline: number) => void)(value, 0)
-            },
-            { armKey: STREAM_ARM, generation, value: "" },
-          )
-          .catch(() => undefined)
-      },
+      cleanup: stop,
     }
   }
 }
@@ -1699,6 +1770,10 @@ function installCaptureScript(input: {
 class KeyedLock {
   private readonly tails = new Map<string, Promise<void>>()
 
+  async idle() {
+    while (this.tails.size) await Promise.all(this.tails.values())
+  }
+
   async acquire(key: string) {
     const previous = this.tails.get(key) ?? Promise.resolve()
     let releaseGate!: () => void
@@ -1729,19 +1804,29 @@ function sendButton(page: Page, selectors: BrowserSelectors) {
   return verified.or(promptInput(page, selectors).locator("xpath=ancestor::*[.//button][1]").getByRole("button").last())
 }
 
-async function assertAuthenticated(page: Page, config: BrowserAdapterConfig) {
+async function assertAuthenticated(page: Page, config: BrowserAdapterConfig, signal?: AbortSignal, onStage?: (stage: string) => void) {
+  aborted(signal)
   let loginURL = false
   try {
     loginURL = /\/(?:login|signin)(?:\/|$)/i.test(new URL(page.url()).pathname)
   } catch {}
-  const loginForm = page.locator('input[type="password"],form[action*="login" i],form[action*="signin" i]').first()
-  if (loginURL || (await loginForm.isVisible().catch(() => false))) throw new AuthenticationRequiredError()
+  const timeout = Math.min(config.navigationTimeoutMs ?? 90_000, 5_000)
+  const loginSelector = 'input[type="password"],form[action*="login" i],form[action*="signin" i]'
+  const loginVisible = loginURL || await page.locator("body").evaluate((body, selector) => {
+    const form = body.querySelector(selector)
+    return form?.checkVisibility({ visibilityProperty: true }) ?? false
+  }, loginSelector, { timeout, signal }).catch(() => { aborted(signal); return false })
+  aborted(signal)
+  if (loginVisible) throw new AuthenticationRequiredError()
   try {
+    onStage?.("authentication-ready")
     await promptInput(page, config.selectors ?? {}).waitFor({
       state: "visible",
-      timeout: Math.min(config.navigationTimeoutMs ?? 90_000, 5_000),
+      timeout,
+      signal,
     })
   } catch {
+    aborted(signal)
     throw new AuthenticationRequiredError()
   }
 }
@@ -1981,14 +2066,15 @@ export async function readDomCompletion(page: Page, signal?: AbortSignal): Promi
   return second
 }
 
-async function assistantBaseline(page: Page): Promise<number> {
-  return page.evaluate(() => {
+async function assistantBaseline(page: Page, signal?: AbortSignal): Promise<number> {
+  aborted(signal)
+  return page.locator("body").evaluate(() => {
     const primary = document.querySelectorAll('[data-role="assistant"]').length
     if (primary) return primary
     const role = document.querySelectorAll('[data-message-author-role="assistant"]').length
     if (role) return role
     return document.querySelectorAll('[data-testid*="assistant" i], [data-testid*="bot" i]').length
-  })
+  }, undefined, { timeout: 5_000, signal })
 }
 
 /**
@@ -2079,7 +2165,10 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
   private readonly captures = new WeakMap<Page, PageStreamCapture>()
   private readonly selectedModels = new WeakMap<Page, string>()
   private readonly locks = new KeyedLock()
-  private closed = false
+  private readonly retirements = new Map<Page, Promise<void>>()
+  private readonly pendingSetups = new Set<Promise<void>>()
+  private readonly setupOperations = new WeakMap<Page, Set<Promise<unknown>>>()
+  private closing: Promise<void> | undefined
 
   private constructor(
     private readonly context: BrowserContext,
@@ -2100,44 +2189,120 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
     return new PlaywrightBrowserAdapter(context, config, lifecycle, protocol)
   }
 
-  private async page(sessionMarker: string) {
-    if (this.closed) throw new Error("AIPass browser adapter is closed")
+  private async page(sessionMarker: string, signal?: AbortSignal, onStage?: (stage: string) => void, onFailure?: (error: unknown) => void) {
+    aborted(signal)
     const existing = this.pages.get(sessionMarker)
     if (existing && !existing.isClosed()) return existing
     if (existing) this.pages.delete(sessionMarker)
-    const page = await this.context.newPage()
-    const capture = await PageStreamCapture.install(page, {
-      streamURLPattern: this.config.streamURLPattern,
-    })
-    this.pages.set(sessionMarker, page)
-    this.captures.set(page, capture)
-    return page
+    let page: Page | undefined
+    let capture: PageStreamCapture | undefined
+    let retirement: Promise<void> | undefined
+    let owned = false
+    const setup = (async () => {
+      onStage?.("page-create")
+      page = await this.context.newPage()
+      aborted(signal)
+      capture = await PageStreamCapture.install(page, {
+        streamURLPattern: this.config.streamURLPattern, signal, onStage,
+      })
+      aborted(signal)
+      this.pages.set(sessionMarker, page)
+      this.captures.set(page, capture)
+      return page
+    })()
+    const cleanup = () => {
+      if (owned) return
+      owned = true
+      // These Playwright setup APIs have no native signal. Keep admission
+      // closed until their late result and all of its resources are reclaimed.
+      const work = setup.then(() => undefined, () => undefined).then(async () => {
+        await capture?.stop()
+        if (page) await (retirement ?? this.retire(sessionMarker, page))
+      }).finally(() => this.pendingSetups.delete(work))
+      this.pendingSetups.add(work)
+      if (page) retirement = this.retire(sessionMarker, page)
+    }
+    signal?.addEventListener("abort", cleanup, { once: true })
+    if (signal?.aborted) cleanup()
+    try { return await abortable(setup, signal) }
+    catch (error) { onFailure?.(error); cleanup(); throw error }
+    finally { signal?.removeEventListener("abort", cleanup) }
   }
 
-  private async evict(sessionMarker: string, expected: Page) {
+  private trackSetup<A>(page: Page, operation: Promise<A>): Promise<A> {
+    const operations = this.setupOperations.get(page) ?? new Set<Promise<unknown>>()
+    this.setupOperations.set(page, operations)
+    const work = operation.finally(() => operations.delete(work))
+    operations.add(work)
+    return work
+  }
+
+  private retire(sessionMarker: string, expected: Page): Promise<void> {
     if (this.pages.get(sessionMarker) === expected) this.pages.delete(sessionMarker)
     this.selectedModels.delete(expected)
-    if (!expected.isClosed()) await expected.close().catch(() => undefined)
+    const existing = this.retirements.get(expected)
+    if (existing) return existing
+    const stopped = this.captures.get(expected)?.stop()
+    const closed = new Promise<void>(resolve => {
+      const onClose = () => { expected.removeListener("close", onClose); resolve() }
+      expected.once("close", onClose)
+      if (expected.isClosed()) onClose()
+    })
+    // Register ownership before requesting close, which may fail or emit its
+    // close event immediately. Neither settlement alone proves reclamation.
+    const work = Promise.all([
+      stopped,
+      // Locator.evaluate's signal only covers resolution in pinned Playwright;
+      // evaluation and handle disposal must remain owned until they settle.
+      (async () => {
+        const operations = this.setupOperations.get(expected)
+        while (operations?.size) await Promise.allSettled(operations)
+      })(),
+      closed,
+      Promise.resolve().then(() => expected.isClosed() ? undefined : expected.close({ runBeforeUnload: false }))
+        .catch(() => { console.error("aipass page teardown failed; admission remains closed until the page closes") }),
+    ]).then(() => {
+      this.retirements.delete(expected)
+    })
+    this.retirements.set(expected, work)
+    return work
   }
 
-  private async prime(page: Page, prompt: string, signal?: AbortSignal) {
+  private async evict(sessionMarker: string, expected: Page, signal?: AbortSignal) {
+    await abortable(this.retire(sessionMarker, expected), signal)
+  }
+
+  private assertAvailable() {
+    if (this.closing) throw new Error("AIPass browser adapter is closed")
+    if (this.retirements.size || this.pendingSetups.size) throw new Error("AIPass browser cleanup is pending; retry after cleanup completes")
+  }
+
+  private async prime(page: Page, prompt: string, signal?: AbortSignal, onStage?: (stage: string) => void, onFailure?: (error: unknown) => void) {
+    onStage?.("priming-ready")
     await abortable(
       promptInput(page, this.config.selectors ?? {}).waitFor({
         state: "visible",
         timeout: this.config.navigationTimeoutMs ?? 90_000,
+        signal,
       }),
       signal,
     )
-    const baseline = await abortable(assistantBaseline(page), signal)
+    onStage?.("priming-baseline")
+    const baseline = await abortable(this.trackSetup(page, assistantBaseline(page, signal)), signal)
+    onStage?.("priming-arm")
     const capture = await abortable(this.captures.get(page)!.activate(baseline, prompt), signal)
     try {
+      onStage?.("priming-fill")
       await abortable(
         promptInput(page, this.config.selectors ?? {}).fill(prompt, {
           timeout: this.config.navigationTimeoutMs ?? 90_000,
+          signal,
         }),
         signal,
       )
-      await abortable(sendButton(page, this.config.selectors ?? {}).click({ timeout: 10_000 }), signal)
+      onStage?.("priming-submit")
+      await abortable(sendButton(page, this.config.selectors ?? {}).click({ timeout: 10_000, signal }), signal)
+      onStage?.("priming-response")
       const response = new BrowserResponse(this.protocol)
       const accepted = new Set<number>()
       let terminal = false
@@ -2234,8 +2399,12 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
           if (estimate !== undefined) return estimate
         }
       }
+    } catch (error) {
+      onFailure?.(error)
+      throw error
     } finally {
-      await capture.cleanup().catch(() => undefined)
+      if (!signal?.aborted) onStage?.("priming-cleanup")
+      await abortable(capture.cleanup(), signal)
     }
   }
 
@@ -2244,17 +2413,38 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
     signal?: AbortSignal,
     options: { readonly forceReload?: boolean } = {},
   ): AsyncGenerator<Frame> {
+    aborted(signal)
+    this.assertAvailable()
     const release = await this.locks.acquire(input.sessionMarker)
     let page: Page | undefined
     let capture: ActivePageCapture | undefined
     let attempt: Attempt | undefined
     let possiblySubmitted = false
     let completed = false
+    let admitted = false
+    let stage = "session-setup"
+    let stageStarted = performance.now()
+    let diagnosed = false
+    const mark = (value: string) => { stage = value; stageStarted = performance.now() }
+    const diagnose = (reason: "cancelled" | "deadline" | "failed") => {
+      if (diagnosed) return
+      diagnosed = true
+      console.error(JSON.stringify({
+        diagnostic: "browser-turn-failure", stage, reason,
+        elapsedMs: Math.round(performance.now() - stageStarted),
+        control: browserControlState(this.context),
+      }))
+    }
+    const onAbort = () => diagnose("cancelled")
+    const onFailure = (error: unknown) => diagnose(signal?.aborted || error instanceof BrowserTurnAbortedError ? "cancelled" : "failed")
+    signal?.addEventListener("abort", onAbort, { once: true })
     try {
       aborted(signal)
+      this.assertAvailable()
+      admitted = true
       if (input.compactionDigest && (await this.lifecycle.rotate?.(input.sessionMarker, input.compactionDigest))) {
         const existing = this.pages.get(input.sessionMarker)
-        if (existing) await this.evict(input.sessionMarker, existing)
+        if (existing) await this.evict(input.sessionMarker, existing, signal)
       }
       let binding = await this.lifecycle.binding(input.sessionMarker)
       let bound = binding !== undefined && sameOrigin(binding, this.config.chatURL)
@@ -2270,7 +2460,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         )
       ) {
         const existing = this.pages.get(input.sessionMarker)
-        if (existing) await this.evict(input.sessionMarker, existing)
+        if (existing) await this.evict(input.sessionMarker, existing, signal)
         await this.lifecycle.discard?.(input.sessionMarker)
         binding = undefined
         bound = false
@@ -2289,34 +2479,48 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       console.error(
         `aipass turn session bound=${bound} contractCurrent=${contractCurrent} ephemeral=${input.ephemeral} carriesEnvelope=${carriesEnvelope} promptChars=${prompt.length}`,
       )
+      mark("attempt-preparation")
       attempt = await this.lifecycle.prepare({
         sessionMarker: input.sessionMarker,
         prompt,
         promptHash: promptHash(prompt),
       })
-      page = await this.page(input.sessionMarker)
+      page = await this.page(input.sessionMarker, signal, mark, onFailure)
       const target = bound && binding ? binding : this.config.chatURL
       if (options.forceReload) this.selectedModels.delete(page)
-      if (options.forceReload || page.url() !== target)
+      if (options.forceReload || page.url() !== target) {
+        mark("navigation")
         await abortable(
           page.goto(target, {
             waitUntil: "domcontentloaded",
             timeout: this.config.navigationTimeoutMs ?? 90_000,
+            signal,
           }),
           signal,
         )
+      }
       aborted(signal)
-      const tempChat = await ensureTempChat(new PlaywrightTempChatSurface(page), { timeoutMs: 8000 })
+      mark("temporary-chat")
+      const setupPage = page
+      const tempChat = await ensureTempChat(
+        new PlaywrightTempChatSurface(page, operation => this.trackSetup(setupPage, operation)),
+        { timeoutMs: 8000, signal },
+      )
+      if (this.setupOperations.get(page)?.size) {
+        diagnose("deadline")
+        throw new Error("AIPass temporary-chat setup did not settle before its deadline")
+      }
       console.error(`aipass temp chat state=${tempChat}`)
       const modelSignature = `${input.model.id}:${input.reasoning}`
       const reusableSelection = page.url() === target && this.selectedModels.get(page) === modelSignature
       if (!reusableSelection) {
-        await abortable(assertAuthenticated(page, this.config), signal)
+        mark("authentication")
+        await abortable(this.trackSetup(page, assertAuthenticated(page, this.config, signal, mark)), signal)
         await abortable(
           selectModel(
             new PlaywrightModelSelectionSurface(page, this.config.selectors, this.config.modelNames),
             { ...input.model, reasoning: input.reasoning },
-            { timeoutMs: 20_000 },
+            { timeoutMs: 20_000, signal, onStage: stage => mark(`model-${stage.replaceAll(" ", "-")}`), onDeadline: () => diagnose("deadline") },
           ),
           signal,
         )
@@ -2331,27 +2535,33 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
           )
           primingEstimate +=
             estimateTokens(primingPrompt) +
-            (await this.prime(page, primingPrompt, signal))
+            (await this.prime(page, primingPrompt, signal, mark, onFailure))
         }
       }
 
+      mark("prompt-ready")
       await abortable(
         promptInput(page, this.config.selectors ?? {}).waitFor({
           state: "visible",
           timeout: this.config.navigationTimeoutMs ?? 90_000,
+          signal,
         }),
         signal,
       )
       const fillPrompt = withTurnKey(prompt, input.promptKey)
       const fillStart = performance.now()
+      mark("prompt-fill")
       await abortable(
         promptInput(page, this.config.selectors ?? {}).fill(fillPrompt, {
           timeout: this.config.navigationTimeoutMs ?? 90_000,
+          signal,
         }),
         signal,
       )
       console.error(`aipass submit fillMs=${Math.round(performance.now() - fillStart)} chars=${fillPrompt.length}`)
+      mark("filled-screenshot")
       await captureStepScreenshot(page, this.config.screenshotDir, "filled")
+      mark("attachments")
       const staged = await stageAttachments(input.attachments ?? [])
       try {
         try {
@@ -2364,18 +2574,24 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       } finally {
         await cleanupStagedFiles(staged.dir).catch(() => undefined)
       }
-      const baseline = await abortable(assistantBaseline(page), signal)
+      mark("baseline")
+      const baseline = await abortable(this.trackSetup(page, assistantBaseline(page, signal)), signal)
+      mark("capture-arm")
       capture = await abortable(this.captures.get(page)!.activate(baseline, fillPrompt), signal)
+      mark("attempt-pending")
       await this.lifecycle.pending(attempt)
       possiblySubmitted = true
       const clickStart = performance.now()
-      await abortable(sendButton(page, this.config.selectors ?? {}).click({ timeout: 10_000 }), signal)
+      mark("submit")
+      await abortable(sendButton(page, this.config.selectors ?? {}).click({ timeout: 10_000, signal }), signal)
       console.error(`aipass submit clickMs=${Math.round(performance.now() - clickStart)}`)
+      mark("submitted-screenshot")
       await captureStepScreenshot(page, this.config.screenshotDir, "submitted")
       const submittedRemoteChatID = page.url()
       if (sameOrigin(submittedRemoteChatID, this.config.chatURL))
         await this.lifecycle.bind(input.sessionMarker, submittedRemoteChatID)
 
+      mark("response")
       const response = new BrowserResponse(this.protocol)
       const accepted = new Set<number>()
       let terminal = false
@@ -2549,6 +2765,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
 
       if (!terminal) throw new Error("observed browser turn ended without a terminal frame")
       const remoteChatID = page.url()
+      mark("attempt-completion")
       await this.lifecycle.complete(
         attempt,
         sameOrigin(remoteChatID, this.config.chatURL) ? remoteChatID : undefined,
@@ -2558,30 +2775,58 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       )
       completed = true
     } catch (error) {
-      if (page) await captureStepScreenshot(page, this.config.screenshotDir, "failed")
-      if (attempt && !completed)
-        await this.lifecycle.fail(attempt, {
-          possiblySubmitted,
-          cancelled: error instanceof BrowserTurnAbortedError || signal?.aborted === true,
-          definitive: error instanceof NoResponseEvidenceError,
-        })
-      if (page && !(error instanceof NoResponseEvidenceError)) await this.evict(input.sessionMarker, page)
+      onFailure(error)
+      if (page && (signal?.aborted || error instanceof BrowserTurnAbortedError)) this.retire(input.sessionMarker, page)
+      try {
+        if (page && !signal?.aborted) await captureStepScreenshot(page, this.config.screenshotDir, "failed")
+        if (attempt && !completed)
+          await this.lifecycle.fail(attempt, {
+            possiblySubmitted,
+            cancelled: error instanceof BrowserTurnAbortedError || signal?.aborted === true,
+            definitive: error instanceof NoResponseEvidenceError,
+          })
+      } finally {
+        if (page && !(error instanceof NoResponseEvidenceError)) this.retire(input.sessionMarker, page)
+      }
       throw error
     } finally {
-      await capture?.cleanup().catch(() => undefined)
-      if (input.ephemeral) {
-        if (page && !page.isClosed()) await this.evict(input.sessionMarker, page)
-        await this.lifecycle.discard?.(input.sessionMarker)
+      try {
+        try {
+          if (!diagnosed) mark("capture-cleanup")
+          if (capture) await abortable(capture.cleanup(), signal)
+        } catch (error) {
+          diagnose(signal?.aborted ? "cancelled" : "failed")
+          if (page) this.retire(input.sessionMarker, page)
+          throw error
+        }
+      } finally {
+        try {
+          if (input.ephemeral && admitted) {
+            if (!diagnosed) mark("session-discard")
+            try {
+              if (page && !page.isClosed()) await this.evict(input.sessionMarker, page, signal)
+            } finally {
+              await this.lifecycle.discard?.(input.sessionMarker)
+            }
+          }
+        } finally {
+          signal?.removeEventListener("abort", onAbort)
+          release()
+        }
       }
-      release()
     }
   }
 
-  async close() {
-    if (this.closed) return
-    this.closed = true
-    this.pages.clear()
-    await this.context.close()
+  close(): Promise<void> {
+    if (this.closing) return this.closing
+    this.closing = (async () => {
+      await this.locks.idle()
+      for (const [sessionMarker, page] of this.pages) this.retire(sessionMarker, page)
+      while (this.retirements.size || this.pendingSetups.size)
+        await Promise.all([...this.retirements.values(), ...this.pendingSetups])
+      await this.context.close()
+    })()
+    return this.closing
   }
 
   async discard(sessionMarker: string) {

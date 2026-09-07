@@ -42,7 +42,7 @@ existing binary; retry later.
 To select a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Althenia/mock-openai-compatible-provider/main/site/install.sh | sh -s -- --version 0.1.0
+curl -fsSL https://raw.githubusercontent.com/Althenia/mock-openai-compatible-provider/main/site/install.sh | sh -s -- --version 1.0.1
 ```
 
 The installer verifies the executable's SHA-256 checksum, runs its `help` check,
@@ -50,24 +50,27 @@ and atomically installs it as `~/.local/bin/aipass-browser-provider` with mode
 `0700`. Set `AIPASS_INSTALL_DIR` or pass `--install-dir DIRECTORY` to choose
 another destination. Updating the executable does not restart a running
 provider. Stop it before replacing the binary. Check the installed version with
-`aipass-browser-provider --version`; it must print `0.1.0` for this release.
+`aipass-browser-provider --version`; it must print `1.0.1` for this release.
 The binaries are ad-hoc signed, not Developer ID signed or notarized.
+Read [v1.0.1's known limitations](docs/releases/v1.0.1.md) before updating:
+model selection can time out before a prompt is submitted, and live skill,
+file-operation, and MCP execution is not verified on the current build.
 
 For offline installation or restoration, download the executable and complete
 source archive into one directory, then run these commands there:
 
 ```sh
-tar -xzf aipass-browser-provider-0.1.0-complete-source.tar.gz
+tar -xzf aipass-browser-provider-1.0.1-complete-source.tar.gz
 shasum -a 256 -c checksums.txt
-sh install.sh --version 0.1.0 --from-dir .
+sh install.sh --version 1.0.1 --from-dir .
 ```
 
 The archive contains the installer and checksums needed by `--from-dir`, plus
 the licenses and corresponding source to keep when redistributing. Use the
-matching directory/version for a restore. This first release has no earlier
-published version: retain a verified copy of any source-built executable before
-upgrading. Preserve state/config directories during a restore; process-memory
-Responses IDs do not survive a restart.
+matching directory/version for a restore. To restore the published `0.1.0`
+binary, use `--version 0.1.0` with the online installer or that release's verified
+offline directory. Stop the provider before replacement and preserve state/config
+directories; process-memory Responses IDs do not survive a restart.
 
 Then authenticate and start it:
 
@@ -126,7 +129,7 @@ source, bundled-component sources, notices, installer, and offline checksums.
 CI verifies an internal checksum manifest, but publishes only the executable and
 complete source archive as release attachments. Only a `vX.Y.Z` tag publishes a
 GitHub Release; the tag must equal `v` plus `package.json`'s version. Existing
-releases are not overwritten. Review [v0.1.0's limitations](docs/releases/v0.1.0.md)
+releases are not overwritten. Review [v1.0.1's limitations](docs/releases/v1.0.1.md)
 before use; a successful build does not erase the recorded live-model failures.
 
 The project is **AGPL-3.0-only**; see [LICENSE](LICENSE),
@@ -262,7 +265,7 @@ For automatic tool choice, the provider buffers at most 64 KiB before exposing a
 
 Preserve-mode requests carry the complete supplied system/developer instructions, supplied conversation in order, matched tool-call/result text, and the current bounded action contract in the current browser submission. Initial, bound, and recovery routes use that same self-contained projection: browser affinity and a current contract digest are not treated as evidence of retained model context. Tool names remain available through the complete name index; full schemas are selected and provisioned as needed. Prompt projection logs contain only action names and character counts, never prompt content.
 
-Long instructions are no longer split into acknowledgement turns or reduced to a head/tail anchor. They stay inline without silent truncation. This preserves transmitted request content; it does not establish an upstream context limit or guarantee that every model will use large requests correctly. See the [release limitations](docs/releases/v0.1.0.md) for the observed compatibility boundaries. Raw local diagnostic reports are not distributed with the release.
+Long instructions are no longer split into acknowledgement turns or reduced to a head/tail anchor. They stay inline without silent truncation. This preserves transmitted request content; it does not establish an upstream context limit or guarantee that every model will use large requests correctly. See the [release limitations](docs/releases/v1.0.1.md) for the observed compatibility boundaries. Raw local diagnostic reports are not distributed with the release.
 
 Requests default to `instruction_mode: "preserve"`, including those carrying `x-session-affinity`: affinity controls session routing, not instruction omission. The non-standard request extension `instruction_mode: "action-only"` explicitly omits system/developer text and lowered system updates, and retains incremental-suffix routing for bound turns. An explicit `instruction_mode` always wins. Action-only mode is intended for orchestration clients that enforce their own instruction layer and need the browser model solely to select from the projected actions. Existing clients that need instruction omission must opt in explicitly. Switching an existing affinity from `preserve` to `action-only` starts a fresh remote conversation so previously projected instructions cannot remain active. Estimated API input usage describes the initial projected request, excluding omitted instructions; it is not native billing or a total of internal attempts.
 
