@@ -79,7 +79,13 @@ test("missing temporary-chat controls do not trigger timeout-free diagnostic cou
   expect(counts).toBe(0)
 })
 
-for (const stage of ["open", "header", "expand", "expanded", "dialog", "levels", "level", "confirmation-controls", "confirm"] as const) {
+const idleModelSurface: ModelSelectionSurface = {
+  async open() {}, async expand() {}, async processingLevel() { return "none" },
+  async openProcessing() {}, async chooseProcessing() {}, async verifyProcessing() {},
+  async confirm() {}, async select() {}, async waitClosed() {},
+}
+
+for (const stage of ["open", "expand", "value", "dialog", "level", "verification", "confirm", "select", "closed"] as const) {
   test(`model selection cancellation reaches native ${stage} work and never starts a later action`, async () => {
     const entered = deferred<void>(), resume = deferred<void>()
     const calls: string[] = []
@@ -89,23 +95,20 @@ for (const stage of ["open", "header", "expand", "expanded", "dialog", "levels",
       if (name === stage) { nativeSignal = signal; entered.resolve(); await resume.promise }
       if (signal?.aborted) throw new DOMException("fixture cancelled", "AbortError")
     }
-    const control = (name: string) => ({ async click(_timeout: number, signal?: AbortSignal) { await visit(name, signal) } })
-    let headers = 0
     const surface: ModelSelectionSurface = {
       async open(_name, _timeout, signal?: AbortSignal) { await visit("open", signal) },
-      async headerControls(_name, _timeout, signal?: AbortSignal) {
-        await visit(headers++ ? "confirmation-controls" : "header", signal)
-        return headers === 1 ? [control("expand"), control("select")] : [control("confirm")]
-      },
-      async expandedControls(_name, _timeout, signal?: AbortSignal) {
-        await visit("expanded", signal)
-        return [control("confirm"), control("dialog"), control("other"), control("select")]
-      },
-      async thinkingLevels(_timeout, signal?: AbortSignal) { await visit("levels", signal); return [control("level")] },
+      async expand(_name, _timeout, signal?: AbortSignal) { await visit("expand", signal) },
+      async processingLevel(_name, _timeout, signal?: AbortSignal) { await visit("value", signal); return "none" },
+      async openProcessing(_name, _timeout, signal?: AbortSignal) { await visit("dialog", signal) },
+      async chooseProcessing(_name, _level, _timeout, signal?: AbortSignal) { await visit("level", signal) },
+      async verifyProcessing(_name, _level, _timeout, signal?: AbortSignal) { await visit("verification", signal) },
+      async confirm(_name, _timeout, signal?: AbortSignal) { await visit("confirm", signal) },
+      async select(_name, _timeout, signal?: AbortSignal) { await visit("select", signal) },
+      async waitClosed(_name, _timeout, signal?: AbortSignal) { await visit("closed", signal) },
     }
     const abort = new AbortController()
     const options = { timeoutMs: 1000, signal: abort.signal }
-    const work = selectModel(surface, { id: "fixture", name: "Fixture", thinking: ["low"], reasoning: "low" }, options)
+    const work = selectModel(surface, { id: "fixture", name: "Fixture", thinking: stage === "select" ? [] : ["low"], reasoning: stage === "select" ? "none" : "low" }, options)
       .then(() => ({ done: true }), error => ({ name: error.name }))
     try {
       await entered.promise
@@ -124,8 +127,7 @@ for (const stage of ["open", "header", "expand", "expanded", "dialog", "levels",
 test("model selection does not open controls for a pre-cancelled turn", async () => {
   let opens = 0
   const surface: ModelSelectionSurface = {
-    async open() { opens++ }, async headerControls() { return [] },
-    async expandedControls() { return [] }, async thinkingLevels() { return [] },
+    ...idleModelSurface, async open() { opens++ },
   }
   const options = { signal: AbortSignal.abort() }
   await expect(selectModel(surface, { id: "fixture", name: "Fixture", thinking: [], reasoning: "none" }, options))
@@ -137,8 +139,9 @@ test("model selection deadline aborts the underlying operation and prevents late
   const resume = deferred<void>()
   let nativeSignal: AbortSignal | undefined, later = 0
   const surface: ModelSelectionSurface = {
+    ...idleModelSurface,
     async open(_name, _timeout, signal?: AbortSignal) { nativeSignal = signal; await resume.promise },
-    async headerControls() { later++; return [] }, async expandedControls() { return [] }, async thinkingLevels() { return [] },
+    async select() { later++ },
   }
   const work = selectModel(surface, { id: "fixture", name: "Fixture", thinking: [], reasoning: "none" }, { timeoutMs: 20 })
     .then(() => ({ done: true }), error => ({ message: error.message }))
@@ -157,8 +160,8 @@ test("synchronous cancellation at model-operation admission still observes its r
   const record = (error: unknown) => { unhandled.push(error) }
   process.on("unhandledRejection", record)
   const surface: ModelSelectionSurface = {
+    ...idleModelSurface,
     async open() { abort.abort(); throw Error("fixture operation rejected after cancellation") },
-    async headerControls() { return [] }, async expandedControls() { return [] }, async thinkingLevels() { return [] },
   }
   try {
     await expect(selectModel(surface, { id: "fixture", name: "Fixture", thinking: [], reasoning: "none" }, { signal: abort.signal }))
@@ -223,6 +226,8 @@ class FixturePage extends EventEmitter {
     }
     return new FixtureLocator(this, role === "checkbox" ? "temp" : role === "dialog" ? "dialog" : "model")
   }
+  getByTestId() { return new FixtureLocator(this, "dialog") }
+  getByText() { return new FixtureLocator(this, "model") }
   locator(selector: string) { return new FixtureLocator(this, selector) }
   async exposeBinding(_name: string, binding: (source: unknown, value: unknown) => void | Promise<void>) { await this.hold("binding"); this.binding = binding }
   async addInitScript() { this.initCalls++; await this.hold("init-script") }
@@ -276,7 +281,7 @@ class FixtureLocator {
   nth(index: number) { return new FixtureLocator(this.page, this.kind, index) }
   filter() { return this }
   locator() { return this.kind === "new-link" ? new FixtureLocator(this.page, "toggle-link") : this }
-  getByRole() { return this }
+  getByRole() { return this.kind === "dialog" ? new FixtureLocator(this.page, "model") : this }
   getByText() { return new FixtureLocator(this.page, "model") }
   async count() { await this.page.hold("model-controls"); return 1 }
   async isChecked() { return true }
@@ -315,7 +320,10 @@ class FixtureLocator {
     }
   }
   async click(options?: { signal?: AbortSignal }) {
-    if (this.kind === "model") await this.page.hold("model-click", options?.signal)
+    if (this.kind === "model") {
+      await this.page.hold("model-controls", options?.signal)
+      await this.page.hold("model-click", options?.signal)
+    }
     if (this.kind === "#model") await this.page.hold("model-open", options?.signal)
     if (this.kind !== "#send") return
     if (this.page.stage === "click") {

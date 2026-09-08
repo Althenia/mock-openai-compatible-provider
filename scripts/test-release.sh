@@ -16,7 +16,7 @@ cp "$root/package.json" "$root/LICENSE" "$root/THIRD_PARTY_NOTICES" "$root/SOURC
 cp "$root/site/install.sh" "$fixture/site/"
 version=$(cd "$root" && bun -p 'require("./package.json").version')
 cp "$root/docs/releases/v$version.md" "$fixture/docs/releases/"
-for name in bun-1.4.0-source playwright-1.62.1-source tinycc-05f0fafa-source webkit-0f966e81-source; do
+for name in bun-1.4.2-source playwright-1.62.1-source tinycc-05f0fafa-source webkit-2e2aa229-source; do
   printf 'inert preflight fixture\n' > "$work/sources/$name.tar.gz"
 done
 (cd "$work/sources" && shasum -a 256 *.tar.gz) > "$fixture/third-party/sources.sha256"
@@ -74,7 +74,7 @@ if bash "$fixture/scripts/prepare-release.sh" "$work/candidate" "$work/sources" 
   exit 1
 fi
 (cd "$work/candidate" && shasum -a 256 -c checksums.txt)
-printf 'tampered\n' >> "$work/sources/bun-1.4.0-source.tar.gz"
+printf 'tampered\n' >> "$work/sources/bun-1.4.2-source.tar.gz"
 if bash "$fixture/scripts/prepare-release.sh" "$work/tampered-candidate" "$work/sources" > "$work/tampered.log" 2>&1; then
   echo 'tampered bundled source was accepted' >&2
   exit 1

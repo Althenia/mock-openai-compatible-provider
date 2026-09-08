@@ -1,14 +1,14 @@
 # Source and rebuilding
 
 AIPassport is licensed under **AGPL-3.0-only**. The release's
-`aipass-browser-provider-0.1.1-complete-source.tar.gz` consolidates the application
+`aipass-browser-provider-0.1.2-complete-source.tar.gz` consolidates the application
 source archive, bundled-component source archives, license/notices, rebuilding
 instructions, installer, and offline checksums. Its nested
-`aipass-browser-provider-0.1.1-source.tar.gz` contains the application source,
+`aipass-browser-provider-0.1.2-source.tar.gz` contains the application source,
 locked dependency manifest, tests, and build/installation scripts from the exact
-release commit. The same commit is available through the `v0.1.1` Git tag.
+release commit. The same commit is available through the `v0.1.2` Git tag.
 The included `release.json` identifies that commit, version, compiler, and target.
-The existing `v0.1.0` release remains unchanged. Supporting files for `v0.1.1`
+The existing `v0.1.0` and `v0.1.1` releases remain unchanged. Supporting files for `v0.1.2`
 are inside its complete source bundle rather than separate release attachments.
 
 Keep this document, `LICENSE`, `THIRD_PARTY_NOTICES`, and corresponding source
@@ -24,9 +24,9 @@ The complete source archive also contains:
 
 | Component | Source revision | Archive |
 | --- | --- | --- |
-| Bun | `bun-v1.4.0` | `bun-1.4.0-source.tar.gz` |
+| Bun | `bun-v1.4.2` | `bun-1.4.2-source.tar.gz` |
 | Playwright | `v1.62.1` | `playwright-1.62.1-source.tar.gz` |
-| WebKit/JavaScriptCore | `0f966e81b78c84bb23213e391bc679c4ef83e56b` | `webkit-0f966e81-source.tar.gz` |
+| WebKit/JavaScriptCore | `2e2aa2290fac856d6f451ceacb58f7f5b44dd057` | `webkit-2e2aa229-source.tar.gz` |
 | TinyCC | `05f0fafaa3be31e31d7b4b5c17dc60f62c991171` | `tinycc-05f0fafa-source.tar.gz` |
 
 Bun's `scripts/build/deps/webkit.ts` and `scripts/build/deps/tinycc.ts` identify
@@ -46,14 +46,14 @@ Those archives provide the crate sources, including MPL-2.0 components such as
 
 The complete upstream repositories remain available at:
 
-- <https://github.com/oven-sh/bun/tree/bun-v1.4.0>
+- <https://github.com/oven-sh/bun/tree/bun-v1.4.2>
 - <https://github.com/microsoft/playwright/tree/v1.62.1>
-- <https://github.com/oven-sh/WebKit/tree/autobuild-0f966e81b78c84bb23213e391bc679c4ef83e56b>
+- <https://github.com/oven-sh/WebKit/tree/autobuild-2e2aa2290fac856d6f451ceacb58f7f5b44dd057>
 - <https://github.com/oven-sh/tinycc/tree/05f0fafaa3be31e31d7b4b5c17dc60f62c991171>
 
 ## Application build
 
-On macOS arm64, use Bun **1.4.0**, the version pinned in the release workflow:
+On macOS arm64, use Bun **1.4.2**, the version pinned in the release workflow:
 
 ```sh
 bun install --frozen-lockfile

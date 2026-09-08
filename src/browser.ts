@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { chromium, errors, type BrowserContext, type Locator, type Page } from "playwright-core"
 import { estimateTokens } from "./context.ts"
 import { browserControlState } from "./browser-diagnostics.ts"
+import { THINKING_LABELS } from "./model-catalog.ts"
 import { INSTRUCTION_DIGEST_PREFIX_LENGTH, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
 
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "max"
@@ -792,15 +793,16 @@ export function classifyNoResponseEvidence(evidence: NoResponseEvidence) {
   )
 }
 
-export interface ModelControl {
-  click(timeoutMs: number, signal?: AbortSignal): Promise<void>
-}
-
 export interface ModelSelectionSurface {
   open(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
-  headerControls(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<readonly ModelControl[]>
-  expandedControls(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<readonly ModelControl[]>
-  thinkingLevels(timeoutMs: number, signal?: AbortSignal): Promise<readonly ModelControl[]>
+  expand(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  processingLevel(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<ReasoningLevel>
+  openProcessing(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  chooseProcessing(modelName: string, level: Exclude<ReasoningLevel, "none">, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  verifyProcessing(modelName: string, level: ReasoningLevel, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  confirm(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  select(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
+  waitClosed(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<void>
 }
 
 interface ModelSelectionInput extends BrowserModel {
@@ -855,49 +857,25 @@ export async function selectModel(
   }
 
   await within("selector open", (timeout) => surface.open(input.name, timeout, signal))
-  let header = await within("card controls", (timeout) => surface.headerControls(input.name, timeout, signal))
-  if (header.length === 0) throw new Error(`AIPass model ${input.id} has no actionable controls`)
-
-  if (input.reasoning === "none") {
-    if (input.thinking.length === 0) {
-      await within("selection", (timeout) => header.at(-1)!.click(timeout, signal))
-      return
+  if (input.thinking.length === 0) {
+    await within("selection", (timeout) => surface.select(input.name, timeout, signal))
+  } else {
+    await within("thinking expansion", (timeout) => surface.expand(input.name, timeout, signal))
+    const current = await within("thinking value", (timeout) => surface.processingLevel(input.name, timeout, signal))
+    if (current !== "none" && !input.thinking.includes(current))
+      throw new Error(`AIPass model ${input.id} displays an unsupported thinking level`)
+    if (current !== input.reasoning) {
+      // Selecting the current option toggles it off; an already-correct value must not be clicked again.
+      const choice = input.reasoning === "none" ? current : input.reasoning
+      if (choice !== "none") {
+        await within("thinking dialog", (timeout) => surface.openProcessing(input.name, timeout, signal))
+        await within("thinking level", (timeout) => surface.chooseProcessing(input.name, choice, timeout, signal))
+      }
     }
-    if (header.length === 1) {
-      await within("card expansion", (timeout) => header[0]!.click(timeout, signal))
-      header = await within("card controls", (timeout) => surface.headerControls(input.name, timeout, signal))
-    }
-    if (header.length < 2)
-      throw new Error(`AIPass model ${input.id} could not return to collapsed controls`)
-    await within("selection", (timeout) => header.at(-1)!.click(timeout, signal))
-    return
+    await within("thinking verification", (timeout) => surface.verifyProcessing(input.name, input.reasoning, timeout, signal))
+    await within("confirmation", (timeout) => surface.confirm(input.name, timeout, signal))
   }
-
-  if (header.length >= 2) await within("thinking expansion", (timeout) => header[0]!.click(timeout, signal))
-  const expanded = await within("thinking controls", (timeout) => surface.expandedControls(input.name, timeout, signal))
-  if (expanded.length < 4)
-    throw new Error(`AIPass model ${input.id} did not expose thinking controls`)
-  await within("thinking dialog", (timeout) => expanded[1]!.click(timeout, signal))
-
-  const levels = await within("thinking levels", (timeout) => surface.thinkingLevels(timeout, signal))
-  const level = input.thinking.indexOf(input.reasoning)
-  if (!levels[level]) throw new Error(`AIPass model ${input.id} did not expose the requested thinking level`)
-  await within("thinking level", (timeout) => levels[level]!.click(timeout, signal))
-
-  header = await within("confirmation controls", (timeout) => surface.headerControls(input.name, timeout, signal))
-  if (header.length === 0) throw new Error(`AIPass model ${input.id} has no confirmation control`)
-  await within("confirmation", (timeout) => header[0]!.click(timeout, signal))
-}
-
-class LocatorControl implements ModelControl {
-  constructor(private readonly locator: Locator) {}
-
-  async click(timeoutMs: number, signal?: AbortSignal) {
-    aborted(signal)
-    await this.locator.waitFor({ state: "visible", timeout: timeoutMs, signal })
-    aborted(signal)
-    await this.locator.click({ timeout: timeoutMs, signal })
-  }
+  await within("selection closed", (timeout) => surface.waitClosed(input.name, timeout, signal))
 }
 
 export class PlaywrightModelSelectionSurface implements ModelSelectionSurface {
@@ -908,65 +886,106 @@ export class PlaywrightModelSelectionSurface implements ModelSelectionSurface {
   ) {}
 
   private dialog() {
-    return this.page.getByRole("dialog").first()
+    return this.page.getByTestId("model-selector-modal")
   }
 
-  private modelName(name: string) {
-    const dialog = this.dialog()
-    const scope = this.selectors.modelOptions
-      ? dialog.locator(this.selectors.modelOptions).filter({ hasText: name }).first()
-      : dialog
-    return scope.getByText(name, { exact: true })
+  private card(name: string) {
+    return this.dialog().locator(this.selectors.modelOptions ?? '[data-testid="model-card"]')
+      .filter({ has: this.page.getByText(name, { exact: true }) })
   }
 
-  private async controls(locator: Locator, limit: number, timeoutMs: number, signal?: AbortSignal) {
-    aborted(signal)
-    const visible = locator.filter({ visible: true })
-    await visible.first().waitFor({ state: "visible", timeout: timeoutMs, signal })
-    const controls = [new LocatorControl(visible.first())]
-    for (let index = 1; index < limit; index++) {
-      aborted(signal)
-      try {
-        await visible.nth(index).waitFor({ state: "visible", timeout: Math.min(timeoutMs, 250), signal })
-      } catch (error) {
-        aborted(signal)
-        if (!(error instanceof errors.TimeoutError)) throw error
-        break
-      }
-      controls.push(new LocatorControl(visible.nth(index)))
-    }
-    return { controls, visible }
+  private processing(name: string) {
+    return this.card(name).getByTestId("thinking-level-trigger")
+  }
+
+  private loader(modelName: string) {
+    const names = this.modelNames.length ? this.modelNames : [modelName]
+    const pattern = new RegExp(`^(?:${names.map(escapeRegex).join("|")})(?: (?:${names.map(escapeRegex).join("|")}))?$`)
+    return this.selectors.modelLoader
+      ? this.page.locator(this.selectors.modelLoader).first()
+      : this.page.getByRole("button", { name: pattern }).first()
   }
 
   async open(modelName: string, timeoutMs: number, signal?: AbortSignal) {
     aborted(signal)
-    const names = this.modelNames.length ? this.modelNames : [modelName]
-    const pattern = new RegExp(`^(?:${names.map(escapeRegex).join("|")})(?: (?:${names.map(escapeRegex).join("|")}))?$`)
-    const loader = this.selectors.modelLoader
-      ? this.page.locator(this.selectors.modelLoader).first()
-      : this.page.getByRole("button", { name: pattern }).first()
-    await loader.click({ timeout: timeoutMs, signal })
+    await this.loader(modelName).click({ timeout: timeoutMs, signal })
     aborted(signal)
     await this.dialog().waitFor({ state: "visible", timeout: timeoutMs, signal })
   }
 
-  async headerControls(modelName: string, timeoutMs: number, signal?: AbortSignal) {
-    const controls = this.modelName(modelName)
-      .locator("xpath=ancestor::*[.//button][1]")
-      .getByRole("button")
-    const result = await this.controls(controls, 2, timeoutMs, signal)
-    return result.controls.length === 1 ? result.controls : [result.controls[0]!, new LocatorControl(result.visible.last())]
+  async expand(modelName: string, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    const action = this.card(modelName).getByRole("button", { name: /^(?:More settings|ตั้งค่าเพิ่มเติม|Confirm|ยืนยัน)$/ })
+    const label = await action.innerText({ timeout: timeoutMs, signal })
+    if (/^(?:More settings|ตั้งค่าเพิ่มเติม)$/.test(label.trim())) {
+      aborted(signal)
+      await action.click({ timeout: timeoutMs, signal })
+    }
+    aborted(signal)
+    await this.processing(modelName).waitFor({ state: "visible", timeout: timeoutMs, signal })
   }
 
-  async expandedControls(modelName: string, timeoutMs: number, signal?: AbortSignal) {
-    const controls = this.modelName(modelName)
-      .locator("xpath=ancestor::*[count(.//button) >= 4][1]")
-      .getByRole("button")
-    return (await this.controls(controls, 4, timeoutMs, signal)).controls
+  async processingLevel(modelName: string, timeoutMs: number, signal?: AbortSignal): Promise<ReasoningLevel> {
+    aborted(signal)
+    const text = await this.processing(modelName).innerText({ timeout: timeoutMs, signal })
+    const value = text.replace(/^(?:Processing|การประมวลผล)/, "").trim()
+    if (!value) return "none"
+    for (const level of ["low", "medium", "high", "max"] as const)
+      if (THINKING_LABELS[level].includes(value)) return level
+    throw new Error(`AIPass model ${modelName} has an unrecognized Processing value`)
   }
 
-  async thinkingLevels(timeoutMs: number, signal?: AbortSignal) {
-    return (await this.controls(this.page.getByRole("dialog").last().getByRole("button"), 4, timeoutMs, signal)).controls
+  async openProcessing(modelName: string, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    // The picker dismisses popovers on scroll; expose the whole row before opening it.
+    await this.processing(modelName).scrollIntoViewIfNeeded({ timeout: timeoutMs, signal })
+    aborted(signal)
+    await this.processing(modelName).getByText(/^(?:Processing|การประมวลผล)$/).click({ timeout: timeoutMs, signal })
+  }
+
+  async chooseProcessing(modelName: string, level: Exclude<ReasoningLevel, "none">, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    const trigger = this.card(modelName).locator('[data-testid="thinking-level-trigger"][aria-expanded="true"][aria-controls]')
+    await trigger.waitFor({ state: "visible", timeout: timeoutMs, signal })
+    const id = await trigger.getAttribute("aria-controls", { timeout: timeoutMs, signal })
+    if (!id) throw new Error(`AIPass model ${modelName} did not identify its Processing dropdown`)
+    const popup = this.page.locator(`[id=${JSON.stringify(id)}][role="dialog"][data-slot="popover-content"][data-open]:not([data-closed])`)
+    aborted(signal)
+    const option = popup.getByRole("button", { name: new RegExp(`^(?:${THINKING_LABELS[level].map(escapeRegex).join("|")})$`) })
+    await option.waitFor({ state: "visible", timeout: timeoutMs, signal })
+    aborted(signal)
+    // Activate the verified button without pointer-induced scrolling or keyboard focus changes.
+    await option.evaluate(element => {
+      if (!(element instanceof HTMLButtonElement) || element.disabled || !element.checkVisibility())
+        throw new Error("AIPass Processing option is not actionable")
+      element.click()
+    }, undefined, { timeout: timeoutMs, signal })
+  }
+
+  async verifyProcessing(modelName: string, level: ReasoningLevel, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    const value = level === "none" ? "" : `(?:${THINKING_LABELS[level].map(escapeRegex).join("|")})`
+    await this.processing(modelName).filter({ hasText: new RegExp(`^\\s*(?:Processing|การประมวลผล)\\s*${value}\\s*$`) })
+      .waitFor({ state: "visible", timeout: timeoutMs, signal })
+  }
+
+  async confirm(modelName: string, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    await this.card(modelName).getByRole("button", { name: /^(?:Confirm|ยืนยัน)$/ }).click({ timeout: timeoutMs, signal })
+  }
+
+  async select(modelName: string, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    await this.card(modelName).getByRole("button", { name: /^(?:Select|เลือก|Confirm|ยืนยัน)$/ }).click({ timeout: timeoutMs, signal })
+  }
+
+  async waitClosed(modelName: string, timeoutMs: number, signal?: AbortSignal) {
+    aborted(signal)
+    await this.dialog().waitFor({ state: "hidden", timeout: timeoutMs, signal })
+    aborted(signal)
+    const name = escapeRegex(modelName)
+    await this.loader(modelName).filter({ hasText: new RegExp(`^\\s*${name}(?:\\s+${name})?\\s*$`) })
+      .waitFor({ state: "visible", timeout: timeoutMs, signal })
   }
 }
 

@@ -24,7 +24,7 @@ describe("compiled CLI execution", () => {
     const io = { out: (value: string) => output.push(value), error: (value: string) => errors.push(value) }
     for (const command of ["version", "--version"]) {
       expect(await runCLI([command], env, io)).toBe(0)
-      expect(output.pop()).toBe("0.1.1")
+      expect(output.pop()).toBe("0.1.2")
     }
     expect(errors).toEqual([])
     expect(await readdir(env.HOME)).toEqual([])

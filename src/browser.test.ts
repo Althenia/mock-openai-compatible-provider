@@ -23,8 +23,8 @@ import {
   readDomCompletion,
   turnPrompt,
   type CaptureTransport,
-  type ModelControl,
   type ModelSelectionSurface,
+  type ReasoningLevel,
   type TempChatControl,
   type TempChatSurface,
 } from "./browser.ts"
@@ -135,48 +135,49 @@ test("prompt contract requires both the current version and action envelope dige
   expect(promptContractCurrent(1, digestA, 1, `${digestA.slice(0, 34)}${"Z".repeat(30)}`, true)).toBe(false)
 })
 
-class FakeControl implements ModelControl {
-  constructor(
-    readonly name: string,
-    private readonly clicked: (name: string, timeoutMs: number) => void,
-  ) {}
-
-  async click(timeoutMs: number) {
-    this.clicked(this.name, timeoutMs)
-  }
-}
-
 class FakeModelSurface implements ModelSelectionSurface {
   readonly clicks: string[] = []
   readonly timeouts: number[] = []
   expanded = false
+  current: ReasoningLevel = "none"
+  closed = false
 
-  control(name: string) {
-    return new FakeControl(name, (clicked, timeout) => {
-      this.clicks.push(clicked)
-      this.timeouts.push(timeout)
-      if (clicked === "settings") this.expanded = true
-      if (clicked === "confirm") this.expanded = false
-    })
+  async action(name: string, timeoutMs: number) {
+    this.clicks.push(name)
+    this.timeouts.push(timeoutMs)
   }
 
   async open(_modelName: string, timeoutMs: number) {
     this.timeouts.push(timeoutMs)
   }
 
-  async headerControls(_modelName: string, timeoutMs: number) {
-    this.timeouts.push(timeoutMs)
-    return this.expanded ? [this.control("confirm")] : [this.control("settings"), this.control("select")]
+  async expand(_modelName: string, timeoutMs: number) {
+    if (!this.expanded) await this.action("settings", timeoutMs)
+    this.expanded = true
   }
 
-  async expandedControls(_modelName: string, timeoutMs: number) {
+  async processingLevel(_modelName: string, timeoutMs: number) {
     this.timeouts.push(timeoutMs)
-    return [this.control("confirm"), this.control("thinking"), this.control("other"), this.control("select")]
+    return this.current
   }
 
-  async thinkingLevels(timeoutMs: number) {
+  async openProcessing(_modelName: string, timeoutMs: number) { await this.action("thinking", timeoutMs) }
+  async chooseProcessing(_modelName: string, level: Exclude<ReasoningLevel, "none">, timeoutMs: number) {
+    await this.action(level, timeoutMs)
+    this.current = this.current === level ? "none" : level
+  }
+  async verifyProcessing(_modelName: string, level: ReasoningLevel, timeoutMs: number) {
     this.timeouts.push(timeoutMs)
-    return [this.control("low"), this.control("medium"), this.control("high"), this.control("max")]
+    if (this.current !== level) throw Error("fixture Processing value mismatch")
+  }
+  async confirm(_modelName: string, timeoutMs: number) {
+    await this.action("confirm", timeoutMs)
+    this.expanded = false
+  }
+  async select(_modelName: string, timeoutMs: number) { await this.action("select", timeoutMs) }
+  async waitClosed(_modelName: string, timeoutMs: number) {
+    this.timeouts.push(timeoutMs)
+    this.closed = true
   }
 }
 
@@ -192,19 +193,23 @@ describe("model selection", () => {
     await result
 
     expect(surface.clicks).toEqual(["settings", "thinking", "high", "confirm"])
+    expect(surface.current).toBe("high")
+    expect(surface.closed).toBe(true)
     expect(surface.timeouts.every((timeout) => timeout > 0 && timeout <= 10_000)).toBe(true)
     expect(surface.timeouts.at(-1)).toBeLessThan(surface.timeouts[0]!)
   })
 
-  test("collapses an already-expanded card before selecting a no-thinking turn", async () => {
+  test("clears an already-set Processing value before confirming a no-thinking turn", async () => {
     const surface = new FakeModelSurface()
     surface.expanded = true
+    surface.current = "high"
     await selectModel(
       surface,
       { id: "gpt", name: "GPT", thinking: ["low", "medium", "high"], reasoning: "none" },
       { timeoutMs: 10_000 },
     )
-    expect(surface.clicks).toEqual(["confirm", "select"])
+    expect(surface.clicks).toEqual(["thinking", "high", "confirm"])
+    expect(surface).toMatchObject({ current: "none", closed: true })
   })
 
   test("rejects unsupported levels before touching browser controls", async () => {

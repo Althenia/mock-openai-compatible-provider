@@ -5,8 +5,8 @@ import { createHash } from "node:crypto"
 import { version } from "../package.json"
 import { rustNotices } from "./rust-notices.ts"
 
-const bunRef = "bun-v1.4.0"
-const webkitRef = "autobuild-0f966e81b78c84bb23213e391bc679c4ef83e56b"
+const bunRef = "bun-v1.4.2"
+const webkitRef = "autobuild-2e2aa2290fac856d6f451ceacb58f7f5b44dd057"
 const raw = (repo: string, ref: string, path: string) => `https://raw.githubusercontent.com/${repo}/${ref}/${path}`
 const bunArchiveOption = process.argv.indexOf("--bun-source")
 const bunArchive = bunArchiveOption >= 0 ? process.argv[bunArchiveOption + 1] : undefined
@@ -19,10 +19,10 @@ if (!webkitArchive || webkitArchive.startsWith("--"))
 const archiveHash = createHash("sha256")
 for await (const chunk of createReadStream(webkitArchive)) archiveHash.update(chunk)
 const expectedArchiveHash = (await Bun.file("third-party/sources.sha256").text())
-  .split("\n").find((line) => line.endsWith("  webkit-0f966e81-source.tar.gz"))?.split(" ")[0]
+  .split("\n").find((line) => line.endsWith("  webkit-2e2aa229-source.tar.gz"))?.split(" ")[0]
 if (archiveHash.digest("hex") !== expectedArchiveHash) throw new Error("WebKit source checksum mismatch")
 const documents: [string, string, "header"?][] = [
-  ["Bun 1.4.0 — upstream runtime and embedded-component notice", raw("oven-sh/bun", bunRef, "LICENSE.md")],
+  ["Bun 1.4.2 — upstream runtime and embedded-component notice", raw("oven-sh/bun", bunRef, "LICENSE.md")],
   ["Bun uWebSockets/uSockets", raw("oven-sh/bun", bunRef, "packages/bun-uws/LICENSE")],
   ["Bun clap", raw("oven-sh/bun", bunRef, "src/clap/LICENSE")],
   ["JavaScriptCore library license", raw("oven-sh/WebKit", webkitRef, "Source/JavaScriptCore/COPYING.LIB")],
@@ -41,7 +41,7 @@ const documents: [string, string, "header"?][] = [
   ["WebKit fast_float", raw("oven-sh/WebKit", webkitRef, "Source/WTF/wtf/fast_float/LICENSE")],
   ["WebKit simdutf", raw("oven-sh/WebKit", webkitRef, "Source/WTF/wtf/simdutf/LICENSE-simdutf.txt")],
   ["WebKit bmalloc mimalloc", raw("oven-sh/WebKit", webkitRef, "Source/bmalloc/mimalloc/mimalloc/LICENSE")],
-  ["BoringSSL", raw("oven-sh/boringssl", "2288897e2e716330490893d226b4f079f9da9e0c", "LICENSE")],
+  ["BoringSSL", raw("oven-sh/boringssl", "41bf9b59c2ebf277a7aa427e1ecad5cc80dd4d4f", "LICENSE")],
   ["Brotli 1.1.0", raw("google/brotli", "v1.1.0", "LICENSE")],
   ["c-ares", raw("c-ares/c-ares", "c7a3138dcfe3bb0eaaf10c0c24c36dc66dc790ab", "LICENSE.md")],
   ["HdrHistogram", raw("HdrHistogram/HdrHistogram_c", "be60a9987ee48d0abf0d7b6a175bad8d6c1585d1", "COPYING.txt")],
@@ -58,7 +58,7 @@ const documents: [string, string, "header"?][] = [
   ["ls-qpack", raw("litespeedtech/ls-qpack", "1e9c5b8e59f8161c54f168a570c8bfdc59ded0c3", "LICENSE")],
   ["lsquic", raw("litespeedtech/lsquic", "3181911301b1aa4f54c1ed690901abc674ee08fb", "LICENSE")],
   ["lsquic Chromium portions", raw("litespeedtech/lsquic", "3181911301b1aa4f54c1ed690901abc674ee08fb", "LICENSE.chrome")],
-  ["mimalloc", raw("oven-sh/mimalloc", "6a14aee24315e503fa295a1fa90fe8b24ad91774", "LICENSE")],
+  ["mimalloc", raw("oven-sh/mimalloc", "6a64e1ba7f5b2130d4efccb67ec87fd0003f0f6a", "LICENSE")],
   ["picohttpparser", raw("h2o/picohttpparser", "066d2b1e9ab820703db0837a7255d92d30f0c9f5", "picohttpparser.h"), "header"],
   ["rust-argon2 3.0.0 — Apache license", raw("sru-systems/rust-argon2", "ed81866f163f0c7026aa6fd8388adf37242eb32a", "LICENSE-APACHE")],
   ["rust-argon2 3.0.0 — MIT license", raw("sru-systems/rust-argon2", "ed81866f163f0c7026aa6fd8388adf37242eb32a", "LICENSE-MIT")],
@@ -93,7 +93,7 @@ const rust = await rustNotices(bunArchive)
 const sections = [
   `AIPassport v${version} — third-party notices\n\n` +
   "The project is AGPL-3.0-only. Third-party components retain their own licenses.\n" +
-  "The macOS arm64 executable embeds Bun 1.4.0 and playwright-core 1.62.1.\n" +
+  "The macOS arm64 executable embeds Bun 1.4.2 and playwright-core 1.62.1.\n" +
   "Chrome is installed separately and is not redistributed.\n\n" +
   "Bun statically links LGPL components. See SOURCE.md and the accompanying source\n" +
   "archives for exact source revisions, Bun's patches, and rebuilding/relinking.\n" +

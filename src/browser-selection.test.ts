@@ -33,7 +33,7 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
     return new Response(`<!doctype html><html><body>
       <a href="/chat?temporary-chat=true">Temporary chat</a>
       <button id="model" onclick="document.querySelector('[role=dialog]').hidden=false">Fixture</button>
-      <div role="dialog" hidden><span>Fixture</span><button onclick="this.parentElement.hidden=true">Select</button></div>
+      <div role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><span>Fixture</span><button onclick="this.closest('[role=dialog]').hidden=true">Select</button></section></div>
       <textarea id="prompt"></textarea><button id="send">Send</button><main></main>
       <script>
         document.querySelector('#send').onclick = async () => {

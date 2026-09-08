@@ -15,7 +15,7 @@ function executable() {
   return command.settings.chromeExecutable
 }
 
-test("native model probes preserve first/actual-last controls, expanded cards, and every thinking index", async () => {
+test("native model probes select named settings on collapsed/expanded cards and every thinking level", async () => {
   const browser = await chromium.launch({ executablePath: executable(), headless: true })
   const context = await browser.newContext()
   const page = await context.newPage()
@@ -26,27 +26,28 @@ test("native model probes preserve first/actual-last controls, expanded cards, a
     for (const reasoning of ["none", ...model.thinking] as const) {
       await page.setContent(String.raw`<!doctype html><body>
         <button id="model" onclick="document.querySelector('#picker').hidden=false">Fixture</button>
-        <div id="picker" role="dialog" hidden><section><header></header><div id="details" hidden></div></section></div>
-        <div id="levels" role="dialog" hidden>${model.thinking.map(level => `<button onclick="document.body.dataset.level='${level}';this.parentElement.hidden=true">${level}</button>`).join("")}</div>
+        <div id="picker" role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><header></header><div id="details" hidden></div></section></div>
+        <div id="levels" role="dialog" data-slot="popover-content" hidden>${model.thinking.map(level => `<button onclick="document.body.dataset.level='${level}';document.querySelector('#value').textContent=this.textContent;this.parentElement.hidden=true;this.parentElement.removeAttribute('data-open')">${level[0].toUpperCase() + level.slice(1)}</button>`).join("")}</div>
         <script>
           var header = document.querySelector('header'), details = document.querySelector('#details');
           function collapse() {
             details.hidden = true; details.innerHTML = '';
-            header.innerHTML = '<span>Fixture</span><button onclick="expand()">Settings</button><button onclick="document.body.dataset.wrong=1">Unrelated</button><button onclick="document.body.dataset.selected=\'none\'">Select</button>';
+            header.innerHTML = '<span>Fixture</span><button onclick="expand()">More settings</button><button onclick="document.body.dataset.wrong=1">Unrelated</button><button onclick="document.body.dataset.selected=\'none\';document.querySelector(\'#picker\').hidden=true">Select</button>';
           }
           function expand() {
-            header.innerHTML = '<span>Fixture</span><button onclick="document.body.dataset.selected=document.body.dataset.level;collapse()">Confirm</button>';
-            details.innerHTML = '<button onclick="document.querySelector(\'#levels\').hidden=false">Thinking</button><button>Other</button><button>Select</button>';
+            header.innerHTML = '<span>Fixture</span><button onclick="document.body.dataset.selected=document.body.dataset.level||\'none\';document.querySelector(\'#picker\').hidden=true">Confirm</button>';
+            details.innerHTML = '<button data-testid="thinking-level-trigger" aria-controls="levels" aria-expanded="false" onclick="document.querySelector(\'#levels\').hidden=false;document.querySelector(\'#levels\').setAttribute(\'data-open\',\'\');this.setAttribute(\'aria-expanded\',\'true\')"><span>Processing</span><span id="value"></span></button><button>Other</button><button>Format</button>';
             details.hidden = false;
           }
           collapse();
         </script>
       </body>`)
-      // Exercise the one-header collapse path as well as 3-control headers.
+      // Exercise already-expanded settings as well as a collapsed card.
       if (reasoning === "none") await page.evaluate(() => (globalThis as unknown as { expand(): void }).expand())
       await selectModel(surface, { ...model, reasoning }, { timeoutMs: 4000, signal })
       expect(await page.locator("body").getAttribute("data-selected", { signal })).toBe(reasoning)
       expect(await page.locator("body").getAttribute("data-wrong", { signal })).toBeNull()
+      expect(await page.locator("#picker").isVisible()).toBe(false)
     }
     expect(browserControlState(context)).toMatchObject({ available: true })
   } finally { await browser.close() }
@@ -58,7 +59,7 @@ test("a disabled native model control cannot select after its selection deadline
   try {
     await page.setContent(`<!doctype html><body>
       <button id="model">Fixture</button>
-      <div role="dialog"><span>Fixture</span><button id="select" disabled onclick="document.body.dataset.selected='yes'">Select</button></div>
+      <div role="dialog" data-testid="model-selector-modal"><section data-testid="model-card"><span>Fixture</span><button id="select" disabled onclick="document.body.dataset.selected='yes'">Select</button></section></div>
     </body>`)
     await expect(selectModel(new PlaywrightModelSelectionSurface(page, { modelLoader: "#model" }),
       { id: "fixture", name: "Fixture", thinking: [], reasoning: "none" }, { timeoutMs: 750 })).rejects.toThrow()
@@ -66,6 +67,31 @@ test("a disabled native model control cannot select after its selection deadline
     expect(await page.locator("body").getAttribute("data-selected")).toBeNull()
   } finally { await browser.close() }
 }, 5000)
+
+for (const locale of ["th", "en"] as const) test(`native ${locale} Terra confirmation survives a mounted closing thinking popover`, async () => {
+  const browser = await chromium.launch({ executablePath: executable(), headless: true })
+  const page = await browser.newPage()
+  const confirm = locale === "th" ? "ยืนยัน" : "Confirm"
+  const levels = locale === "th" ? ["ต่ำ", "ปกติ", "สูง"] : ["Low", "Medium", "High"]
+  try {
+    await page.setContent(`<!doctype html><html lang="${locale}"><body>
+      <button data-testid="model-selector-trigger" onclick="document.querySelector('#picker').hidden=false"><img alt="GPT-5.6 Terra"> <span>GPT-5.6 Terra</span></button>
+      <div id="picker" data-testid="model-selector-modal" role="dialog" hidden>
+        <div data-testid="model-card" role="button" tabindex="0">
+          <div><span>GPT-5.6 Terra</span><button onclick="document.body.dataset.selected=document.body.dataset.level;document.querySelector('#picker').hidden=true">${confirm}</button></div>
+          <div><button data-testid="thinking-level-trigger" aria-label="${locale === "th" ? "คิดวิเคราะห์" : "Thinking"}" aria-controls="levels" aria-expanded="false" onclick="document.querySelector('#levels').hidden=false;document.querySelector('#levels').setAttribute('data-open','');this.setAttribute('aria-expanded','true')"><span>${locale === "th" ? "การประมวลผล" : "Processing"}</span><span id="value"></span></button><button>Style</button><button>Format</button></div>
+        </div>
+      </div>
+      <div id="levels" role="dialog" data-slot="popover-content" hidden>${levels.map((name, index) => `<button onclick="document.body.dataset.level='${index}';document.querySelector('#value').textContent=this.textContent;this.parentElement.removeAttribute('data-open');this.parentElement.setAttribute('data-closed','');this.parentElement.setAttribute('data-ending-style','')">${name}</button>`).join("")}</div>
+    </body></html>`)
+    await selectModel(new PlaywrightModelSelectionSurface(page), {
+      id: "gpt-5.6-terra", name: "GPT-5.6 Terra", thinking: ["low", "medium", "high"], reasoning: "low",
+    }, { timeoutMs: 3000 })
+    expect(await page.locator("body").getAttribute("data-selected")).toBe("0")
+    expect(await page.locator("#picker").isVisible()).toBe(false)
+    expect(await page.locator("#levels").getAttribute("data-closed")).toBe("")
+  } finally { await browser.close() }
+}, 6000)
 
 test("unreadable temporary-chat diagnostics expose structure, not attribute values or accessible text", async () => {
   const browser = await chromium.launch({ executablePath: executable(), headless: true })
@@ -103,7 +129,7 @@ test("native authentication rejects visible login or a missing composer but acce
       <input type="checkbox" aria-label="Temporary chat" checked>
       <input type="password" ${mode === "visible" ? "" : "style='display:none'"}>
       <button id="model" onclick="document.querySelector('[role=dialog]').hidden=false">Fixture</button>
-      <div role="dialog" hidden><span>Fixture</span><button onclick="this.parentElement.hidden=true">Select</button></div>
+      <div role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><span>Fixture</span><button onclick="this.closest('[role=dialog]').hidden=true">Select</button></section></div>
       ${mode === "missing" ? "" : '<textarea id="prompt"></textarea>'}<button id="send">Send</button>
       <script>document.querySelector('#send').onclick = async () => {
         const response = await fetch('/submit', { method: 'POST', body: JSON.stringify({ messages: [{ content: document.querySelector('#prompt').value }] }) });

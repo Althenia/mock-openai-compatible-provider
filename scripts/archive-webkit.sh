@@ -8,7 +8,7 @@ output=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 [ ! -e "$output" ] || { echo 'source archive already exists' >&2; exit 1; }
 work=$(mktemp -d "${TMPDIR:-/tmp}/aipass-webkit-source.XXXXXX")
 trap 'rm -rf "$work"' EXIT
-revision=0f966e81b78c84bb23213e391bc679c4ef83e56b
+revision=2e2aa2290fac856d6f451ceacb58f7f5b44dd057
 git -c advice.detachedHead=false clone --quiet --filter=blob:none --depth 1 --sparse \
   --branch "autobuild-$revision" https://github.com/oven-sh/WebKit.git "$work/repo"
 [ "$(git -C "$work/repo" rev-parse HEAD)" = "$revision" ]

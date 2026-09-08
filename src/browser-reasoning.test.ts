@@ -41,7 +41,7 @@ for (const scenario of ["selected", "unselected", "cancel", "late-dom", "late-do
     return new Response(`<!doctype html><html><body>
       <a href="/chat?temporary-chat=true">Temporary chat</a>
       <button id="model" onclick="document.querySelector('[role=dialog]').hidden=false">Fixture</button>
-      <div role="dialog" hidden><span>Fixture</span><button onclick="this.parentElement.hidden=true">Select</button></div>
+      <div role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><span>Fixture</span><button onclick="this.closest('[role=dialog]').hidden=true">Select</button></section></div>
       <textarea id="prompt"></textarea><button id="send" type="submit">Send</button>
       <main><article data-role="assistant"><div data-no-copy="true"><div data-slot="collapsible"><button data-slot="collapsible-trigger" aria-expanded="true">Thinking</button><div data-slot="collapsible-content"><p>OLD PANEL MUST NOT LEAK</p></div></div></div></article></main>
       <script>
@@ -203,7 +203,7 @@ test("a completed thinking-only webchat message waits for the later tool reply",
       return new Response(`<!doctype html><html><body>
         <a href="/chat?temporary-chat=true">Temporary chat</a>
         <button id="model" onclick="document.querySelector('[role=dialog]').hidden=false">Fixture</button>
-        <div role="dialog" hidden><span>Fixture</span><button onclick="this.parentElement.hidden=true">Select</button></div>
+        <div role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><span>Fixture</span><button onclick="this.closest('[role=dialog]').hidden=true">Select</button></section></div>
         <textarea id="prompt"></textarea><button id="send" type="submit">Send</button><main></main>
         <script>
           document.querySelector('#send').onclick = async () => {
