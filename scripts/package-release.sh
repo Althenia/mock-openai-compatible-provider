@@ -10,9 +10,5 @@ printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
 mkdir "$destination"
 destination=$(cd "$destination" && pwd)
 cp "$assets/aipass-browser-provider-darwin-arm64" "$destination/"
-COPYFILE_DISABLE=1 tar -czf "$destination/aipass-browser-provider-$version-complete-source.tar.gz" -C "$assets" \
-  "aipass-browser-provider-$version-source.tar.gz" \
-  bun-1.4.2-source.tar.gz playwright-1.62.1-source.tar.gz \
-  tinycc-05f0fafa-source.tar.gz webkit-2e2aa229-source.tar.gz \
-  LICENSE THIRD_PARTY_NOTICES SOURCE.md install.sh release.json checksums.txt
-(cd "$destination" && shasum -a 256 aipass-* > checksums.txt && shasum -a 256 -c checksums.txt)
+cp "$assets/install.sh" "$assets/LICENSE" "$assets/release.json" "$destination/"
+(cd "$destination" && shasum -a 256 aipass-* install.sh LICENSE release.json > checksums.txt && shasum -a 256 -c checksums.txt)

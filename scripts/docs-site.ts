@@ -1,4 +1,5 @@
 import { join } from "node:path"
+import { readdirSync } from "node:fs"
 
 const HTML_HEADERS = { "content-type": "text/html; charset=utf-8", "x-content-type-options": "nosniff" }
 
@@ -43,15 +44,24 @@ function rangeFor(header: string | null, size: number) {
 }
 
 export function createDocsSiteHandler(root = process.cwd()) {
+  // One readable route per docs/releases/v*.md file, so new releases
+  // publish without code changes. Missing directory (fixtures) means no routes.
+  const releaseRoutes: Record<string, Resource> = {}
+  try {
+    for (const name of readdirSync(join(root, "docs", "releases")).sort()) {
+      if (!/^v\d+\.\d+\.\d+\.md$/.test(name)) continue
+      const version = name.slice(0, -".md".length)
+      releaseRoutes[`/docs/releases/${version}`] = { file: `docs/releases/${name}`, type: "text/markdown", readable: true }
+    }
+  } catch {
+    // No releases directory; serve the remaining allowlisted resources.
+  }
   const resources: Readonly<Record<string, Resource>> = {
     "/": { file: "site/index.html", type: "text/html; charset=utf-8" },
     "/docs/runtime-guide": { file: "docs/runtime-guide.md", type: "text/markdown", readable: true },
     "/docs/operations": { file: "docs/operations.md", type: "text/markdown", readable: true },
     "/docs/model-matrix": { file: "docs/model-matrix.md", type: "text/markdown", readable: true },
-    "/docs/releases/v0.1.0": { file: "docs/releases/v0.1.0.md", type: "text/markdown", readable: true },
-    "/docs/releases/v0.1.1": { file: "docs/releases/v0.1.1.md", type: "text/markdown", readable: true },
-    "/docs/releases/v0.1.2": { file: "docs/releases/v0.1.2.md", type: "text/markdown", readable: true },
-    "/docs/releases/v0.1.3": { file: "docs/releases/v0.1.3.md", type: "text/markdown", readable: true },
+    ...releaseRoutes,
     "/docs/source": { file: "SOURCE.md", type: "text/markdown", readable: true },
     "/docs/license": { file: "LICENSE", type: "text/plain", readable: true },
     "/docs/notices": { file: "THIRD_PARTY_NOTICES", type: "text/plain", readable: true },

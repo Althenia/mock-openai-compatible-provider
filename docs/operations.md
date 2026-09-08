@@ -79,10 +79,9 @@ the selected state root: stop other instances and disable automatic supervisor
 restarts before updating a shared executable. There is no automatic stop/restart.
 Versions before v0.1.3 need the README's installer command once to gain `update`.
 
-The installer accepts `--version VERSION`, `--install-dir DIRECTORY` (or `AIPASS_INSTALL_DIR`), and `--from-dir DIRECTORY` for verified offline artifacts. For the published 0.1.2 archive and matching executable downloaded into one directory:
+The installer accepts `--version VERSION`, `--install-dir DIRECTORY` (or `AIPASS_INSTALL_DIR`), and `--from-dir DIRECTORY` for verified offline artifacts. For a downloaded release directory containing the binary, checksums, and installer:
 
 ```sh
-tar -xzf aipass-browser-provider-0.1.2-complete-source.tar.gz
 shasum -a 256 -c checksums.txt
 sh install.sh --version 0.1.2 --from-dir .
 ```
@@ -93,10 +92,10 @@ For a source build, install `dist/aipass-browser-provider` to the desired execut
 
 - `bun run build` compiles and signs the executable on macOS; `bun run test:build` checks an isolated copy.
 - `bun run test:install` validates installer behavior with local fixtures.
-- `bun run test:release` validates release preflight and offline packaging with inert component-source fixtures; it does not validate downloaded upstream sources.
+- `bun run test:release` validates release preflight and binary-only packaging; it does not download upstream sources.
 - `bun scripts/live-smoke.ts --case startup-context gpt-5.6-terra` checks synthetic startup instructions through both APIs. `lookup`, `chain`, `catalog`, and `instruction-update` cover other bounded diagnostics. These consume authenticated provider quota, use an in-memory dispatcher, and are not real-client execution proof. Stop a running provider before starting these scripts.
 - `bun scripts/live-catalog-trace.ts --self-test` checks the metadata observer locally. Its `--run` and `--provider` modes require explicit `AIPASS_LIVE_SMOKE=1` and `AIPASS_LIVE_FIXTURE` pointing to a directory containing `notes.txt`. `--run` also requires the `yce2e` tmux session and a configured YCoding route; `--provider` leaves client launch to the operator. Native context capture and skill-input matching are separate from successful task execution.
 - `bun scripts/docs-site.ts` serves the allowlisted documentation and redacted review files on `127.0.0.1:8787`; `--port PORT` selects another port. It does not expose raw output, credentials, or arbitrary repository files.
 - Public documentation and the installer are hosted on [GitHub Pages](https://althenia.github.io/mock-openai-compatible-provider/). The manually dispatched Pages workflow builds only the public allowlist with `scripts/build-docs-site.ts`; it never uploads the local review shell or recordings.
 
-The license is [AGPL-3.0-only](../LICENSE). See [source and rebuilding](../SOURCE.md) and [third-party notices](../THIRD_PARTY_NOTICES). Keep corresponding source and notices when redistributing. Release workflow details and known limitations belong in release documentation, not the quick-start README.
+The license is [AGPL-3.0-only](../LICENSE). Release workflow details and known limitations belong in release documentation, not the quick-start README.
