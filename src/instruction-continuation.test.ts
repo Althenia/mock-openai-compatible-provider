@@ -110,6 +110,15 @@ function selectedPrompt(turn: ProjectedTurn, currentDigest: string, currentVersi
   return { current, prompt: turnPrompt(input, true, false, current) }
 }
 
+function expectStartupInstructions(turn: ProjectedTurn, instructions: readonly string[]) {
+  expect(turn.primingPrompts).toHaveLength(instructions.length + 1)
+  expect(turn.primingPrompts[0]).toContain("You are the agent backend.")
+  for (const [index, instruction] of instructions.entries()) {
+    expect(turn.primingPrompts[index + 1]).toContain(instruction)
+    expect(turn.primingPrompts[index + 1]).toContain("Acknowledge briefly with READY")
+  }
+}
+
 describe("instruction fidelity is independent of session affinity", () => {
   for (const endpoint of ["chat", "responses"] as const) {
     const parse = (instructions: string, affinity: boolean, mode?: "preserve" | "action-only") => {
@@ -146,9 +155,9 @@ describe("instruction fidelity is independent of session affinity", () => {
         expect(affinity.turn.primingPrompts).toEqual(plain.turn.primingPrompts)
         expect(affinity.turn.actionEnvelopeDigest).toBe(plain.turn.actionEnvelopeDigest)
         expect(affinity.promptTokens).toBe(plain.promptTokens)
-        const submitted = [...affinity.turn.primingPrompts, affinity.turn.initialPrompt].join("\n")
-        expect(submitted).toContain("KEEP_SYSTEM_RULE")
-        expect(submitted).toContain("KEEP_DEVELOPER_RULE")
+        expectStartupInstructions(affinity.turn, ["KEEP_SYSTEM_RULE", "KEEP_DEVELOPER_RULE"])
+        expect(affinity.turn.initialPrompt).not.toContain("KEEP_SYSTEM_RULE")
+        expect(affinity.turn.initialPrompt).not.toContain("KEEP_DEVELOPER_RULE")
         expect(affinity.turn.incrementalPrompt).toContain("KEEP_CLIENT_UPDATE")
       })
     }
@@ -156,15 +165,16 @@ describe("instruction fidelity is independent of session affinity", () => {
     test(`${endpoint} keeps explicit action-only behavior with or without affinity`, () => {
       for (const affinity of [false, true]) {
         const explicit = parse("KEEP_SYSTEM_RULE", affinity, "action-only")
-        const submitted = [...explicit.turn.primingPrompts, explicit.turn.initialPrompt].join("\n")
-        expect(submitted).not.toContain("KEEP_SYSTEM_RULE")
-        expect(submitted).not.toContain("KEEP_DEVELOPER_RULE")
-        expect(submitted).not.toContain("KEEP_CLIENT_UPDATE")
+        expectStartupInstructions(explicit.turn, [])
+        expect(explicit.turn.initialPrompt).not.toContain("KEEP_SYSTEM_RULE")
+        expect(explicit.turn.initialPrompt).not.toContain("KEEP_DEVELOPER_RULE")
+        expect(explicit.turn.initialPrompt).not.toContain("KEEP_CLIENT_UPDATE")
         expect(explicit.turn.incrementalPrompt).toContain("Return the result.")
         expect(explicit.turn.incrementalPrompt).not.toContain("KEEP_CLIENT_UPDATE")
         const preserved = parse("KEEP_SYSTEM_RULE", affinity, "preserve")
-        expect(preserved.turn.initialPrompt).toContain("KEEP_SYSTEM_RULE")
-        expect(preserved.turn.initialPrompt).toContain("KEEP_DEVELOPER_RULE")
+        expectStartupInstructions(preserved.turn, ["KEEP_SYSTEM_RULE", "KEEP_DEVELOPER_RULE"])
+        expect(preserved.turn.initialPrompt).not.toContain("KEEP_SYSTEM_RULE")
+        expect(preserved.turn.initialPrompt).not.toContain("KEEP_DEVELOPER_RULE")
         expect(preserved.turn.incrementalPrompt).toContain("KEEP_CLIENT_UPDATE")
       }
     })
@@ -186,9 +196,10 @@ describe("instruction changes during tool continuations", () => {
           : responsesTurn(instructions, "self-contained-responses")
         const routed = selectedPrompt(turn, turn.actionEnvelopeDigest)
         expect(routed.current).toBe(true)
-        expect(turn.primingPrompts).toEqual([])
+        expectStartupInstructions(turn, endpoint === "chat" ? [instructions, "Use only installed skill IDs."] : [instructions])
         for (const prompt of [turn.initialPrompt, routed.prompt, turn.recoveryPrompt]) {
-          expect(prompt).toContain(instructions)
+          expect(prompt).not.toContain(instructions)
+          expect(prompt).not.toContain("Use only installed skill IDs.")
           expect(prompt).toContain(originalRequest)
           expect(prompt).toContain('TOOL CALL call_skill skill: {"id":"fixture"}')
           expect(prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
@@ -212,7 +223,8 @@ describe("instruction changes during tool continuations", () => {
       expect(after.actionEnvelopeDigest).not.toBe(before.actionEnvelopeDigest)
       const routed = selectedPrompt(after, before.actionEnvelopeDigest)
       expect(routed.current).toBe(false)
-      expect(routed.prompt).toContain("CATALOG_NEW")
+      expectStartupInstructions(after, endpoint === "chat" ? ["<available_skills>CATALOG_NEW</available_skills>", "Use only installed skill IDs."] : ["<available_skills>CATALOG_NEW</available_skills>"])
+      expect(routed.prompt).not.toContain("CATALOG_NEW")
       expect(routed.prompt).toContain(originalRequest)
       expect(routed.prompt).toContain(toolResult)
     })
@@ -222,10 +234,11 @@ describe("instruction changes during tool continuations", () => {
     const before = chatTurn("<available_skills>CATALOG_OLD</available_skills>", { mode: "action-only" })
     const after = chatTurn("<available_skills>CATALOG_NEW</available_skills>", { mode: "preserve" })
     expect(before.initialPrompt).not.toContain("CATALOG_OLD")
-    expect(after.recoveryPrompt).toContain("CATALOG_NEW")
+    expectStartupInstructions(after, ["<available_skills>CATALOG_NEW</available_skills>", "Use only installed skill IDs."])
+    expect(after.recoveryPrompt).not.toContain("CATALOG_NEW")
     const routed = selectedPrompt(after, before.actionEnvelopeDigest)
     expect(routed.current).toBe(false)
-    expect(routed.prompt).toContain("CATALOG_NEW")
+    expect(routed.prompt).not.toContain("CATALOG_NEW")
     expect(routed.prompt).toContain(originalRequest)
     expect(routed.prompt).toContain(toolResult)
   })
@@ -252,7 +265,8 @@ describe("instruction changes during tool continuations", () => {
     const provisionRoute = selectedPrompt(provisionGrowth, before.actionEnvelopeDigest)
     expect(provisionRoute.current).toBe(true)
     expect(provisionRoute.prompt).toBe(provisionGrowth.incrementalPrompt)
-    for (const text of ["<available_skills>CATALOG</available_skills>", "Use only installed skill IDs.", request,
+    expectStartupInstructions(provisionGrowth, ["<available_skills>CATALOG</available_skills>", "Use only installed skill IDs."])
+    for (const text of [request,
       'TOOL CALL call_read read: {"path":"fixture-alpha.txt"}', "TOOL RESULT call_read: fixture alpha",
       'TOOL CALL call_skill skill: {"id":"fixture"}', `TOOL RESULT call_skill: ${toolResult}`,
       '"name":"read"', '"name":"skill"']) expect(provisionRoute.prompt).toContain(text)
@@ -274,6 +288,20 @@ describe("instruction changes during tool continuations", () => {
     expect(routed.prompt).toContain("Use skill fixture.")
   })
 
+  test("action-only changed schemas refresh a tool continuation with current schemas", () => {
+    const before = chatTurn("OMITTED", { mode: "action-only", tools: [skill()] })
+    const after = chatTurn("OMITTED_CHANGED", { mode: "action-only", tools: [skill(true)] })
+    expect(after.toolContinuation).toBe(true)
+    expectStartupInstructions(after, [])
+    expect(after.actionEnvelopeDigest).not.toBe(before.actionEnvelopeDigest)
+    expect(after.incrementalPrompt).toContain('"revision":{"type":"string"}')
+    const routed = selectedPrompt(after, before.actionEnvelopeDigest)
+    expect(routed.current).toBe(true)
+    expect(routed.prompt).toBe(after.incrementalPrompt)
+    expect(routed.prompt).toContain('"revision":{"type":"string"}')
+    expect(routed.prompt).toContain(toolResult)
+  })
+
   test("version mismatch refreshes a bound tool continuation", () => {
     const turn = chatTurn("<available_skills>CATALOG</available_skills>")
     const routed = selectedPrompt(turn, turn.actionEnvelopeDigest, turn.promptContractVersion - 1)
@@ -289,6 +317,8 @@ test("estimated prompt usage describes the exposed projection without charging o
       model: "gemini-3.1-flash-lite", instruction_mode: mode,
       messages: [{ role: "system", content: "RULE ".repeat(3_000) }, { role: "user", content: "Reply ready." }],
     }, new Headers())
-    expect(parsed.promptTokens).toBe(estimateTokens(parsed.turn.initialPrompt))
+    expect(parsed.promptTokens).toBe(
+      estimateTokens(parsed.turn.initialPrompt) + parsed.turn.primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0),
+    )
   }
 })

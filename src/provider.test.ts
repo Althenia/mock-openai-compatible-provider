@@ -28,6 +28,15 @@ import { estimateTokens } from "./context.ts"
 
 const temporary: string[] = []
 
+function expectStartupPrompts(primingPrompts: readonly string[], instructions: readonly string[] = []) {
+  expect(primingPrompts).toHaveLength(instructions.length + 1)
+  expect(primingPrompts[0]).toContain("You are the agent backend.")
+  for (const [index, instruction] of instructions.entries()) {
+    expect(primingPrompts[index + 1]).toContain(instruction)
+    expect(primingPrompts[index + 1]).toContain("Acknowledge briefly with READY")
+  }
+}
+
 afterEach(async () => {
   await Promise.all(temporary.splice(0).map((path) => rm(path, { recursive: true, force: true })))
 })
@@ -278,10 +287,10 @@ describe("authenticated OpenAI request boundary", () => {
       }, new Headers()) },
     ]
     for (const { role, request: { turn } } of requests) {
-      expect(turn.primingPrompts).toEqual([])
+      expectStartupPrompts(turn.primingPrompts, [`${role}: ${instructions}`])
       for (const prompt of [turn.initialPrompt, turn.incrementalPrompt, turn.recoveryPrompt]) {
         const transmitted = Buffer.from(prompt.trimEnd()).toString("utf8")
-        expect(transmitted).toContain(`${role}: ${instructions}`)
+        expect(transmitted).not.toContain(instructions)
         expect(transmitted).toContain("USER: Reply ready.")
       }
     }
@@ -306,8 +315,9 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.sessionMarker).toBe("session-a")
     expect(parsed.turn.ephemeral).toBe(false)
     expect(parsed.turn.reasoning).toBe("low")
-    expect(parsed.turn.initialPrompt).toContain("SYSTEM: PRIVATE_SYSTEM")
-    expect(parsed.turn.initialPrompt).toContain("DEVELOPER: USE_LOCAL_TOOLS")
+    expectStartupPrompts(parsed.turn.primingPrompts, ["SYSTEM: PRIVATE_SYSTEM", "DEVELOPER: USE_LOCAL_TOOLS"])
+    expect(parsed.turn.initialPrompt).not.toContain("PRIVATE_SYSTEM")
+    expect(parsed.turn.initialPrompt).not.toContain("USE_LOCAL_TOOLS")
     expect(parsed.turn.initialPrompt).toContain("USER: hello")
     expect(parsed.turn.initialPrompt).toContain("Offered tool index")
     expect(parsed.turn.initialPrompt).toContain("- read: not forwarded")
@@ -317,14 +327,14 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.toolRepairPrompt).toContain("Do not override safety")
     expect(parsed.turn.toolRepairPrompt).not.toContain("Do not repeat that refusal")
     expect(parsed.turn.incrementalPrompt).toBe(parsed.turn.initialPrompt)
-    expect(parsed.turn.incrementalPrompt).toContain("PRIVATE_SYSTEM")
+    expect(parsed.turn.incrementalPrompt).not.toContain("PRIVATE_SYSTEM")
     expect(parsed.turn.incrementalPrompt).not.toContain('"name":"read"')
     expect(parsed.turn.incrementalPrompt).not.toContain("<aipass-action>")
-    expect(parsed.turn.promptContractVersion).toBe(15)
+    expect(parsed.turn.promptContractVersion).toBe(19)
     expect(parsed.turn.actionEnvelopeDigest).toMatch(/^[a-f0-9]{64}$/)
     expect(parsed.turn.toolContinuation).toBe(false)
-    expect(parsed.turn.recoveryPrompt).toContain("SYSTEM: PRIVATE_SYSTEM")
-    expect(parsed.turn.recoveryPrompt).toContain("DEVELOPER: USE_LOCAL_TOOLS")
+    expect(parsed.turn.recoveryPrompt).not.toContain("PRIVATE_SYSTEM")
+    expect(parsed.turn.recoveryPrompt).not.toContain("USE_LOCAL_TOOLS")
     expect(parsed.turn.recoveryPrompt).toContain("USER: next")
     expect(parsed.turn.recoveryPrompt).toContain("Offered tool index")
     expect(parsed.turn.recoveryPrompt).toContain("- read: not forwarded")
@@ -375,8 +385,9 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers(),
     )
-    expect(generic.turn.initialPrompt).toContain("SYSTEM: GENERIC_SYSTEM")
-    expect(generic.turn.initialPrompt).toContain("DEVELOPER: GENERIC_DEVELOPER")
+    expectStartupPrompts(generic.turn.primingPrompts, ["SYSTEM: GENERIC_SYSTEM", "DEVELOPER: GENERIC_DEVELOPER"])
+    expect(generic.turn.initialPrompt).not.toContain("GENERIC_SYSTEM")
+    expect(generic.turn.initialPrompt).not.toContain("GENERIC_DEVELOPER")
     expect(generic.turn.reasoning).toBe("medium")
     expect(generic.turn.sessionMarker).toMatch(/^anon_/)
     expect(generic.turn.ephemeral).toBe(true)
@@ -436,13 +447,13 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers(),
     )
-    expect(primed.turn.primingPrompts).toEqual([])
-    expect(primed.turn.initialPrompt).toContain(`SYSTEM: ${longInstruction}`)
+    expectStartupPrompts(primed.turn.primingPrompts, [`SYSTEM: ${longInstruction}`])
+    expect(primed.turn.initialPrompt).not.toContain(longInstruction)
     expect(primed.turn.incrementalPrompt).toBe(primed.turn.initialPrompt)
     expect(primed.turn.recoveryPrompt).toBe(primed.turn.initialPrompt)
     expect(primed.turn.actionEnvelopeDigest).toStartWith("b0")
     expect(primed.promptTokens).toBeGreaterThan(estimateTokens(longInstruction))
-    expect(primed.promptTokens).toBe(estimateTokens(primed.turn.initialPrompt))
+    expect(primed.promptTokens).toBe(estimateTokens(primed.turn.initialPrompt) + primed.turn.primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0))
 
     const actionOnly = parseOpenAIChatRequest(
       {
@@ -455,10 +466,10 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers(),
     )
-    expect(actionOnly.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(actionOnly.turn.primingPrompts)
     expect(actionOnly.turn.initialPrompt).not.toContain("KEEP_THIS_RULE")
     expect(actionOnly.turn.actionEnvelopeDigest).toStartWith("a0")
-    expect(actionOnly.promptTokens).toBe(estimateTokens(actionOnly.turn.initialPrompt))
+    expect(actionOnly.promptTokens).toBe(estimateTokens(actionOnly.turn.initialPrompt) + actionOnly.turn.primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0))
 
     const tinyTools = parseOpenAIChatRequest(
       {
@@ -478,7 +489,7 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers(),
     )
-    expect(tinyTools.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(tinyTools.turn.primingPrompts)
 
     const bulkyBudget = ["read", "glob", "grep", "shell"].map((name) => ({
       type: "function",
@@ -497,7 +508,7 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers(),
     )
-    expect(capped.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(capped.turn.primingPrompts)
     expect(capped.projectedActions).toEqual([])
     expect(capped.turn.initialPrompt).toContain("Offered tool index")
     expect(capped.turn.initialPrompt).toContain("- read:")
@@ -575,7 +586,7 @@ describe("authenticated OpenAI request boundary", () => {
     expect(kept.turn.initialPrompt).toContain("Offered tool index")
     expect(kept.turn.initialPrompt).toContain("- read:")
     expect(kept.turn.initialPrompt).toContain("- glob:")
-    expect(kept.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(kept.turn.primingPrompts)
 
     const midBudget = ["read", "glob", "grep", "shell", "write", "edit", "bash_exec", "webfetch"].map((name) => ({
       type: "function",
@@ -601,7 +612,7 @@ describe("authenticated OpenAI request boundary", () => {
       new Headers(),
     )
     expect(trimmed.projectedActions).toEqual([])
-    expect(trimmed.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(trimmed.turn.primingPrompts)
     expect(trimmed.turn.initialPrompt).toContain("Offered tool index")
     expect(trimmed.turn.initialPrompt.length).toBeLessThan(4_000)
 
@@ -623,7 +634,7 @@ describe("authenticated OpenAI request boundary", () => {
     )
     expect(weak.projectedActions).toEqual([])
     expect(weak.turn.initialPrompt).toContain("Offered tool index")
-    expect(weak.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(weak.turn.primingPrompts)
 
     const affinityDefault = parseOpenAIChatRequest(
       {
@@ -635,8 +646,8 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers({ "x-session-affinity": "orchestration-session" }),
     )
-    expect(affinityDefault.turn.primingPrompts).toEqual([])
-    expect(affinityDefault.turn.initialPrompt).toContain("KEEP_THIS_RULE")
+    expectStartupPrompts(affinityDefault.turn.primingPrompts, [`SYSTEM: ${longInstruction}`])
+    expect(affinityDefault.turn.initialPrompt).not.toContain("KEEP_THIS_RULE")
     expect(affinityDefault.turn.actionEnvelopeDigest).toStartWith("b0")
 
     const explicitPreserve = parseOpenAIChatRequest(
@@ -650,7 +661,7 @@ describe("authenticated OpenAI request boundary", () => {
       },
       new Headers({ "x-session-affinity": "orchestration-session" }),
     )
-    expect(explicitPreserve.turn.primingPrompts).toEqual([])
+    expectStartupPrompts(explicitPreserve.turn.primingPrompts, [`SYSTEM: ${longInstruction}`])
     expect(explicitPreserve.turn.actionEnvelopeDigest).toStartWith("b0")
     expect(affinityDefault.turn.initialPrompt).toBe(explicitPreserve.turn.initialPrompt)
     expect(affinityDefault.turn.primingPrompts).toEqual(explicitPreserve.turn.primingPrompts)

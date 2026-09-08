@@ -10,8 +10,11 @@ const copy = '<svg viewBox="0 0 21 20"><path d="M1 1" /></svg>'
 
 let browser: Browser
 let page: Page
+let transportPulse: ReturnType<typeof setInterval>
 
 beforeAll(async () => {
+  // Keep Bun's Playwright pipe callbacks awake through browser teardown too.
+  transportPulse = setInterval(() => {}, 10).unref()
   const command = parseCommand(["start"], {}, { verifyChrome: false })
   if (command.type !== "serve") throw new Error("expected serve command settings")
   browser = await chromium.launch({ headless: true, executablePath: command.settings.chromeExecutable })
@@ -19,8 +22,10 @@ beforeAll(async () => {
 })
 
 afterAll(async () => {
-  await page?.close()
-  await browser?.close()
+  try {
+    await page?.close()
+    await browser?.close()
+  } finally { clearInterval(transportPulse) }
 })
 
 function controls(...icons: string[]) {

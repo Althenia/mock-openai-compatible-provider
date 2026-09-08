@@ -119,10 +119,11 @@ test("unreadable temporary-chat diagnostics expose structure, not attribute valu
 
 test("native authentication rejects visible login or a missing composer but accepts hidden login markup", async () => {
   let mode: "visible" | "hidden" | "missing" = "visible"
-  let submissions = 0
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+  const submissions: { mode: string; prompt: string }[] = []
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     if (request.method === "POST") {
-      submissions++
+      const body = await request.json() as { messages: { content: string }[] }
+      submissions.push({ mode, prompt: body.messages[0]!.content })
       return new Response(`data: ${JSON.stringify({ type: "text", delta: '<aipass-envelope>{"type":"chat","text":"ready"}</aipass-envelope>' })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response(`<!doctype html><body>
@@ -134,6 +135,9 @@ test("native authentication rejects visible login or a missing composer but acce
       <script>document.querySelector('#send').onclick = async () => {
         const response = await fetch('/submit', { method: 'POST', body: JSON.stringify({ messages: [{ content: document.querySelector('#prompt').value }] }) });
         await response.text();
+        const article = document.createElement('article'); article.dataset.role = 'assistant';
+        article.innerHTML = '<p>ready</p><button aria-label="Like"><svg viewBox="0 0 21 20"><path d="M4.75 5.75H2.75" /></svg></button><button aria-label="Dislike"><svg viewBox="0 0 21 20"><path d="M16.1898 12.75H18.1898" /></svg></button>';
+        document.body.append(article);
       };</script>
     </body>`, { headers: { "content-type": "text/html" } })
   } })
@@ -158,15 +162,18 @@ test("native authentication rejects visible login or a missing composer but acce
       }, protocol)
       try {
         const input = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Reply ready." }] }, new Headers()).turn
+        expect(input.primingPrompts[0]).toStartWith("You are the agent backend.")
         const work = (async () => {
           const frames: BrowserFrame[] = []
-          for await (const frame of adapter.turn({ ...input, model: { id: "fixture", name: "Fixture", thinking: [] } }, AbortSignal.timeout(5000))) frames.push(frame)
+          // Startup ordering is covered by browser-priming.test.ts; this deadline covers authentication.
+          for await (const frame of adapter.turn({ ...input, primingPrompts: [], model: { id: "fixture", name: "Fixture", thinking: [] } }, AbortSignal.timeout(5000))) frames.push(frame)
           return frames
         })()
         if (candidate === "hidden") expect(await work).toContainEqual({ type: "finish", reason: "stop" })
         else await expect(work).rejects.toMatchObject({ name: "AuthenticationRequiredError" })
       } finally { await adapter.close(); await rm(profilePath, { recursive: true, force: true }) }
     }
-    expect(submissions).toBe(1)
+    expect(submissions.map(item => item.mode)).toEqual(["hidden"])
+    expect(submissions[0]!.prompt).toContain("USER: Reply ready.")
   } finally { clearInterval(transportPulse); await server.stop(true) }
 }, 20_000)

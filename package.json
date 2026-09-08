@@ -1,6 +1,6 @@
 {
   "name": "aipass-browser-provider",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "license": "AGPL-3.0-only",
   "private": true,
   "type": "module",

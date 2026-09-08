@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>AIPass · local review</title>
+  <style>
+    :root { --ink:#10233f; --blue:#176db6; --blue-soft:#e7f1fa; --slate:#d8e2ee; --paper:#fff; --wash:#f4f7fb; }
+    * { box-sizing:border-box; } html { scroll-behavior:smooth; } body { margin:0; color:var(--ink); background:var(--wash); font:16px/1.55 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    a { color:inherit; text-decoration-color:#82b5de; text-underline-offset:.2em; } a:hover { color:var(--blue); } :focus-visible { outline:3px solid var(--blue); outline-offset:3px; border-radius:3px; } .timestamps { display:flex;gap:.5rem;flex-wrap:wrap;margin-top:1rem } .timestamps button { padding:.6rem .8rem;min-height:44px;background:white;color:var(--ink);border:1px solid var(--slate);border-radius:.4rem;font:inherit;cursor:pointer }
+    .shell { display:grid; grid-template-columns:16rem minmax(0,1fr); min-height:100vh; } aside { padding:2rem 1.25rem; background:var(--ink); color:#e8f2fb; } .mark { display:block; margin-bottom:3rem; font:700 1.1rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.08em; text-decoration:none; } nav { display:grid; gap:.45rem; font-size:.9rem; } nav a { padding:.45rem .6rem; border-radius:.35rem; text-decoration:none; } nav a:hover { background:#ffffff17; color:white; }
+    main { max-width:1040px; padding:clamp(2rem,5vw,5rem); } .eyebrow { color:var(--blue); font:700 .75rem/1 ui-monospace,SFMono-Regular,Menlo,monospace; letter-spacing:.12em; text-transform:uppercase; } h1 { max-width:13ch; margin:.8rem 0 1.4rem; font-size:clamp(2.5rem,7vw,5.7rem); line-height:.94; letter-spacing:-.065em; } h2 { margin:0 0 .5rem; font-size:1.35rem; letter-spacing:-.025em; } .lede { max-width:61ch; color:#405572; font-size:1.1rem; } .rule { height:1px; margin:3rem 0; background:var(--slate); }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1rem; } .panel { padding:1.25rem; background:var(--paper); border:1px solid var(--slate); border-radius:.65rem; box-shadow:0 14px 32px #10233f0a; } .panel p { margin:.45rem 0 0; color:#526784; } .links { display:grid; gap:.5rem; margin-top:1rem; } .links a { display:flex; justify-content:space-between; gap:1rem; padding:.65rem .75rem; border:1px solid var(--slate); border-radius:.4rem; text-decoration:none; } .links a::after { content:"↗"; color:var(--blue); } .review { background:var(--blue-soft); border-color:#b9d8ef; } video { width:100%; margin-top:1rem; border-radius:.35rem; background:var(--ink); } code { padding:.15rem .35rem; border-radius:.2rem; background:#eaf0f6; font: .88em ui-monospace,SFMono-Regular,Menlo,monospace; }
+    @media (max-width:700px) { .shell { display:block; } aside { padding:1.25rem; } .mark { margin-bottom:1.25rem; } nav { grid-template-columns:repeat(2,minmax(0,1fr)); } main { padding:2.5rem 1.25rem; } .grid { grid-template-columns:1fr; } } @media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside><a class="mark" href="#top">AIPASS / LOCAL</a><nav aria-label="Documentation"><a href="#setup">Setup</a><a href="#prompt-contract">Prompt contract</a><a href="#docs">Docs</a><a href="#scripts">Scripts</a><a href="#local-review">Local review</a></nav></aside>
+    <main id="top">
+      <p class="eyebrow">Documentation + recording review</p><h1>Read the runtime. Review locally.</h1><p class="lede">A loopback-only reference surface for the provider’s setup, prompt contract, diagnostics, and a supplied review recording.</p>
+      <div class="rule"></div>
+      <section id="setup" class="grid"><article class="panel"><h2>Setup</h2><p>Use the concise repository entry point for supported installation, source setup, and checks.</p><div class="links"><a href="/docs/readme">Open README</a></div></article><article id="prompt-contract" class="panel"><h2>Prompt contract</h2><p>The full preserved runtime behavior, ordering, compaction, recovery, and action-only opt-out are kept in one guide.</p><div class="links"><a href="/docs/runtime-guide">Read runtime guide</a></div></article></section>
+      <section id="docs" class="panel" style="margin-top:1rem"><h2>Documentation</h2><p>Setup details, runtime contracts, and observed limits. Only these named references are served.</p><div class="links"><a href="/docs/operations">Operations and client setup</a><a href="/docs/runtime-guide">Runtime and prompt contract</a><a href="/docs/model-matrix">Model reference</a><a href="/docs/releases/v0.1.2">Release limitations · 0.1.2</a><a href="/docs/source">Source and redistribution</a></div></section>
+      <section id="scripts" class="grid" style="margin-top:1rem"><article class="panel"><h2>Live smoke</h2><p>Reference the opt-in diagnostic script without executing it.</p><div class="links"><a href="/scripts/live-smoke">Open source</a></div></article><article class="panel"><h2>Catalog trace</h2><p>Reference the local trace script without exposing logs or broader paths.</p><div class="links"><a href="/scripts/live-catalog-trace">Open source</a></div></article></section>
+      <section class="panel" style="margin-top:1rem"><h2>Build and validation scripts</h2><div class="links"><a href="/scripts/build">Build executable</a><a href="/scripts/test-install">Installer checks</a><a href="/scripts/test-release">Release packaging checks</a></div></section>
+      <section id="local-review" class="panel review" style="margin-top:1rem"><h2>Local review</h2><p id="review-status" role="status">Checking for a reviewed recording…</p><p>Prompt delivery and successful action execution are separate checks. Read the captured startup text before reviewing the webchat response.</p><details open><summary>Captured startup instructions</summary><pre id="startup-text" tabindex="0" aria-label="Captured startup instructions, scroll to read" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:32rem;overflow:auto;font-size:.8rem">Not yet available.</pre></details><video id="review-video" controls preload="none" hidden><source src="/review/review.webm" type="video/webm">Your browser does not support WebM video.</video><p id="review-outcome"></p><div class="links"><a href="/review/result.json">Review summary</a><a href="/review/startup.txt">Full redacted startup record</a></div></section>
+    </main>
+  </div>
+  <script>
+    fetch('/review/review.webm', { method: 'HEAD' }).then((response) => {
+      if (!response.ok) { document.querySelector('#review-status').textContent = 'No reviewed recording is available yet.'; return; }
+      document.querySelector('#review-status').textContent = 'Review recording available locally.';
+      document.querySelector('#review-video').hidden = false;
+    }).catch(() => { document.querySelector('#review-status').textContent = 'Local review is unavailable. Run bun scripts/docs-site.ts and reload.'; });
+    fetch('/review/startup.txt').then(response => response.ok ? response.text() : null).then(text => { if (text) document.querySelector('#startup-text').textContent = text; }).catch(() => {});
+    fetch('/review/result.json').then(response => response.ok ? response.json() : null).then(result => {
+      if (result?.outcome) document.querySelector('#review-outcome').textContent = result.outcome;
+      const timestamps = document.createElement('div'); timestamps.className = 'timestamps'; timestamps.setAttribute('aria-label', 'Recording timestamps');
+      for (const item of result?.timestamps ?? []) {
+        if (!Number.isFinite(item.seconds) || item.seconds < 0 || typeof item.label !== 'string') continue;
+        const button = document.createElement('button'); button.type = 'button'; button.textContent = `${item.seconds}s · ${item.label}`;
+        button.onclick = () => { const video = document.querySelector('#review-video'); video.currentTime = item.seconds; video.play().catch(() => {}); };
+        timestamps.append(button);
+      }
+      document.querySelector('#review-video').after(timestamps);
+    }).catch(() => {});
+  </script>
+</body>
+</html>

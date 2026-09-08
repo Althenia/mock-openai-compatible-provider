@@ -2183,6 +2183,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
   private readonly pages = new Map<string, Page>()
   private readonly captures = new WeakMap<Page, PageStreamCapture>()
   private readonly selectedModels = new WeakMap<Page, string>()
+  private readonly primedContexts = new WeakMap<Page, string>()
   private readonly locks = new KeyedLock()
   private readonly retirements = new Map<Page, Promise<void>>()
   private readonly pendingSetups = new Set<Promise<void>>()
@@ -2502,7 +2503,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       attempt = await this.lifecycle.prepare({
         sessionMarker: input.sessionMarker,
         prompt,
-        promptHash: promptHash(prompt),
+        promptHash: promptHash(JSON.stringify([input.model.id, input.reasoning, input.compactionDigest, input.primingPrompts, prompt])),
       })
       page = await this.page(input.sessionMarker, signal, mark, onFailure)
       const target = bound && binding ? binding : this.config.chatURL
@@ -2547,7 +2548,9 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       }
 
       let primingEstimate = 0
-      if (carriesEnvelope && input.primingPrompts.length) {
+      const startupIdentity = JSON.stringify([modelSignature, input.promptContractVersion, input.primingPrompts])
+      if (input.primingPrompts.length && (carriesEnvelope || !reusableSelection || this.primedContexts.get(page) !== startupIdentity)) {
+        this.primedContexts.delete(page)
         for (const [index, primingPrompt] of input.primingPrompts.entries()) {
           console.error(
             `aipass instruction priming part=${index + 1}/${input.primingPrompts.length} chars=${primingPrompt.length}`,
@@ -2556,6 +2559,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
             estimateTokens(primingPrompt) +
             (await this.prime(page, primingPrompt, signal, mark, onFailure))
         }
+        this.primedContexts.set(page, startupIdentity)
       }
 
       mark("prompt-ready")

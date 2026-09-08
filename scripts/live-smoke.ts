@@ -1,8 +1,8 @@
 // Opt-in, quota-consuming checks against the authenticated webchat profile.
-// Build first, then run: bun scripts/live-smoke.ts [--case lookup|chain|catalog|instruction-update] [--instruction-mode action-only|preserve] [model-id ...]
+// Build first, then run: bun scripts/live-smoke.ts [--case lookup|chain|catalog|instruction-update|startup-context] [--instruction-mode action-only|preserve] [model-id ...]
 import { MODELS } from "../src/config.ts"
 
-type CaseName = "lookup" | "chain" | "catalog" | "instruction-update"
+type CaseName = "lookup" | "chain" | "catalog" | "instruction-update" | "startup-context"
 type ChatCall = { readonly id: string; readonly name: string; readonly input: Record<string, unknown> }
 type ChainStep = { readonly name: string; readonly input: Record<string, string> }
 
@@ -21,13 +21,13 @@ for (let index = 0; index < args.length; index++) {
   }
   if (value === "--case") {
     const next = args[++index]
-    if (next !== "lookup" && next !== "chain" && next !== "catalog" && next !== "instruction-update") throw new Error("--case must be lookup, chain, catalog, or instruction-update")
+    if (next !== "lookup" && next !== "chain" && next !== "catalog" && next !== "instruction-update" && next !== "startup-context") throw new Error("--case must be lookup, chain, catalog, instruction-update, or startup-context")
     caseName = next
     continue
   }
   if (value.startsWith("--case=")) {
     const next = value.slice("--case=".length)
-    if (next !== "lookup" && next !== "chain" && next !== "catalog" && next !== "instruction-update") throw new Error("--case must be lookup, chain, catalog, or instruction-update")
+    if (next !== "lookup" && next !== "chain" && next !== "catalog" && next !== "instruction-update" && next !== "startup-context") throw new Error("--case must be lookup, chain, catalog, instruction-update, or startup-context")
     caseName = next
     continue
   }
@@ -193,6 +193,48 @@ async function runLookup(endpoint: string, token: string, model: string, effort:
     throw new Error("tool result continuation did not return the supplied value")
 }
 
+async function runStartupContext(endpoint: string, token: string, model: string, effort: string | undefined, api: "chat" | "responses") {
+  const session = `startup-${crypto.randomUUID()}`
+  const workspace = `fixture-root-${crypto.randomUUID()}`
+  const prefix = `FOLDERS_${crypto.randomUUID()}`
+  const startup = [
+    { role: "system", content: `USER INSTRUCTIONS: For your final answer, respond with exactly ${prefix}: followed immediately by the returned folder name, without extra text.` },
+    { role: "developer", content: "AGENT INSTRUCTIONS: You decide the next action and interpret results. The client only validates and dispatches your structured output. For a directory request, choose the offered read-only directory capability rather than a shell command. Wait for its result before answering." },
+    { role: "developer", content: `WORKSPACE INSTRUCTIONS: The current repository path is ${workspace}. Use that exact path, not a guessed path or the adapter's working directory.` },
+  ]
+  const task = { role: "user", content: "List current repo folders." }
+  const tools = [
+    { name: "read", description: "List a directory by path, read-only.", parameters: { type: "object", additionalProperties: false, properties: { path: { type: "string" } }, required: ["path"] } },
+    { name: "shell", description: "Execute a shell command.", parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
+  ]
+  const common = { model, reasoning: effort ? { effort } : undefined, session_id: session, stream: false }
+  const messages: unknown[] = [...startup, task]
+  const route = api === "chat" ? "/chat/completions" : "/responses"
+  const first = await (await request(endpoint, token, route, api === "chat"
+    ? { ...common, messages, tools: tools.map((tool) => ({ type: "function", function: tool })) }
+    : { ...common, input: messages, tools: tools.map((tool) => ({ type: "function", ...tool })) })).json()
+  const call = api === "chat" ? chatCall(first) : responsesCall(first)
+  if (call.name !== "read" || !equalInput(call.input, { path: workspace }))
+    throw new Error("startup instructions did not produce the exact read-only action and workspace-derived path")
+  console.log(JSON.stringify({ model, check: `startup-context-${api}`, stage: "action", startupSections: ["user", "agent", "workspace"], passed: true }))
+  // Handler-only fixture: dispatch the returned request, without choosing a next action.
+  const folder = `folder-${crypto.randomUUID()}`
+  const result = JSON.stringify({ folders: [folder] })
+  let next: unknown
+  if (api === "chat") {
+    const assistant = record(firstChoice(first)?.message)
+    if (!assistant) throw new Error("startup assistant message is missing")
+    messages.push(assistant, { role: "tool", tool_call_id: call.id, content: result })
+    next = { ...common, messages, tools: tools.map((tool) => ({ type: "function", function: tool })) }
+  } else {
+    next = { ...common, previous_response_id: stringValue(record(first)?.id, "response id"), input: [{ type: "function_call_output", call_id: call.id, output: result }], tools: tools.map((tool) => ({ type: "function", ...tool })) }
+  }
+  const final = await request(endpoint, token, route, { ...record(next), stream: true })
+  const text = await final.text()
+  if (api === "chat") chatStream(text, `${prefix}:${folder}`)
+  else responsesStream(text, `${prefix}:${folder}`)
+}
+
 async function runChatChain(endpoint: string, token: string, model: string, effort: string | undefined, instructionMode?: "action-only" | "preserve", updateInstructions = false) {
   const session = `chain-chat-${crypto.randomUUID()}`
   // Catalog IDs are unpredictable and appear only in system context, not in
@@ -280,7 +322,9 @@ try {
   reader.releaseLock()
   for (const model of models) {
     const effort = MODELS.find((item) => item.id === model)!.thinking.length ? "low" : undefined
-    const checks: readonly (readonly [string, () => Promise<void>])[] = caseName === "lookup"
+    const checks: readonly (readonly [string, () => Promise<void>])[] = caseName === "startup-context"
+      ? (["chat", "responses"] as const).map((api) => [`startup-context-${api}`, () => runStartupContext(endpoint, token, model, effort, api)] as const)
+      : caseName === "lookup"
       ? [["lookup", () => runLookup(endpoint, token, model, effort)]] as const
       : caseName === "catalog"
         ? (catalogMode ? [catalogMode] : ["action-only", "preserve"] as const)

@@ -43,11 +43,17 @@ describe("process-memory Responses continuation", () => {
         input: [{ type: "function_call_output", call_id: "call_lookup", output: "LOOKUP_RESULT" }],
       })), !stream)
       expect(turns[1]!.sessionMarker).toBe(turns[0]!.sessionMarker)
+      expect(turns[1]!.primingPrompts).toHaveLength(3)
+      expect(turns[1]!.primingPrompts[1]).toContain("NEW_TOP_LEVEL_RULE")
+      expect(turns[1]!.primingPrompts[2]).toContain("RETAINED_MESSAGE_RULE")
+      expect(turns[1]!.primingPrompts.join("\n")).not.toContain("OLD_TOP_LEVEL_RULE")
       for (const prompt of [turns[1]!.initialPrompt, turns[1]!.incrementalPrompt, turns[1]!.recoveryPrompt]) {
-        for (const value of ["RETAINED_MESSAGE_RULE", "NEW_TOP_LEVEL_RULE", "ORIGINAL_TASK", "ASSISTANT REASONING: PRIOR_REASONING",
+        for (const value of ["ORIGINAL_TASK", "ASSISTANT REASONING: PRIOR_REASONING",
           "ASSISTANT: PRIOR_ASSISTANT", 'TOOL CALL call_lookup lookup: {"key":"fixture-alpha"}', "TOOL RESULT call_lookup: LOOKUP_RESULT"])
           expect(prompt).toContain(value)
         expect(prompt).not.toContain("OLD_TOP_LEVEL_RULE")
+        expect(prompt).not.toContain("RETAINED_MESSAGE_RULE")
+        expect(prompt).not.toContain("NEW_TOP_LEVEL_RULE")
         expect(prompt.indexOf("ORIGINAL_TASK")).toBeLessThan(prompt.indexOf("TOOL CALL call_lookup"))
         expect(prompt.indexOf("TOOL CALL call_lookup")).toBeLessThan(prompt.indexOf("TOOL RESULT call_lookup"))
       }
@@ -56,6 +62,8 @@ describe("process-memory Responses continuation", () => {
       expect(turns[2]!.initialPrompt).toContain("CONTINUATION_ANSWER")
       expect(turns[2]!.initialPrompt).toContain("FINAL_QUESTION")
       expect(turns[2]!.initialPrompt).not.toContain("NEW_TOP_LEVEL_RULE")
+      expect(turns[2]!.primingPrompts.join("\n")).not.toContain("NEW_TOP_LEVEL_RULE")
+      expect(turns[2]!.primingPrompts.join("\n")).toContain("RETAINED_MESSAGE_RULE")
       expect(turns[2]!.initialPrompt.match(/ORIGINAL_TASK/g)).toHaveLength(1)
       const consumed = await handler(request({ previous_response_id: first.id, input: "branch" }))
       expect(consumed.status).toBe(400)

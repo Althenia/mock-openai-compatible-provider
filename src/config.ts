@@ -38,6 +38,7 @@ export interface Settings {
 export type Command =
   | { readonly type: "help" }
   | { readonly type: "version" }
+  | { readonly type: "update"; readonly settings: Settings; readonly version?: string; readonly installDir?: string }
   | { readonly type: "serve"; readonly settings: Settings }
   | { readonly type: "stop"; readonly settings: Settings }
   | { readonly type: "endpoint"; readonly settings: Settings }
@@ -96,7 +97,7 @@ function port(value: string) {
 }
 
 export function usage() {
-  return "usage: aipass-browser-provider <command> [options]\n\ncommands:\n  start        run the provider server in the foreground\n  serve        alias for start\n  stop         request graceful shutdown of the active server\n  endpoint     print the configured OpenAI-compatible endpoint\n  login        open the signed-in Chrome profile to sign in and verify access (window stays open)\n  print-token  print the provider bearer token\n  version      print the release version (--version is an alias)\n  help         print this help\n\noptions:\n  --config PATH\n  --state-root PATH\n  --chrome PATH\n  --port PORT\n\nUse `aipass-browser-provider help`, `--help`, or `-h` for this text."
+  return "usage: aipass-browser-provider <command> [options]\n\ncommands:\n  start        run the provider server in the foreground\n  serve        alias for start\n  stop         request graceful shutdown of the active server\n  update       install the latest verified release (stop the provider first)\n  endpoint     print the configured OpenAI-compatible endpoint\n  login        open the signed-in Chrome profile to sign in and verify access (window stays open)\n  print-token  print the provider bearer token\n  version      print the release version (--version is an alias)\n  help         print this help\n\noptions:\n  --config PATH\n  --state-root PATH\n  --chrome PATH\n  --port PORT\n\nupdate options:\n  --version VERSION       select a release instead of latest\n  --install-dir DIRECTORY override the executable installation directory\n  --state-root PATH       use the same profile lock as the provider\n\nUse `aipass-browser-provider help`, `--help`, or `-h` for this text."
 }
 
 export function parseCommand(
@@ -113,13 +114,15 @@ export function parseCommand(
     if (rest.length) throw new Error(usage())
     return { type: "help" }
   }
-  if (!command || !["start", "serve", "stop", "endpoint", "login", "print-token"].includes(command))
+  if (!command || !["start", "serve", "stop", "update", "endpoint", "login", "print-token"].includes(command))
     throw new Error(usage())
 
   let configPath = environment.AIPASS_CONFIG_PATH?.trim() || join(xdgPath(environment, "config"), "aipass-browser-provider/config.json")
   let stateRoot = environment.AIPASS_STATE_ROOT?.trim() || join(xdgPath(environment, "state"), "aipass-browser-provider")
   let chromeExecutable = environment.AIPASS_BROWSER_EXECUTABLE?.trim() || defaultChromeExecutable()
-  let requestedPort = environment.AIPASS_PORT ? port(environment.AIPASS_PORT) : undefined
+  let requestedPort = command !== "update" && environment.AIPASS_PORT ? port(environment.AIPASS_PORT) : undefined
+  let updateVersion: string | undefined
+  let installDir = environment.AIPASS_INSTALL_DIR?.trim() || undefined
   for (let index = 0; index < rest.length; index += 2) {
     const option = rest[index]
     const value = rest[index + 1]
@@ -128,6 +131,11 @@ export function parseCommand(
     else if (option === "--state-root") stateRoot = value
     else if (option === "--chrome") chromeExecutable = value
     else if (option === "--port" && ["start", "serve", "endpoint"].includes(command)) requestedPort = port(value)
+    else if (option === "--version" && command === "update") {
+      if (!/^v?\d+\.\d+\.\d+$/.test(value)) throw new Error("invalid release version; expected X.Y.Z or vX.Y.Z")
+      updateVersion = value
+    }
+    else if (option === "--install-dir" && command === "update") installDir = value
     else throw new Error(`unknown option ${option}\n${usage()}`)
   }
   if (rest.length % 2 !== 0) throw new Error(`missing option value\n${usage()}`)
@@ -152,6 +160,7 @@ export function parseCommand(
   }
   if (command === "start" || command === "serve") return { type: "serve", settings }
   if (command === "stop") return { type: "stop", settings }
+  if (command === "update") return { type: "update", settings, version: updateVersion, installDir }
   if (command === "endpoint") return { type: "endpoint", settings }
   if (command === "login") return { type: "login", settings }
   return { type: "print-token", settings }

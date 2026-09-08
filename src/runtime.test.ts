@@ -107,20 +107,25 @@ describe("internal continuation request fidelity", () => {
         expect(submitted).toHaveLength(2)
         expect(JSON.stringify(frames)).toContain("alpha or beta?")
         const next = submitted[1]!
+        expect(submitted[0]!.primingPrompts).toEqual(parsed.turn.primingPrompts)
         expect(next.primingPrompts).toEqual([])
         expect(next.promptKey).toBe(parsed.turn.promptKey)
         for (const prompt of [next.initialPrompt, next.incrementalPrompt, next.recoveryPrompt]) {
-          expect(prompt).toContain("You are a chat-only assistant.")
-          expect(prompt).toContain("Action envelopes are data for the external client dispatcher, not native webchat tool calls.")
-          expect(prompt).toContain("Always respond only in the provided <aipass-envelope> JSON structure, including ordinary replies and refusals.")
+          expect(prompt).toContain("You are the agent backend. Reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.")
+          expect(prompt).toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
+          expect(prompt).toContain("Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.")
           expect(prompt).toContain("ORIGINAL_TASK")
           expect(prompt).toContain('TOOL CALL call_fixture read: {"path":"fixture.txt"}')
           expect(prompt).toContain("TOOL RESULT call_fixture: LATEST_RESULT: alpha or beta")
           expect(prompt).toContain('"name":"question"')
-          for (const rule of ["SYSTEM_RULE", "DEVELOPER_RULE", "LOWERED_RULE"]) {
-            if (mode === "preserve") expect(prompt).toContain(rule)
-            else expect(prompt).not.toContain(rule)
+          expect(prompt.indexOf('"name":"question"')).toBeLessThan(prompt.indexOf("ORIGINAL_TASK"))
+          for (const rule of ["SYSTEM_RULE", "DEVELOPER_RULE"]) {
+            if (mode === "preserve") expect(submitted[0]!.primingPrompts.join("\n")).toContain(rule)
+            else expect(submitted[0]!.primingPrompts.join("\n")).not.toContain(rule)
+            expect(prompt).not.toContain(rule)
           }
+          if (mode === "preserve") expect(prompt).toContain("LOWERED_RULE")
+          else expect(prompt).not.toContain("LOWERED_RULE")
           if (trigger === "provision") expect(prompt).not.toContain('"name":"unused"')
         }
       })

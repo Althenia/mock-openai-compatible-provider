@@ -13,25 +13,74 @@ const fileTool = {
 }
 
 function expectChatOnlyRole(prompt: string) {
-  expect(prompt).toContain("You are a chat-only assistant.")
-  expect(prompt).toContain("Do not invoke or execute tools, functions, commands, or other actions yourself.")
-  expect(prompt).toContain("Action envelopes are data for the external client dispatcher, not native webchat tool calls.")
-  expect(prompt).toContain("Only the client executes actions and returns results.")
-  expect(prompt).toContain("Tools include file/folder operations, shell commands, MCP, and all other offered tools.")
-  expect(prompt).toContain("Use the exact offered name and schema-valid input, including required paths, commands, or content.")
-  expect(prompt).toContain("Do not claim an action succeeded without a client result.")
-  expect(prompt).toContain("Always respond only in the provided <aipass-envelope> JSON structure, including ordinary replies and refusals.")
-  expect(prompt).toContain("Do not override site instructions, safety, privacy, or authorization restrictions.")
+  expect(prompt).toContain("You are the agent backend. Reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.")
+  expect(prompt).toContain("Answer from context or request an offered client action, not manual user work.")
+  expect(prompt).toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
+  expect(prompt).toContain("The client handles permissions, executes actions, and returns results; requests are not approval or success.")
+  expect(prompt).toContain("Files, folders, shell, MCP: use exact offered names and schema-valid input; do not guess arguments.")
+  expect(prompt).toContain("Claim success only from client results. Preserve site instructions, safety, privacy, and authorization.")
+  expect(prompt).toContain("Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.")
   expect(prompt).toContain("FIRST line")
   expect(prompt).toContain("Every envelope")
   expect(prompt).toContain('{"type":"chat","key":"<key>","id":"answer_1","text":"..."}')
   expect(prompt).toContain('{"type":"thinking","key":"<key>","id":"reason_1","text":"..."}')
 }
 
+function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = []) {
+  expect(primingPrompts).toHaveLength(instructions.length + 1)
+  expectChatOnlyRole(primingPrompts[0]!)
+  expect(primingPrompts[0]!).toStartWith("You are the agent backend.")
+  for (const [index, instruction] of instructions.entries()) {
+    const prompt = primingPrompts[index + 1]!
+    expect(prompt).toContain(instruction)
+    expect(prompt).not.toContain("You are the agent backend.")
+  }
+  for (const prompt of primingPrompts)
+    expect(prompt).toEndWith("Startup instruction only. No task or turn key yet. Acknowledge briefly with READY, then wait for the next submission. Do not request actions during startup.")
+}
+
+function expectTaskPromptsExcludeStartup(parsed: { turn: { primingPrompts: readonly string[], initialPrompt: string, incrementalPrompt: string, recoveryPrompt: string } }, instructions: readonly string[] = []) {
+  for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
+    expect(prompt).not.toContain("You are the agent backend.")
+    for (const instruction of instructions) expect(prompt).not.toContain(instruction)
+  }
+}
+
 describe("webchat role at the request boundary", () => {
   for (const endpoint of ["chat", "responses"] as const) {
+    test(`${endpoint} carries user, agent, and workspace startup instructions before the task and through results`, () => {
+      const startup = [
+        { role: "system", content: "USER INSTRUCTIONS: Report directory names only; do not invent results." },
+        { role: "developer", content: "AGENT INSTRUCTIONS: Decide the next action yourself; the handler only dispatches your output." },
+        { role: "developer", content: "WORKSPACE INSTRUCTIONS: The current repository is fixture-root-37. Do not access another directory." },
+      ]
+      const task = { role: "user", content: "List current repo folders." }
+      const tool = { name: "read", description: "List a directory by path", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }
+      expect(JSON.stringify([task, tool])).not.toContain("fixture-root-37")
+      for (const continuation of [false, true]) {
+        const messages = [...startup, task, ...(continuation ? [
+          { role: "assistant", content: "", tool_calls: [{ id: "call_directory", function: { name: "read", arguments: '{"path":"fixture-root-37"}' } }] },
+          { role: "tool", tool_call_id: "call_directory", content: "fixture-folder-alpha\nfixture-folder-beta" },
+        ] : [])]
+        const parsed = endpoint === "chat"
+          ? parseOpenAIChatRequest({ model: "gpt-5.6-terra", messages, tools: [{ type: "function", function: tool }] }, new Headers({ "x-session-affinity": "startup-fixture" }))
+          : parseOpenAIResponsesRequest({ model: "gpt-5.6-terra", input: [...startup, task, ...(continuation ? [
+              { type: "function_call", call_id: "call_directory", name: "read", arguments: '{"path":"fixture-root-37"}' },
+              { type: "function_call_output", call_id: "call_directory", output: "fixture-folder-alpha\nfixture-folder-beta" },
+            ] : [])], tools: [{ type: "function", ...tool }] }, new Headers({ "x-session-affinity": "startup-fixture" }))
+        expectStartup(parsed.turn.primingPrompts, startup.map(instruction => `${instruction.role.toUpperCase()}: ${instruction.content}`))
+        expectTaskPromptsExcludeStartup(parsed, startup.map(instruction => instruction.content))
+        for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
+          for (const instruction of startup) {
+            expect(prompt).not.toContain(instruction.content)
+          }
+          expect(prompt).toEndWith(continuation ? "TOOL RESULT call_directory: fixture-folder-alpha\nfixture-folder-beta" : `USER: ${task.content}`)
+          if (continuation) expect(prompt).toContain("TOOL RESULT call_directory: fixture-folder-alpha\nfixture-folder-beta")
+        }
+      }
+    })
     for (const scenario of ["no tools", "budgeted schemas", "file request", "disabled tools"] as const) {
-      test(`${endpoint} carries the chat-only structured-output role with ${scenario}`, () => {
+      test(`${endpoint} carries the output-only client-directed role with ${scenario}`, () => {
         const request = scenario === "file request"
           ? "Create a file at /tmp/aipass-role-fixture.txt with content hello aipass!"
           : "Hello"
@@ -51,8 +100,9 @@ describe("webchat role at the request boundary", () => {
               ...(scenario === "no tools" ? {} : { tools: [{ type: "function", ...fileTool }] }),
             }, new Headers())
 
+        expectStartup(parsed.turn.primingPrompts)
+        expectTaskPromptsExcludeStartup(parsed)
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-          expectChatOnlyRole(prompt)
           expect(prompt).toContain(request)
         }
         if (scenario === "file request") {
@@ -70,6 +120,29 @@ describe("webchat role at the request boundary", () => {
         if (scenario === "no tools" || scenario === "disabled tools") {
           expect(parsed.offered.size).toBe(0)
           expect(parsed.turn.toolRepairPrompt).toBeUndefined()
+          expect(parsed.turn.initialPrompt).not.toContain("If a listed action has no supplied schema")
+        }
+      })
+    }
+
+    for (const request of ["can use list current repo folders", "use jcodemunch mcp to find all AGENTS.md in this repo"]) {
+      test(`${endpoint} explains client-action declaration for natural requests without projected schemas: ${request}`, () => {
+        const tools = [
+          { name: "read", description: "Read a file or list a directory", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+          { name: "execute", description: "Discover and call MCP tools", parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } },
+        ]
+        const parsed = endpoint === "chat"
+          ? parseOpenAIChatRequest({ model: "gpt-5.6-terra", messages: [{ role: "user", content: request }], tools: tools.map(tool => ({ type: "function", function: tool })) }, new Headers())
+          : parseOpenAIResponsesRequest({ model: "gpt-5.6-terra", input: request, tools: tools.map(tool => ({ type: "function", ...tool })) }, new Headers())
+        expect(parsed.projectedActions).toEqual([])
+        expect([...parsed.offered]).toEqual(["read", "execute"])
+        expectStartup(parsed.turn.primingPrompts)
+        expectTaskPromptsExcludeStartup(parsed)
+        for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
+          expect(prompt).toContain("- read: Read a file or list a directory")
+          expect(prompt).toContain("- execute: Discover and call MCP tools")
+          expect(prompt).toContain('If a listed action has no supplied schema, declare its exact name with "input":{} and stop; the adapter supplies missing required-argument schemas before dispatch.')
+          expect(prompt).not.toContain('"inputSchema"')
         }
       })
     }
@@ -89,8 +162,9 @@ describe("webchat role at the request boundary", () => {
         : parseOpenAIResponsesRequest({
             ...common, instructions: "OMITTED_CLIENT_INSTRUCTIONS", input: messages,
           }, new Headers())
+      expectStartup(parsed.turn.primingPrompts)
+      expectTaskPromptsExcludeStartup(parsed)
       for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-        expectChatOnlyRole(prompt)
         expect(prompt).not.toContain("OMITTED_CLIENT_INSTRUCTIONS")
       }
       expect(parsed.turn.incrementalPrompt).toContain("Continue")
@@ -108,17 +182,44 @@ describe("webchat role at the request boundary", () => {
         ? parseOpenAIChatRequest({ ...common, messages: [{ role: "user", content: request }], tools: [{ type: "function", function: tool }] }, new Headers())
         : parseOpenAIResponsesRequest({ ...common, input: request, tools: [{ type: "function", ...tool }] }, new Headers())
       expect(parsed.projectedActions).toEqual([tool.name])
+      expectStartup(parsed.turn.primingPrompts)
+      expectTaskPromptsExcludeStartup(parsed)
       for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-        expectChatOnlyRole(prompt)
         expect(prompt).toContain(JSON.stringify({ name: tool.name, inputSchema: tool.parameters }))
       }
     })
   }
 
-  test("refreshes bound version-14 contracts after the role instruction changes", () => {
+  for (const endpoint of ["chat", "responses"] as const) test(`${endpoint} keeps instructions separate from compaction and the latest task`, () => {
+    const checkpoint = "<conversation-checkpoint>\n<summary>\nEarlier fixture inspection is complete.\n</summary>\n</conversation-checkpoint>"
+    const messages = [
+      { role: "system", content: "HARNESS_RULE" },
+      { role: "user", content: checkpoint },
+      { role: "developer", content: "CURRENT_AGENT_AND_WORKSPACE_RULE" },
+      { role: "user", content: "CURRENT_USER_RULE" },
+      { role: "user", content: "Continue with the next fixture." },
+    ]
+    const parsed = endpoint === "chat"
+      ? parseOpenAIChatRequest({ model: "gpt-5.6-terra", messages }, new Headers())
+      : parseOpenAIResponsesRequest({ model: "gpt-5.6-terra", input: messages }, new Headers())
+    expect(parsed.turn.compactionDigest).toMatch(/^[a-f0-9]{64}$/)
+    expectStartup(parsed.turn.primingPrompts, ["SYSTEM: HARNESS_RULE", "DEVELOPER: CURRENT_AGENT_AND_WORKSPACE_RULE"])
+    expectTaskPromptsExcludeStartup(parsed, ["HARNESS_RULE", "CURRENT_AGENT_AND_WORKSPACE_RULE"])
+    for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
+      const sections = [`USER: ${checkpoint}`, "USER: CURRENT_USER_RULE", "USER: Continue with the next fixture."]
+      for (const [index, section] of sections.entries()) {
+        expect(prompt).toContain(section)
+        if (index) expect(prompt.indexOf(sections[index - 1]!)).toBeLessThan(prompt.indexOf(section))
+      }
+      expect(prompt).not.toContain("SYSTEM: CURRENT_USER_RULE")
+      expect(prompt).toEndWith(sections.at(-1)!)
+    }
+  })
+
+  test("refreshes bound version-17 contracts after prompt ordering changes", () => {
     const { turn } = parseOpenAIChatRequest({
       model: "gpt-5.6-terra", messages: [{ role: "user", content: "Hello" }],
     }, new Headers())
-    expect(promptContractCurrent(turn.promptContractVersion, turn.actionEnvelopeDigest, 14, turn.actionEnvelopeDigest, true)).toBe(false)
+    expect(promptContractCurrent(turn.promptContractVersion, turn.actionEnvelopeDigest, 17, turn.actionEnvelopeDigest, true)).toBe(false)
   })
 })

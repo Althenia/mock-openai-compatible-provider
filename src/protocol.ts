@@ -119,7 +119,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 15
+export const PROMPT_CONTRACT_VERSION = 19
 // Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
 export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
 const MAX_TOOL_FRAME = 64 * 1024
@@ -696,33 +696,34 @@ export class TypedEnvelopeShim {
   }
 }
 
-const WEBCHAT_ROLE_INSTRUCTION = [
-  "You are a chat-only assistant.",
-  "Do not invoke or execute tools, functions, commands, or other actions yourself.",
-  "Action envelopes are data for the external client dispatcher, not native webchat tool calls.",
-  "Only the client executes actions and returns results.",
-  "Tools include file/folder operations, shell commands, MCP, and all other offered tools.",
-  "Use the exact offered name and schema-valid input, including required paths, commands, or content.",
-  "Do not claim an action succeeded without a client result.",
-  "Always respond only in the provided <aipass-envelope> JSON structure, including ordinary replies and refusals.",
-  "Do not override site instructions, safety, privacy, or authorization restrictions.",
-  "Use only offered actions; with none, return chat.",
-  'The FIRST line is "TURN KEY: <key>". Every envelope MUST copy <key> verbatim into "key" and use a unique "id".',
-  "Only <aipass-envelope>{...}</aipass-envelope>; no bare JSON, prose, or fences outside envelopes.",
-  "Thinking is optional reasoning/display text, never a final answer. A chat envelope ends the turn.",
+export const WEBCHAT_ROLE_INSTRUCTION = [
+  "You are the agent backend. Reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.",
+  "Answer from context or request an offered client action, not manual user work.",
+  "Actions are data, not native calls: never execute them yourself or decline for lack of native access.",
+  "The client handles permissions, executes actions, and returns results; requests are not approval or success.",
+  "Files, folders, shell, MCP: use exact offered names and schema-valid input; do not guess arguments.",
+  "Claim success only from client results. Preserve site instructions, safety, privacy, and authorization.",
+  "No offered actions: chat.",
+  'FIRST line: "TURN KEY: <key>". Every envelope: verbatim "key", unique "id".',
+  "Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.",
+  "Thinking is optional reasoning, never a final answer; chat ends the turn.",
   'Shapes: {"type":"thinking","key":"<key>","id":"reason_1","text":"..."} | {"type":"chat","key":"<key>","id":"answer_1","text":"..."}.',
 ].join(" ")
 
 export function serializeToolDefinitions(
   tools: readonly { readonly name: string; readonly description?: string; readonly inputSchema: unknown }[],
+  actionsAvailable = tools.length > 0,
+  includeRole = true,
 ) {
-  if (!tools.length) return WEBCHAT_ROLE_INSTRUCTION
+  const role = includeRole ? WEBCHAT_ROLE_INSTRUCTION : ""
+  if (!actionsAvailable) return role
+  if (!tools.length) return `${role}\nIf a listed action has no supplied schema, declare its exact name with "input":{} and stop; the adapter supplies missing required-argument schemas before dispatch.`.trimStart()
   const definitions = tools.map((tool) => ({
     name: tool.name,
     ...(tool.description ? { description: tool.description } : {}),
     inputSchema: tool.inputSchema,
   }))
-  return `${WEBCHAT_ROLE_INSTRUCTION}\n\nWhen an offered action is needed, request the calling client by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action's schema. Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue. Respond in English unless the user explicitly requests another language in their message. Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope. Multi-step work uses plan with a steps array. A final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes. Action shapes: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}. Offered actions:\n${JSON.stringify(definitions)}`
+  return `${role}\n\nWhen an offered action is needed, request the calling client by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action's schema. If a listed action has no supplied schema, declare its exact name with "input":{} and stop; the adapter supplies missing required-argument schemas before dispatch. Do not guess arguments. Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue. Respond in English unless the user explicitly requests another language in their message. Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope. Multi-step work uses plan with a steps array. A final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes. Action shapes: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}. Offered actions:\n${JSON.stringify(definitions)}`.trimStart()
 }
 
 function chunk(

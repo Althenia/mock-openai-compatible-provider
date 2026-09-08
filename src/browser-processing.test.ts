@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PlaywrightBrowserAdapter, PlaywrightModelSelectionSurface, selectModel, type BrowserProtocol, type BrowserTurnInput } from "./browser.ts"
 import { model, parseCommand } from "./config.ts"
+import { parseOpenAIChatRequest } from "./http.ts"
 import { StreamFrameParser, type BrowserFrame } from "./protocol.ts"
 
 const models = [model("gpt-5.6-terra"), model("claude-opus-5@azure"), model("Llama-4-Scout-17B-16E-Instruct-1")]
@@ -170,7 +171,7 @@ for (const failure of ["missing", "missing-control", "missing-option", "disabled
 
 for (const failure of ["", "stuck"]) test(`adapter sends only after model/variant verification and closure${failure ? " (stuck picker)" : " across a retained session"}`, async () => {
   const transportPulse = setInterval(() => {}, 10).unref()
-  const submissions: { selected: string; pickerClosed: boolean; filledWhileOpen: boolean; actions: string[] }[] = []
+  const submissions: { selected: string; pickerClosed: boolean; filledWhileOpen: boolean; actions: string[]; prompt: string }[] = []
   let navigations = 0
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const path = new URL(request.url).pathname
@@ -186,15 +187,19 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
         let filledWhileOpen = false;
         document.querySelector('textarea').addEventListener('input', () => {
           filledWhileOpen ||= !picker.hidden;
-          actions.push('fill');
+          if (actions.at(-1) !== 'fill') actions.push('fill');
         });
         document.querySelector('#send').onclick = async () => {
           actions.push('send');
           const response = await fetch('/submit', {method:'POST',body:JSON.stringify({
             messages:[{content:document.querySelector('textarea').value}],
-            observation:{selected:document.body.dataset.selected,pickerClosed:picker.hidden,filledWhileOpen,actions:actions.splice(0)}
+            observation:{selected:document.body.dataset.selected,pickerClosed:picker.hidden,filledWhileOpen,actions:actions.splice(0),prompt:document.querySelector('textarea').value}
           })});
           await response.text();
+          const article = document.createElement('article');
+          article.dataset.role = 'assistant';
+          article.innerHTML = '<p>ready</p><button aria-label="Like"><svg viewBox="0 0 21 20"><path d="M4.75 5.75H2.75" /></svg></button><button aria-label="Dislike"><svg viewBox="0 0 21 20"><path d="M16.1898 12.75H18.1898" /></svg></button>';
+          document.body.append(article);
         };
       </script></body>`), { headers: { "content-type": "text/html" } })
   } })
@@ -205,24 +210,43 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
     decoder: () => new StreamFrameParser(), text: delta => ({ type: "text", delta }),
     finish: reason => ({ type: "finish", reason }), isTerminal: frame => frame.type === "finish",
   }
+  let binding: string | undefined
+  let version: number | undefined
+  let digest: string | undefined
   const adapter = await PlaywrightBrowserAdapter.launch({
     profilePath, executablePath: command.settings.chromeExecutable, chatURL: `${server.url}chat`,
     selectors: { modelLoader: "#model", promptInput: "textarea", sendButton: "#send" },
   }, {
-    async binding() { return undefined }, async prepare(input) { return { id: "fixture", promptHash: input.promptHash } },
-    async pending() {}, async bind() {}, async complete() {}, async fail() {},
+    async binding() { return binding }, async prepare(input) { return { id: "fixture", promptHash: input.promptHash } },
+    async promptContractVersion() { return version ?? 0 }, async actionEnvelopeDigest() { return digest },
+    async pending() {}, async bind(_, remote) { binding = remote },
+    async complete(_, remote, _estimate, nextVersion, nextDigest) {
+      binding = remote
+      if (nextVersion !== undefined) version = nextVersion
+      if (nextDigest !== undefined) digest = nextDigest
+    },
+    async fail() {},
   }, protocol)
   try {
     const cases = [[0, "low"], [0, "high"], [0, "high"], [2, "none"], [1, "max"], [1, "none"]] as const
     for (const [index, reasoning] of failure ? cases.slice(0, 1) : cases) {
       const input: BrowserTurnInput = {
-        sessionMarker: "processing-fixture", ephemeral: false, primingPrompts: [],
-        model: models[index]!, reasoning, initialPrompt: "Reply ready.", incrementalPrompt: "Reply ready.", recoveryPrompt: "Reply ready.",
-        promptContractVersion: 0, actionEnvelopeDigest: "fixture", toolContinuation: false,
+        ...parseOpenAIChatRequest({
+          model: models[index]!.id, reasoning_effort: reasoning, session_id: "processing-fixture",
+          messages: [
+            { role: "system", content: "USER_RULE: Report fixture results only." },
+            { role: "developer", content: "AGENT_RULE: Use client results. WORKSPACE_RULE: fixture-root." },
+            { role: "user", content: "Inspect fixture-root." },
+            { role: "assistant", content: "", tool_calls: [{ id: "call_fixture", function: { name: "read", arguments: '{"path":"fixture-root"}' } }] },
+            { role: "tool", tool_call_id: "call_fixture", content: "fixture-alpha" },
+            { role: "user", content: "Reply ready." },
+          ],
+        }, new Headers()).turn,
+        model: models[index]!, promptKey: "processing-fixture-key",
       }
       const work = (async () => {
         const frames: BrowserFrame[] = []
-        for await (const frame of adapter.turn(input, AbortSignal.timeout(failure ? 2500 : 8000))) frames.push(frame)
+        for await (const frame of adapter.turn(input, AbortSignal.timeout(failure ? 2500 : 25000))) frames.push(frame)
         return frames
       })()
       if (failure) await expect(work).rejects.toThrow()
@@ -231,16 +255,35 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
     expect(navigations).toBe(1)
     if (failure) expect(submissions).toEqual([])
     else {
-      expect(submissions.map(({ selected }) => selected)).toEqual(cases.map(([index, reasoning]) => `${index}:${reasoning}`))
+      expect(submissions.map(({ selected }) => selected)).toEqual(cases.flatMap(([index, reasoning], turn) => Array(turn === 2 ? 1 : 4).fill(`${index}:${reasoning}`)))
       for (const observation of submissions) {
         expect(observation.pickerClosed).toBe(true)
         expect(observation.filledWhileOpen).toBe(false)
       }
-      expect(submissions[2]!.actions).toEqual(["fill", "send"])
-      for (const index of [0, 1, 3, 4, 5]) expect(submissions[index]!.actions.slice(-3)).toEqual(["closed", "fill", "send"])
+      const tasks = submissions.filter(({ prompt }) => prompt.startsWith("TURN KEY:"))
+      expect(tasks).toHaveLength(cases.length)
+      for (const observation of tasks) {
+        expect(observation.prompt).toStartWith("TURN KEY: processing-fixture-key\n\n")
+        const sections = ["USER: Inspect fixture-root.", 'TOOL CALL call_fixture read: {"path":"fixture-root"}', "TOOL RESULT call_fixture: fixture-alpha", "USER: Reply ready."]
+        for (const [index, section] of sections.entries()) {
+          expect(observation.prompt).toContain(section)
+          if (index) expect(observation.prompt.indexOf(sections[index - 1]!)).toBeLessThan(observation.prompt.indexOf(section))
+        }
+        expect(observation.prompt.trimEnd()).toEndWith("USER: Reply ready.")
+        expect(observation.prompt).toBe(tasks[0]!.prompt)
+        expect(observation.prompt).not.toContain("SYSTEM: USER_RULE")
+        expect(observation.prompt).not.toContain("DEVELOPER: AGENT_RULE")
+      }
+      expect(tasks[2]!.actions).toEqual(["fill", "send"])
+      for (const index of [0, 4, 9, 13, 17]) {
+        expect(submissions[index]!.actions.slice(-3)).toEqual(["closed", "fill", "send"])
+        expect(submissions[index]!.prompt).toStartWith("You are the agent backend.")
+        expect(submissions[index + 1]!.prompt).toStartWith("SYSTEM: USER_RULE")
+        expect(submissions[index + 2]!.prompt).toStartWith("DEVELOPER: AGENT_RULE")
+      }
     }
   } finally {
     await adapter.close(); await server.stop(true); clearInterval(transportPulse)
     await rm(profilePath, { recursive: true, force: true })
   }
-}, 30_000)
+}, 120_000)

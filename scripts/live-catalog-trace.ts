@@ -9,7 +9,8 @@ import { parseOpenAIChatRequest } from "../src/http.ts"
 import { serveProvider } from "../src/runtime.ts"
 import { readExistingToken } from "../src/state.ts"
 
-type Trace = { index: number; prompt: string; seen: number; internal: number; mismatches: number; native: Promise<NativeReply>[]; wire?: InputTrace[]; comparison?: ReturnType<typeof compareSkillInputs> }
+type StartupTrace = { prompts: readonly string[]; seen: number; mismatches: number }
+type Trace = { index: number; prompt: string; seen: number; internal: number; mismatches: number; native: Promise<NativeReply>[]; startup?: StartupTrace; wire?: InputTrace[]; comparison?: ReturnType<typeof compareSkillInputs> }
 type InputTrace = { digest: string; bytes: number; keyCount: number }
 type NativeReply = { complete: boolean; attributable: boolean; inputs: InputTrace[] }
 const report = (value: object) => process.stdout.write(`${JSON.stringify(value)}\n`)
@@ -79,18 +80,26 @@ function nativeOwner(trace?: Trace) {
 function captureSummary(traces: Trace[], nativeCount: number, inspectionFailed: boolean, normalConfigUnchanged: boolean) {
   return {
     normalConfigUnchanged, nativeCount, inspectionFailed,
-    projection: traces.map((trace) => ({ request: trace.index, expectedChars: trace.prompt.length, observed: trace.seen, internal: trace.internal, mismatches: trace.mismatches })),
+    projection: traces.map((trace) => ({
+      request: trace.index, expectedChars: trace.prompt.length, observed: trace.seen, internal: trace.internal, mismatches: trace.mismatches,
+      startupExpected: trace.startup?.prompts.length ?? 0, startupObserved: trace.startup?.seen ?? 0, startupMismatches: trace.startup?.mismatches ?? 0,
+    })),
     captureComplete: normalConfigUnchanged && !inspectionFailed && nativeCount > 0 && traces.length > 0 &&
-      traces.every((trace) => trace.prompt.length > 0 && trace.seen > 0 && trace.mismatches === 0),
+      traces.every((trace) => {
+        const startup = trace.startup
+        const startupComplete = !startup || startup.seen === 0 || (startup.seen === startup.prompts.length && startup.mismatches === 0)
+        return trace.prompt.length > 0 && trace.seen > 0 && trace.mismatches === 0 && startupComplete
+      }),
   }
 }
 
 async function project(request: Request, index: number): Promise<Trace | undefined> {
   if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/chat/completions") return
   const parsed = parseOpenAIChatRequest(await request.clone().json(), request.headers)
-  if (parsed.turn.primingPrompts.length || parsed.turn.initialPrompt !== parsed.turn.incrementalPrompt || parsed.turn.initialPrompt !== parsed.turn.recoveryPrompt)
-    throw new Error("observer requires a self-contained request projection")
-  return { index, prompt: parsed.turn.initialPrompt, seen: 0, internal: 0, mismatches: 0, native: [] }
+  return {
+    index, prompt: parsed.turn.initialPrompt, seen: 0, internal: 0, mismatches: 0, native: [],
+    startup: { prompts: parsed.turn.primingPrompts, seen: 0, mismatches: 0 },
+  }
 }
 
 function nativeSubmission(data: string, trace?: Trace) {
@@ -103,18 +112,29 @@ function nativeSubmission(data: string, trace?: Trace) {
     ? message.parts.flatMap((part) => part.type === "text" && typeof part.text === "string" ? [part.text] : []) : [])
   const keys = texts.flatMap((text) => /^TURN KEY: ([^\r\n]+)\r?\n/.exec(text)?.[1] ?? [])
   if (keys.length > 1) throw new Error("ambiguous submitted turn key")
-  const submitted = texts.find((text) => text.startsWith("TURN KEY: "))?.replace(/^TURN KEY: [^\r\n]+\r?\n\r?\n/, "")
-  const expected = trace?.prompt
+  const keyed = keys.length === 1
+  const submitted = keyed
+    ? texts.find((text) => text.startsWith("TURN KEY: "))?.replace(/^TURN KEY: [^\r\n]+\r?\n\r?\n/, "")
+    : texts.length === 1 ? texts[0] : undefined
+  const startup = !keyed
+  const startupTrace = trace?.startup
+  const expected = startup ? startupTrace?.prompts[startupTrace.seen] : trace?.prompt
   const exact = expected !== undefined ? expected === submitted : null
-  const internal = expected !== undefined && submitted?.startsWith(expected + "\n\n") === true
+  const internal = !startup && expected !== undefined && submitted?.endsWith("\n\n" + expected) === true
   if (trace) {
-    trace.seen++
-    if (internal) trace.internal++
-    if (!exact && !internal) trace.mismatches++
+    if (startup) {
+      if (!trace.startup) throw new Error("unexpected unkeyed native submission")
+      trace.startup.seen++
+      if (!exact) trace.startup.mismatches++
+    } else {
+      trace.seen++
+      if (internal) trace.internal++
+      if (!exact && !internal) trace.mismatches++
+    }
   }
   return {
     submittedKey: keys[0],
-    check: "native-submission", request: trace?.index, exact, internal, fullContext: exact === true || internal,
+    check: "native-submission", request: trace?.index, startup, exact, internal, fullContext: !startup && (exact === true || internal),
     expectedChars: expected?.length, observedChars: submitted?.length,
     trailingWhitespaceOnly: exact === false && submitted === expected?.trimEnd(),
     lineEndingsOnly: exact === false && submitted === expected?.replace(/\r\n?/g, "\n"),
@@ -147,6 +167,11 @@ async function selfTest() {
   assert.equal(captureSummary([partial], 1, false, true).captureComplete, false, "missing current-request submission must fail")
   const full: Trace = { ...partial, seen: 1 }
   assert.equal(captureSummary([full], 1, false, true).captureComplete, true)
+  const partialStartup: Trace = {
+    ...full,
+    startup: { prompts: ["adapter role", "SYSTEM: caller instruction"], seen: 1, mismatches: 0 },
+  }
+  assert.equal(captureSummary([partialStartup], 2, false, true).captureComplete, false, "partial startup capture must fail")
   const bound: Trace = { ...full, index: 2, seen: 0 }
   assert.equal(captureSummary([full, bound], 1, false, true).captureComplete, false, "a prior exact submission cannot stand in for a bound request")
   assert.equal(captureSummary([full, { ...bound, seen: 1 }], 2, false, true).captureComplete, true)
@@ -155,26 +180,49 @@ async function selfTest() {
   assert.equal(captureSummary([full], 2, false, false).captureComplete, false)
   const whitespaceTrace: Trace = { ...partial, prompt: "fixture \n" }
   const nativeBody = (text: string) => JSON.stringify({ isTemporary: true, messages: [{ parts: [{ type: "text", text: `TURN KEY: submitted-turn\n\n${text}` }] }] })
+  const startupBody = (text: string) => JSON.stringify({ isTemporary: true, messages: [{ parts: [{ type: "text", text }] }] })
+  const startupTrace: Trace = {
+    ...partial,
+    startup: { prompts: ["adapter role", "SYSTEM: caller instruction"], seen: 0, mismatches: 0 },
+  }
+  assert.equal(nativeSubmission(startupBody("adapter role"), startupTrace)?.startup, true)
+  assert.equal(nativeSubmission(startupBody("SYSTEM: caller instruction"), startupTrace)?.exact, true)
+  assert.equal(captureSummary([{ ...startupTrace, seen: 1 }], 3, false, true).captureComplete, true, "complete ordered startup is independent of the keyed task")
+  const outOfOrderStartup: Trace = { ...startupTrace, startup: { prompts: ["adapter role", "SYSTEM: caller instruction"], seen: 0, mismatches: 0 } }
+  assert.equal(nativeSubmission(startupBody("SYSTEM: caller instruction"), outOfOrderStartup)?.exact, false)
+  assert.equal(nativeSubmission(startupBody("adapter role"), outOfOrderStartup)?.exact, false)
+  assert.equal(captureSummary([{ ...outOfOrderStartup, seen: 1 }], 3, false, true).captureComplete, false, "out-of-order startup capture must fail")
+  const reusedBound: Trace = { ...startupTrace, startup: { prompts: ["adapter role"], seen: 0, mismatches: 0 }, seen: 1 }
+  assert.equal(captureSummary([reusedBound], 1, false, true).captureComplete, true, "a reused bound turn may omit startup")
   const whitespace = nativeSubmission(nativeBody(whitespaceTrace.prompt.trimEnd()), whitespaceTrace)
   assert.equal(whitespace?.exact, false)
   assert.equal(whitespace?.trailingWhitespaceOnly, true)
   assert.equal(whitespaceTrace.seen, 1)
   assert.equal(whitespaceTrace.mismatches, 1)
   const repaired = { ...partial }
-  assert.equal(nativeSubmission(nativeBody(repaired.prompt + "\n\nrepair instruction"), repaired)?.fullContext, true)
+  const repairSubmission = nativeSubmission(nativeBody("repair instruction\n\n" + repaired.prompt), repaired)
+  assert.equal(repairSubmission?.submittedKey, "submitted-turn")
+  assert.equal(repairSubmission?.fullContext, true)
   assert.equal(repaired.internal, 1)
+  const provisionSubmission = nativeSubmission(nativeBody("provision instruction\n\n" + repaired.prompt), repaired)
+  assert.equal(provisionSubmission?.submittedKey, "submitted-turn")
+  assert.equal(provisionSubmission?.fullContext, true)
   assert.equal(nativeSubmission(nativeBody("repair instruction"), repaired)?.fullContext, false)
   assert.equal(captureSummary([repaired], 2, false, true).captureComplete, false, "contextless internal turns must fail")
-  assert.equal(nativeSubmission(JSON.stringify({ messages: [{ parts: [{ type: "text", text: partial.prompt }] }] }), { ...partial })?.fullContext, false, "unkeyed submissions are not attributable")
+  assert.equal(nativeSubmission(JSON.stringify({ messages: [{ parts: [{ type: "text", text: partial.prompt }] }] }))?.fullContext, false, "unkeyed submissions are not attributable")
   const body = JSON.stringify({ model: "gemini-3.1-flash-lite", instruction_mode: "preserve", messages: [
     { role: "system", content: "Synthetic instruction.\n".repeat(450) + "<available_skills>readme-writer</available_skills>" },
     { role: "user", content: "Reply ready." },
   ] })
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const trace = await project(request, 1)
-    assert(trace && trace.prompt.length > 8_000)
-    assert(trace.prompt.includes("<available_skills>readme-writer</available_skills>"))
+    assert(trace && trace.prompt.length > 0)
+    assert.equal(trace.startup?.prompts.length, 2)
+    assert(trace.startup?.prompts[1]?.length > 8_000)
+    assert(trace.startup?.prompts[1]?.includes("<available_skills>readme-writer</available_skills>"))
     assert.equal(await request.text(), body)
+    for (const startup of trace.startup?.prompts ?? [])
+      assert.equal(nativeSubmission(startupBody(startup), trace)?.exact, true, "startup prompts must be captured in projection order")
     assert.equal(nativeSubmission(nativeBody(trace.prompt), trace)?.exact, true)
     assert.equal(trace.seen, 1)
     assert.equal(trace.mismatches, 0)
@@ -277,7 +325,7 @@ async function run(managedClient = false) {
           firstNativeTarget ??= request.url()
           nativeCount++
           report({ sequence: nativeCount, sameTargetAsFirst: request.url() === firstNativeTarget, ...metadata })
-          if (trace) trace.native.push(response.text().then((body) => nativeReply(body, submittedKey)).catch(() => {
+          if (trace && submittedKey) trace.native.push(response.text().then((body) => nativeReply(body, submittedKey)).catch(() => {
             inspectionFailed = true
             return { complete: false, attributable: false, inputs: [] }
           }))
@@ -316,7 +364,8 @@ async function run(managedClient = false) {
         if (trace) {
           if (addTrace(traces, trace)) { inspectionFailed = true; report({ overlappingClientRequests: true }) }
           current = trace
-          report({ check: "client-projection", request: trace.index, expectedChars: trace.prompt.length, catalog: trace.prompt.includes("available_skills"), readme: trace.prompt.includes("readme-writer") })
+          const context = [...(trace.startup?.prompts ?? []), trace.prompt].join("\n")
+          report({ check: "client-projection", request: trace.index, expectedChars: trace.prompt.length, startupPrompts: trace.startup?.prompts.length ?? 0, catalog: context.includes("available_skills"), readme: context.includes("readme-writer") })
         }
       } catch { inspectionFailed = true; report({ projectionFailed: true }) }
       const response = await fetch(new URL(new URL(request.url).pathname, endpoint), { method: request.method, headers: request.headers, body: request.body, signal: request.signal })

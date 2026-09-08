@@ -354,7 +354,10 @@ export class StandaloneBrowserService implements BrowserService {
 
   private async flightHash(input: ProjectedTurn): Promise<string> {
     const hashPrompt = (prompt: string) =>
-      promptHashForSingleFlight(input.promptKey ? withTurnKey(prompt, input.promptKey) : prompt)
+      promptHashForSingleFlight(JSON.stringify([
+        input.modelID, input.reasoning, input.compactionDigest, input.primingPrompts,
+        input.promptKey ? withTurnKey(prompt, input.promptKey) : prompt,
+      ]))
     if (!this.flightStore) return hashPrompt(input.initialPrompt)
     const record = await this.flightStore.get(input.sessionMarker)
     const binding = record?.remoteChatID
@@ -455,7 +458,7 @@ export class StandaloneBrowserService implements BrowserService {
           : undefined)
       const repair = repairPrompt
         ? () => {
-            const prompt = [input.recoveryPrompt, repairPrompt].filter(Boolean).join("\n\n")
+            const prompt = [repairPrompt, input.recoveryPrompt].filter(Boolean).join("\n\n")
             console.error(`aipass turn repair start promptChars=${prompt.length}`)
             const repairInput: ProjectedTurn = {
               ...input,
@@ -538,7 +541,7 @@ export class StandaloneBrowserService implements BrowserService {
           }
         } else {
           const provisionSchemas = need.map((name) => schemasByName.get(name)!).filter(Boolean)
-          const provisionPrompt = [input.recoveryPrompt, serializeToolDefinitions(provisionSchemas)].filter(Boolean).join("\n\n")
+          const provisionPrompt = [serializeToolDefinitions(provisionSchemas), input.recoveryPrompt].filter(Boolean).join("\n\n")
           console.error(`aipass turn provision start tools=${need.join(",")} promptChars=${provisionPrompt.length}`)
           for (const name of need) shown.add(name)
           const provisionInput: ProjectedTurn = {

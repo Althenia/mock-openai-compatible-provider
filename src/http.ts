@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { model, type Reasoning } from "./config.ts"
-import { INSTRUCTION_DIGEST_PREFIX_LENGTH, PROMPT_CONTRACT_VERSION, serializeToolDefinitions, validName } from "./protocol.ts"
+import { INSTRUCTION_DIGEST_PREFIX_LENGTH, PROMPT_CONTRACT_VERSION, WEBCHAT_ROLE_INSTRUCTION, serializeToolDefinitions, validName } from "./protocol.ts"
 import { compactionDigest, estimateTokens } from "./context.ts"
 
 export interface OfferedToolSchema {
@@ -505,8 +505,15 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   const instructionMode = input.instruction_mode ?? "preserve"
   if (instructionMode !== "preserve" && instructionMode !== "action-only")
     throw new Error("instruction_mode must be preserve or action-only")
-  const clientInstructions = serializeMessages(input.messages, "instructions")
-  const instructions = instructionMode === "action-only" ? "" : clientInstructions
+  // Validate before projecting individual instruction messages so original
+  // system/developer boundaries and ordering survive transport.
+  serializeMessages(input.messages, "instructions")
+  const instructions = instructionMode === "action-only" ? [] : (input.messages as unknown[])
+    .filter(message => ["system", "developer"].includes(String(record(message)?.role)))
+    .map(message => serializeMessages([message], "instructions"))
+  const primingPrompts = [WEBCHAT_ROLE_INSTRUCTION, ...instructions].map(prompt =>
+    `${prompt}\n\nStartup instruction only. No task or turn key yet. Acknowledge briefly with READY, then wait for the next submission. Do not request actions during startup.`,
+  )
   const omitLoweredSystemUpdates = instructionMode === "action-only"
   const conversation = serializeMessages(input.messages, "conversation", omitLoweredSystemUpdates)
   const incrementalTranscript = incrementalMessages(input.messages, conversation, omitLoweredSystemUpdates)
@@ -549,8 +556,8 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
           (tool) => namedSet.has(tool.name) || budgetedNonNamedSet.has(tool.name),
         )
   const nameIndex = toolNameIndex(offeredTools)
-  const schemaContract = serializeToolDefinitions(provisioned)
-  const actionContract = [nameIndex, schemaContract].filter(Boolean).join("\n")
+  const schemaContract = serializeToolDefinitions(provisioned, offeredTools.length > 0, false)
+  const actionContract = [schemaContract, nameIndex].filter(Boolean).join("\n")
   // Repair re-provides the full offered set: a decline often means the capped
   // projection hid the needed tool. Concise-natural contracts answer fast at
   // this size (measured); dense-synthetic extremes may still idle out once.
@@ -560,10 +567,9 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
       ? "You must request one of the available actions before giving a final answer."
       : ""
   const toolDefinitions = [actionContract, requiredNotice].filter(Boolean).join("\n")
-  // Browser affinity is transport state, not reliable semantic memory. Normal
-  // requests carry all supplied context in the current submission on every route.
-  const initialTranscript = [instructions, conversation].filter(Boolean).join("\n\n")
-  const initialPrompt = [initialTranscript, toolDefinitions].filter(Boolean).join("\n")
+  // Startup is submitted serially by the browser. Every task still carries
+  // current action schemas and chronological conversation, not startup text.
+  const initialPrompt = [toolDefinitions, conversation].filter(Boolean).join("\n")
   const autoToolChoice = input.tool_choice === undefined || input.tool_choice === "auto"
   const toolRepairPrompt = autoToolChoice && offeredTools.length > 0
     ? [
@@ -575,11 +581,11 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
       ].join("\n")
     : undefined
   const rawActionEnvelopeDigest = createHash("sha256")
-    .update(`${PROMPT_CONTRACT_VERSION}\0${instructions}\0${toolDefinitions}`)
+    .update(JSON.stringify([PROMPT_CONTRACT_VERSION, primingPrompts, toolDefinitions]))
     .digest("hex")
   // Keep instruction identity separate so tool-schema provisioning can reuse
   // a continuation without suppressing a changed preserved instruction block.
-  const instructionDigest = createHash("sha256").update(instructions).digest("hex")
+  const instructionDigest = createHash("sha256").update(JSON.stringify(primingPrompts)).digest("hex")
   const actionEnvelopeDigest = [
     instructionMode === "action-only" ? "a0" : "b0",
     instructionDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH - 2),
@@ -587,13 +593,13 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   ].join("")
   const incrementalPrompt = instructionMode === "preserve"
     ? initialPrompt
-    : [incrementalTranscript, serializeToolDefinitions([])].filter(Boolean).join("\n\n")
+    : [toolDefinitions, incrementalTranscript].filter(Boolean).join("\n\n")
   // A recovery reload has no bound remote history. Tool continuations need
   // their preceding request as well as the latest tool result to resume.
   const recoveryConversation = continuingTool ? conversation : incrementalTranscript
   const recoveryPrompt = instructionMode === "preserve"
     ? initialPrompt
-    : [recoveryConversation, toolDefinitions].filter(Boolean).join("\n")
+    : [toolDefinitions, recoveryConversation].filter(Boolean).join("\n")
   const reasoningMode = record(input.reasoning)?.mode ?? record(input.reasoning)?.effort
   if (
     reasoningMode !== undefined &&
@@ -608,7 +614,7 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
     turn: {
       sessionMarker,
       ephemeral: sessionValue.ephemeral,
-      primingPrompts: [],
+      primingPrompts,
       modelID: input.model,
       reasoning: reasoningValue as Reasoning,
       initialPrompt,
@@ -633,7 +639,7 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
     projectedActions: provisioned.map((tool) => tool.name),
     stream,
     includeUsage: record(input.stream_options)?.include_usage === true,
-    promptTokens: estimateTokens(initialPrompt),
+    promptTokens: estimateTokens(initialPrompt) + primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0),
     requireTool: selection.required,
   }
 }

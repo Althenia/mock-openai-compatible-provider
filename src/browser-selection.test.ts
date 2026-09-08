@@ -8,6 +8,8 @@ import { parseOpenAIChatRequest } from "./http.ts"
 import { StreamFrameParser, type BrowserFrame } from "./protocol.ts"
 
 for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated matching ${sibling} response during a selected turn`, async () => {
+  const transportPulse = setInterval(() => {}, 10).unref()
+  let startups = 0
   const wire = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
   const tool = '<aipass-envelope>{"type":"tool","key":"fixture-key","id":"read_1","name":"read","input":{}}</aipass-envelope>'
   const thinking = wire({ type: "reasoning-delta", delta: "selected thought" })
@@ -15,8 +17,15 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
   let release!: () => void
   const remainder = new Promise<void>(resolve => { release = resolve })
   let binding: string | undefined
-  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const path = new URL(request.url).pathname
+    if (path === "/submit") {
+      const body = await request.json() as { messages: { parts: { text: string }[] }[] }
+      if (!body.messages[0]!.parts[0]!.text.startsWith("TURN KEY:")) {
+        startups++
+        return new Response(wire({ type: "text", delta: "READY" }) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
+      }
+    }
     if (path === "/submit") return new Response(new ReadableStream<Uint8Array>({
       async start(controller) {
         controller.enqueue(Buffer.from(thinking.slice(0, split)))
@@ -38,6 +47,13 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
       <script>
         document.querySelector('#send').onclick = async () => {
           const response = await fetch(new Request('/submit', { method: 'POST', body: JSON.stringify({ messages: [{ parts: [{ type: 'text', text: document.querySelector('#prompt').value }] }] }) }));
+          if (!document.querySelector('#prompt').value.startsWith('TURN KEY:')) {
+            await response.text();
+            const article = document.createElement('article'); article.dataset.role = 'assistant';
+            article.innerHTML = '<p>READY</p><button aria-label="Like"><svg viewBox="0 0 21 20"><path d="M4.75 5.75H2.75" /></svg></button><button aria-label="Dislike"><svg viewBox="0 0 21 20"><path d="M16.1898 12.75H18.1898" /></svg></button>';
+            document.querySelector('main').append(article);
+            return;
+          }
           const reader = response.body.getReader();
           await reader.read();
           await (await fetch('/side')).text();
@@ -74,5 +90,6 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
     expect(frames).toEqual([
       { type: "reasoning", delta: "selected thought" }, { type: "text", delta: tool }, { type: "finish", reason: "stop" },
     ])
-  } finally { release(); await adapter.close(); await server.stop(true); await rm(profilePath, { recursive: true, force: true }) }
+    expect(startups).toBe(input.primingPrompts.length)
+  } finally { release(); await adapter.close(); clearInterval(transportPulse); await server.stop(true); await rm(profilePath, { recursive: true, force: true }) }
 }, 20_000)

@@ -1,6 +1,8 @@
-import { endpointURL, ensureEndpointConfig, parseCommand, readRuntimeConfig, usage, type Environment, type Settings } from "./config.ts"
-import { readExistingToken, readOrCreateToken } from "./state.ts"
+import { endpointURL, ensureEndpointConfig, parseCommand, readRuntimeConfig, usage, type Command, type Environment, type Settings } from "./config.ts"
+import { ProfileLock, readExistingToken, readOrCreateToken } from "./state.ts"
 import { version } from "../package.json"
+import { basename, dirname } from "node:path"
+import installer from "../site/install.sh" with { type: "text" }
 
 export interface CLIIO {
   readonly out: (value: string) => void
@@ -26,6 +28,33 @@ async function requestStop(settings: Settings) {
   if (!response.ok) throw new Error("provider server rejected the authenticated stop request")
 }
 
+async function update(command: Extract<Command, { type: "update" }>, environment: Environment, io: CLIIO) {
+  let installDir = command.installDir
+  // Bun's compiled entrypoint lives in its virtual filesystem. Never use the
+  // Bun executable's directory when this CLI is invoked from source.
+  if (!installDir && import.meta.path.startsWith("/$bunfs/")) {
+    if (basename(process.execPath) !== "aipass-browser-provider")
+      throw new Error("renamed executable: use update --install-dir DIRECTORY to select the installation")
+    installDir = dirname(process.execPath)
+  }
+  const lock = await ProfileLock.acquire(command.settings.paths).catch(error => {
+    if (!(error instanceof Error) || error.message !== "browser profile is already owned by another provider process") throw error
+    throw new Error("cannot update: stop the provider and close login for this state root first", { cause: error })
+  })
+  try {
+    const args = ["/bin/sh", "-c", installer, "aipass-installer"]
+    if (command.version) args.push("--version", command.version)
+    if (installDir) args.push("--install-dir", installDir)
+    const child = Bun.spawn(args, { env: environment, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+    ])
+    if (stdout.trim()) io.out(stdout.trimEnd())
+    if (code !== 0) throw new Error(stderr.trim() || `update installer failed (exit ${code})`)
+    if (stderr.trim()) io.error(stderr.trimEnd())
+  } finally { await lock.release() }
+}
+
 export async function runCLI(
   arguments_: readonly string[],
   environment: Environment = process.env,
@@ -36,6 +65,7 @@ export async function runCLI(
     const command = parseCommand(arguments_, environment)
     if (command.type === "help") io.out(usage())
     else if (command.type === "version") io.out(version)
+    else if (command.type === "update") await update(command, environment, io)
     else if (command.type === "endpoint") io.out(endpointURL(await ensureEndpointConfig(command.settings)))
     else if (command.type === "print-token") io.out(await readOrCreateToken(command.settings.paths))
     else if (command.type === "stop") {

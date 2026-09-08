@@ -22,7 +22,11 @@ for (const scenario of ["selected", "unselected", "cancel", "late-dom", "late-do
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const path = new URL(request.url).pathname
     if (path === "/submit") {
-      key = /^TURN KEY: (.+)/m.exec(await request.text())?.[1] ?? ""
+      const prompt = await request.text()
+      if (!prompt.startsWith("TURN KEY:") && prompt !== "unrelated") {
+        return new Response(`data: ${JSON.stringify({ type: "text", delta: "READY" })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+      }
+      key = /^TURN KEY: (.+)/m.exec(prompt)?.[1] ?? ""
       submitted = true
       return Response.json({ remaining: 42 })
     }
@@ -42,13 +46,24 @@ for (const scenario of ["selected", "unselected", "cancel", "late-dom", "late-do
       <a href="/chat?temporary-chat=true">Temporary chat</a>
       <button id="model" onclick="document.querySelector('[role=dialog]').hidden=false">Fixture</button>
       <div role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><span>Fixture</span><button onclick="this.closest('[role=dialog]').hidden=true">Select</button></section></div>
-      <textarea id="prompt"></textarea><button id="send" type="submit">Send</button>
+      <textarea id="prompt"></textarea><button id="send" type="button">Send</button>
       <main><article data-role="assistant"><div data-no-copy="true"><div data-slot="collapsible"><button data-slot="collapsible-trigger" aria-expanded="true">Thinking</button><div data-slot="collapsible-content"><p>OLD PANEL MUST NOT LEAK</p></div></div></div></article></main>
       <script>
         document.querySelector('#send').onclick = async () => {
           const prompt = document.querySelector('#prompt').value;
           document.querySelector('#send').disabled = false;
-          await (await fetch('/submit', {method:'POST', body:${scenario === "unselected" ? "'unrelated'" : "prompt"}})).text();
+          await (await fetch('/submit', {method:'POST', body:${scenario === "unselected" ? "prompt.startsWith('TURN KEY:') ? 'unrelated' : prompt" : "prompt"}})).text();
+          if (!prompt.startsWith('TURN KEY:')) {
+            const article = document.createElement('article'); article.dataset.role = 'assistant';
+            article.textContent = 'READY';
+            for (const [label, path] of [['Like', 'M4.75 5.75H2.75'], ['Dislike', 'M16.1898 12.75H18.1898']]) {
+              const button = document.createElement('button');
+              button.setAttribute('aria-label', label);
+              button.innerHTML = '<svg viewBox="0 0 21 20"><path d="' + path + '" /></svg>'; article.append(button);
+            }
+            document.querySelector('main').append(article);
+            return;
+          }
           const user = document.createElement('article'); user.dataset.role = 'user'; user.textContent = prompt; document.querySelector('main').append(user);
           const article = document.createElement('article'); article.dataset.role = 'assistant';
           article.innerHTML = '<div data-no-copy="true"><div data-slot="collapsible"><button data-slot="collapsible-trigger" aria-expanded="true">Processing</button><div data-slot="collapsible-content"><p><span data-streamdown="strong">Check</span></p><p id="body">Visible</p></div></div></div>';
@@ -195,7 +210,10 @@ test("a completed thinking-only webchat message waits for the later tool reply",
     hostname: "127.0.0.1", port: 0,
     async fetch(request) {
       if (request.method === "POST") {
-        await request.text()
+        const prompt = await request.text()
+        if (new URL(request.url).pathname === "/submit" && !prompt.startsWith("TURN KEY:")) {
+          return new Response(`data: ${JSON.stringify({ type: "text", delta: "READY" })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+        }
         const final = new URL(request.url).pathname === "/final"
         finalRequested ||= final
         return new Response(`data: ${JSON.stringify({ type: "text-delta", delta: final ? tool : thinking })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
@@ -204,11 +222,22 @@ test("a completed thinking-only webchat message waits for the later tool reply",
         <a href="/chat?temporary-chat=true">Temporary chat</a>
         <button id="model" onclick="document.querySelector('[role=dialog]').hidden=false">Fixture</button>
         <div role="dialog" data-testid="model-selector-modal" hidden><section data-testid="model-card"><span>Fixture</span><button onclick="this.closest('[role=dialog]').hidden=true">Select</button></section></div>
-        <textarea id="prompt"></textarea><button id="send" type="submit">Send</button><main></main>
+        <textarea id="prompt"></textarea><button id="send" type="button">Send</button><main></main>
         <script>
           document.querySelector('#send').onclick = async () => {
+            const prompt = document.querySelector('#prompt').value;
             document.querySelector('#send').disabled = true;
-            await (await fetch('/submit', {method:'POST', body:document.querySelector('#prompt').value})).text();
+            await (await fetch('/submit', {method:'POST', body:prompt})).text();
+            if (!prompt.startsWith('TURN KEY:')) {
+              const article = document.createElement('article'); article.dataset.role = 'assistant'; article.textContent = 'READY';
+              for (const [label, path] of [['Like', 'M4.75 5.75H2.75'], ['Dislike', 'M16.1898 12.75H18.1898']]) {
+                const button = document.createElement('button'); button.setAttribute('aria-label', label);
+                button.innerHTML = '<svg viewBox="0 0 21 20"><path d="' + path + '" /></svg>'; article.append(button);
+              }
+              document.querySelector('main').append(article);
+              document.querySelector('#send').disabled = false;
+              return;
+            }
             const article = document.createElement('article'); article.dataset.role = 'assistant';
             const text = document.createElement('p'); text.textContent = ${JSON.stringify(thinking)}; article.append(text);
             for (const path of ['M4.75 5.75H2.75', 'M16.1898 12.75H18.1898']) {

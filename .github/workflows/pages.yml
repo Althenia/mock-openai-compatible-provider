@@ -1,4 +1,4 @@
-name: Publish installer
+name: Publish documentation
 
 on:
   push:
@@ -6,6 +6,14 @@ on:
       - main
     paths:
       - "site/**"
+      - "docs/**"
+      - "README.md"
+      - "SOURCE.md"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES"
+      - "scripts/**"
+      - "src/docs-site.test.ts"
+      - "src/static-docs-site.test.ts"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -24,7 +32,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
       - run: sh -n site/install.sh && sh scripts/test-install.sh
+      - run: bun test src/docs-site.test.ts src/static-docs-site.test.ts
   deploy:
     needs: validate
     if: github.event_name == 'workflow_dispatch' && github.event.repository.private == false
@@ -35,12 +47,20 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
       - name: Configure Pages
+        id: pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
-      - name: Upload installer
+      - name: Build public documentation and installer
+        env:
+          PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: bun scripts/build-docs-site.ts --out output/pages --base-path "$PAGES_BASE_PATH"
+      - name: Upload public documentation and installer
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
         with:
-          path: site
+          path: output/pages
       - name: Deploy Pages
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

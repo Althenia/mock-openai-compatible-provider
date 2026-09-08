@@ -252,11 +252,11 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(15);
+    expect(PROMPT_CONTRACT_VERSION).toBe(19);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(15);
+    expect(parsed.turn.promptContractVersion).toBe(19);
   });
 });
