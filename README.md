@@ -72,7 +72,5 @@ these paths.
 - [Operations](docs/operations.md) — configuration, updates, diagnostic scripts, and local review.
 - [Runtime guide](docs/runtime-guide.md) — API contracts, sessions, context, and recovery.
 - [Model matrix](docs/model-matrix.md) — provider model IDs and Processing options.
-- [Build and contribute](SOURCE.md#application-build) — source setup and checks with **Bun 1.4.2**.
 
-Licensed under [AGPL-3.0-only](LICENSE). See [source and redistribution](SOURCE.md)
-and [third-party notices](THIRD_PARTY_NOTICES).
+Licensed under [AGPL-3.0-only](LICENSE).
