@@ -18,15 +18,17 @@ sources:
 
 # Definition
 
-Webchat has no native function-calling API, so AIPass projects offered tool names and selected schemas, validates returned envelopes, and converts valid actions to OpenAI-compatible calls; only the calling client executes them and returns tool results.[^runtime-guide]
+Webchat has no native function-calling API, so AIPass supplies offered tool names and complete schemas during startup, validates returned envelopes, and converts valid actions to OpenAI-compatible calls; only the calling client executes them and returns tool results.[^runtime-guide]
 
 # Envelope rules
 
-Every envelope carries the current submission turn key, a unique call ID, an offered name, and schema-conforming input; chat envelopes stay text, thinking envelopes become reasoning, and quoted action JSON inside chat is not executed.[^runtime-guide] The protocol defines `<aipass-envelope>` delimiters, a leading `TURN KEY` line, per-turn key matching, and a typed action chain of thinking, action group, and final chat or action envelopes.[^protocol]
+Action envelopes carry the current submission turn key, a unique call ID, an offered name, and schema-conforming input; chat envelopes stay text, thinking envelopes become reasoning, and quoted action JSON inside chat is not executed.[^runtime-guide] The protocol defines `<aipass-envelope>` delimiters, a leading `TURN KEY` line, per-turn key matching, and a typed action chain of thinking, action group, and final chat or action envelopes.[^protocol]
 
 # Repair paths
 
-Automatic capability-only refusals can trigger one corrective turn and missing required arguments can trigger one targeted schema-provision turn; safety refusals, ordinary answers, existing actions, and oversized responses do not retry, and neither path invents results.[^runtime-guide]
+Complete bare and `TURN KEY`-prefixed envelope chains are validated before single-envelope malformed-text recovery. After reasoning progress, strict runtime validation rejects invalid trailing actions instead of absorbing them into chat prose. Single chat/thinking envelopes retain narrow recovery for unescaped prose quotes; non-strict fallback behavior is unchanged.[^runtime-guide]
+
+Automatic capability-only refusals can trigger one corrective turn and missing required arguments can trigger one targeted argument-correction turn referencing the startup schema. Corrections carry guidance and the latest task/result delta without repeating the role, full schemas, or full conversation; neither path invents results.[^runtime-guide] The recognized Thai webchat guardrail notice terminates immediately, including split stream text, before turn-key retry, refusal repair, or argument correction.[^runtime-guide]
 
 See also: [Provider runtime](../architecture/provider-runtime.md) and [Prompt projection](../architecture/prompt-projection.md).
 

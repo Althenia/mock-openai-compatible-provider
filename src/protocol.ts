@@ -119,7 +119,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 22
+export const PROMPT_CONTRACT_VERSION = 23
 // Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
 export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
 const MAX_TOOL_FRAME = 64 * 1024
@@ -669,7 +669,7 @@ export class TypedEnvelopeShim {
       const echo = echoedTurnKey(original)
       if (echo && completionEnvelopes(echo.body).length) {
         if (!envelopesMatchTurnKey(original, echo.key)) throw new Error("browser response TURN KEY mismatch")
-        const bare = this.tryBare(echo.body) ?? this.tryBareChain(echo.body)
+        const bare = this.tryBareChain(echo.body) ?? this.tryBare(echo.body)
         if (bare) return bare
         if (echo.body.startsWith(ENVELOPE_OPEN)) return [...this.push(echo.body), ...this.finish()]
       }
@@ -679,13 +679,13 @@ export class TypedEnvelopeShim {
     const trimmed = this.buffer.trim()
     this.buffer = ""
     if (!trimmed) return []
-    const bare = this.tryBare(trimmed)
-    if (bare) return bare
     // Bare multi-envelope chain: {"thinking",...}\n{"tool",...} has no tags
-    // and is not one JSON object. Parse each envelope-shaped object in order;
-    // anything unparsable stays text so the repair net can still act.
+    // and is not one JSON object. Validate it before single-envelope repair
+    // can absorb a trailing action into the first envelope's prose.
     const chain = this.tryBareChain(trimmed)
     if (chain) return chain
+    const bare = this.tryBare(trimmed)
+    if (bare) return bare
     if (trimmed.startsWith("{")) {
       try {
         JSON.parse(trimmed)
@@ -816,16 +816,25 @@ export function serializeToolDefinitions(
   tools: readonly { readonly name: string; readonly description?: string; readonly inputSchema: unknown }[],
   actionsAvailable = tools.length > 0,
   includeRole = true,
+  includeActionProtocol = true,
 ) {
   const role = includeRole ? WEBCHAT_ROLE_INSTRUCTION : ""
   if (!actionsAvailable) return role
-  if (!tools.length) return `${role}\nIf a listed action has no supplied schema, declare its exact name with "input":{} and stop; the adapter supplies missing required-argument schemas before dispatch.`.trimStart()
   const definitions = tools.map((tool) => ({
     name: tool.name,
     ...(tool.description ? { description: tool.description } : {}),
     inputSchema: tool.inputSchema,
   }))
-  return `${role}\n\nWhen an offered action is needed, request the calling client by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action's schema. If a listed action has no supplied schema, declare its exact name with "input":{} and stop; the adapter supplies missing required-argument schemas before dispatch. Do not guess arguments. Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue. Respond in English unless the user explicitly requests another language in their message. Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope. Multi-step work uses plan with a steps array. A final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes. Action shapes: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}. Offered actions:\n${JSON.stringify(definitions)}`.trimStart()
+  const actionProtocol = includeActionProtocol ? [
+    'When an offered action is needed, request the calling client by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action\'s schema.',
+    "Use the full schemas supplied during startup. Every action input must satisfy its schema, including all required fields. Do not guess arguments.",
+    "Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue.",
+    "Respond in English unless the user explicitly requests another language in their message.",
+    "Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope.",
+    "Multi-step work uses plan with a steps array. A final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes.",
+    'Action shapes: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}.',
+  ].join(" ") : ""
+  return [role, actionProtocol, tools.length ? `Offered actions:\n${JSON.stringify(definitions)}` : ""].filter(Boolean).join("\n\n")
 }
 
 function chunk(

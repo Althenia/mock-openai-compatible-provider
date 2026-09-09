@@ -111,14 +111,15 @@ describe("internal continuation request fidelity", () => {
         expect(next.primingPrompts).toEqual([])
         expect(next.promptKey).toBe(parsed.turn.promptKey)
         for (const prompt of [next.initialPrompt, next.incrementalPrompt, next.recoveryPrompt]) {
-          expect(prompt).toContain("You are a text-generation assistant working only as the backend.")
-          expect(prompt).toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
-          expect(prompt).toContain("Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.")
-          expect(prompt).toContain("ORIGINAL_TASK")
-          expect(prompt).toContain('TOOL CALL call_fixture read: {"path":"fixture.txt"}')
+          expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
+          expect(prompt).not.toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
+          expect(prompt).not.toContain("Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.")
+          expect(prompt).not.toContain("ORIGINAL_TASK")
+          expect(prompt).not.toContain('TOOL CALL call_fixture read: {"path":"fixture.txt"}')
           expect(prompt).toContain("TOOL RESULT call_fixture: LATEST_RESULT: alpha or beta")
-          expect(prompt).toContain('"name":"question"')
-          expect(prompt.indexOf('"name":"question"')).toBeLessThan(prompt.indexOf("ORIGINAL_TASK"))
+          expect(prompt).not.toContain('"inputSchema"')
+          expect(submitted[0]!.primingPrompts.join("\n")).toContain('"name":"question"')
+          if (trigger === "provision") expect(prompt).toContain('"name":"question","required":["query"]')
           for (const rule of ["SYSTEM_RULE", "DEVELOPER_RULE"]) {
             if (mode === "preserve") expect(submitted[0]!.primingPrompts.join("\n")).toContain(rule)
             else expect(submitted[0]!.primingPrompts.join("\n")).not.toContain(rule)
@@ -900,7 +901,7 @@ describe("duplicate-submit single-flight", () => {
     expect(store.get("m3", "h3")).toBeUndefined()
   })
 
-  test("unshown envelope declaration triggers exactly one provision pass", async () => {
+  test("an incomplete envelope declaration triggers exactly one argument-correction pass", async () => {
     const questionSchema = {
       name: "question",
       description: "Ask the user a question",
@@ -934,7 +935,8 @@ describe("duplicate-submit single-flight", () => {
     for await (const frame of service.turn(input)) frames.push(frame)
     expect(adapterTurns).toBe(2)
     expect(seenPrompts[1]).toContain('"name":"question"')
-    expect(seenPrompts[1]).toContain('"inputSchema"')
+    expect(seenPrompts[1]).toContain('"required":["query"]')
+    expect(seenPrompts[1]).not.toContain('"inputSchema"')
     expect(seenPrompts[1]).not.toContain('"name":"read"')
     expect(JSON.stringify(frames)).toContain("which file?")
   })
@@ -973,7 +975,8 @@ describe("duplicate-submit single-flight", () => {
     for await (const frame of service.turn(input)) frames.push(frame)
     expect(adapterTurns).toBe(2)
     expect(seenPrompts[1]).toContain('"name":"question"')
-    expect(seenPrompts[1]).toContain('"inputSchema"')
+    expect(seenPrompts[1]).toContain('"required":["query"]')
+    expect(seenPrompts[1]).not.toContain('"inputSchema"')
     expect(JSON.stringify(frames)).toContain("which file?")
   })
 
@@ -1011,7 +1014,8 @@ describe("duplicate-submit single-flight", () => {
     for await (const frame of service.turn(input)) frames.push(frame)
     expect(adapterTurns).toBe(2)
     expect(seenPrompts[1]).toContain('"name":"question"')
-    expect(seenPrompts[1]).toContain('"inputSchema"')
+    expect(seenPrompts[1]).toContain('"required":["query"]')
+    expect(seenPrompts[1]).not.toContain('"inputSchema"')
     expect(JSON.stringify(frames)).toContain("which file?")
   })
 

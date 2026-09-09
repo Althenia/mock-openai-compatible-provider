@@ -27,13 +27,18 @@ reliability.
 - `tool_choice` supports automatic, disabled, required, and named choices.
   Required/named calls must be non-streaming; invalid combinations fail before
   browser submission. Estimated usage is marked `estimated: true`, not billing.
-- Same-hash ambiguous submissions fail closed. Failed/cancelled pages are
-  evicted; the persistent profile is protected by a PID-identified lock.
+- Same-hash ambiguous submissions fail closed. A recognized webchat safety
+  block records a definitive failed attempt rather than an ambiguous pending
+  submission. The persistent profile is protected by a PID-identified lock.
+- Recognized webchat safety blocks stop immediately, without automatic retry,
+  repair, or fallback. Before streaming they return HTTP 422 with code
+  `webchat_safety_block`; after reasoning has already streamed, the response
+  ends with a structured SSE error carrying that code, not a successful finish.
 
 ## Client action loop
 
-Webchat has no native function-calling API. AIPass projects offered tool names
-and selected schemas, validates returned envelopes, and converts valid actions
+Webchat has no native function-calling API. AIPass supplies offered tool names
+and complete schemas during startup, validates returned envelopes, and converts valid actions
 to OpenAI-compatible calls. Only the calling client executes them and returns
 tool results. MCP actions use their exact offered names through the same path.
 
@@ -46,27 +51,41 @@ an example. Chat envelopes remain text, thinking envelopes become reasoning,
 and quoted action JSON inside chat is not executed. Automatic capability-only
 refusals can trigger one corrective turn; safety refusals, ordinary answers,
 existing actions, and oversized responses do not. Missing required arguments
-can trigger one targeted schema-provision turn. Neither path invents results.
+can trigger one targeted argument-correction turn using the startup schema.
+Corrections carry guidance and the latest request/result delta, not repeated
+role instructions, full schemas, or full conversation history. Neither path
+invents results. The recognized Thai webchat guardrail notice takes precedence
+over these paths and over turn-key mismatch recovery, including when its text
+arrives across multiple stream chunks.
+
+Complete bare and `TURN KEY`-prefixed envelope chains are validated before
+single-envelope malformed-text recovery. After reasoning progress, strict
+runtime validation rejects invalid trailing actions rather than absorbing them
+into chat prose. Single chat/thinking envelopes with unescaped prose quotes
+retain narrow text recovery; non-strict fallback behavior is unchanged.
 
 ## Prompt contract
 
 For preserve-mode requests, startup uses separate completed webchat turns:
 
-1. Submit the AIPass role/protocol and wait for its reply internally.
+1. Submit the AIPass role/action protocol and startup control instruction once,
+   then wait for its reply internally. The control instruction tells the backend
+   to acknowledge startup blocks with `READY` until a keyed task arrives.
 2. Submit each complete supplied system/developer message as its own turn, in
    original order, waiting for each reply before proceeding.
-3. Submit the current action contract and conversation in chronological order, including
+3. Submit each offered tool's full definition in its own startup block. Do not
+   repeat the role/protocol or startup acknowledgment instruction in these blocks.
+4. Submit the conversation in chronological order, including
    matched tool-call/result text and the latest user task.
 
 Startup replies are never emitted as client answers or actions. Unchanged bound
-turns send only the task projection; recovery, changed instructions/contracts,
+turns send only the latest task/result delta; recovery, changed instructions/contracts,
 model or reasoning-variant switches, compaction, and newly opened pages replay
 startup before the task. This relies on the webchat retaining startup context;
-it is not a guarantee of model compliance. Supplemental repair directives and
-selected schemas precede the replayed conversation and do not repeat startup.
-Tool names remain available
-through the complete name index; full schemas are selected and provisioned as
-needed. Prompt projection logs contain only action names and character counts,
+it is not a guarantee of model compliance. Tool-schema changes invalidate the
+startup contract even during a tool-result continuation. Each task submission
+still carries its current `TURN KEY`, the every-turn envelope guard, and any
+required/named `tool_choice` constraint. Prompt projection logs contain only action names and character counts,
 never prompt content.
 
 The webchat backend owns reasoning, planning, action selection, and answers.

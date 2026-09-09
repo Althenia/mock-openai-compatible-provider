@@ -130,14 +130,13 @@ test("action-only mode resets a preserved binding but reuses its own context", (
 test("prompt contract requires both the current version and action envelope digest", () => {
   const digestA = `b0${"1".repeat(32)}${"a".repeat(30)}`
   const digestB = `b0${"1".repeat(32)}${"b".repeat(30)}`
-  expect(promptContractCurrent(1, digestA, 1, digestA, false)).toBe(true)
-  expect(promptContractCurrent(1, digestA, 0, digestA, false)).toBe(false)
-  expect(promptContractCurrent(1, digestA, 1, digestB, false)).toBe(false)
-  expect(promptContractCurrent(1, digestA, 1, digestB, true)).toBe(true)
-  expect(promptContractCurrent(1, digestA, 0, digestB, true)).toBe(false)
-  expect(promptContractCurrent(1, digestA, 1, undefined, true)).toBe(false)
-  expect(promptContractCurrent(1, digestA, 1, digestA.slice(0, 34), true)).toBe(false)
-  expect(promptContractCurrent(1, digestA, 1, `${digestA.slice(0, 34)}${"Z".repeat(30)}`, true)).toBe(false)
+  expect(promptContractCurrent(1, digestA, 1, digestA)).toBe(true)
+  expect(promptContractCurrent(1, digestA, 0, digestA)).toBe(false)
+  expect(promptContractCurrent(1, digestA, 1, digestB)).toBe(false)
+  expect(promptContractCurrent(1, digestA, 0, digestB)).toBe(false)
+  expect(promptContractCurrent(1, digestA, 1, undefined)).toBe(false)
+  expect(promptContractCurrent(1, digestA, 1, digestA.slice(0, 34))).toBe(false)
+  expect(promptContractCurrent(1, digestA, 1, `${digestA.slice(0, 34)}${"Z".repeat(30)}`)).toBe(false)
 })
 
 class FakeModelSurface implements ModelSelectionSurface {

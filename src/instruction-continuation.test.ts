@@ -87,7 +87,6 @@ function selectedPrompt(turn: ProjectedTurn, currentDigest: string, currentVersi
     turn.actionEnvelopeDigest,
     currentVersion,
     currentDigest,
-    turn.toolContinuation,
   )
   const model = MODELS.find((candidate) => candidate.id === turn.modelID)
   if (!model) throw new Error("test model is missing")
@@ -111,12 +110,14 @@ function selectedPrompt(turn: ProjectedTurn, currentDigest: string, currentVersi
 }
 
 function expectStartupInstructions(turn: ProjectedTurn, instructions: readonly string[]) {
-  expect(turn.primingPrompts).toHaveLength(instructions.length + 1)
+  expect(turn.primingPrompts).toHaveLength(instructions.length + turn.provisionedActions.length + 1)
   expect(turn.primingPrompts[0]).toContain("You are a text-generation assistant working only as the backend.")
+  expect(turn.primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
   for (const [index, instruction] of instructions.entries()) {
     expect(turn.primingPrompts[index + 1]).toContain(instruction)
-    expect(turn.primingPrompts[index + 1]).toContain("Acknowledge briefly with READY")
+    expect(turn.primingPrompts[index + 1]).not.toContain("READY")
   }
+  for (const [index, name] of turn.provisionedActions.entries()) expect(turn.primingPrompts[instructions.length + index + 1]).toContain(`"name":"${name}"`)
 }
 
 describe("instruction fidelity is independent of session affinity", () => {
@@ -184,7 +185,7 @@ describe("instruction fidelity is independent of session affinity", () => {
 describe("instruction changes during tool continuations", () => {
   for (const endpoint of ["chat", "responses"] as const) {
     for (const length of [8_000, 8_001, 44_771]) {
-      test(`${endpoint} keeps the tool delta plus schemas on a current bound continuation (${length} instruction characters)`, () => {
+      test(`${endpoint} keeps only the tool delta on a current bound continuation (${length} instruction characters)`, () => {
         const head = "INSTRUCTION_HEAD\n"
         const middle = "\n<available_skills>EXACT_CATALOG_MIDDLE</available_skills>\n"
         const tail = "\nINSTRUCTION_TAIL"
@@ -206,17 +207,18 @@ describe("instruction changes during tool continuations", () => {
           expect(prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
           expect(prompt.indexOf(originalRequest)).toBeLessThan(prompt.indexOf("TOOL CALL call_skill"))
           expect(prompt.indexOf("TOOL CALL call_skill")).toBeLessThan(prompt.indexOf("TOOL RESULT call_skill"))
-          expect(prompt).toContain('"name":"skill"')
+          expect(prompt).not.toContain('"inputSchema"')
           expect(prompt).not.toContain("Apply every stored CLIENT INSTRUCTIONS part")
         }
-        // Bound routing is delta-only: schemas plus the latest result, with
+        // Bound routing is delta-only: the latest result, with
         // the full chain living in the remote chat history instead.
         expect(routed.prompt).not.toContain(instructions)
         expect(routed.prompt).not.toContain("Use only installed skill IDs.")
         expect(routed.prompt).not.toContain(originalRequest)
         expect(routed.prompt).not.toContain('TOOL CALL call_skill skill: {"id":"fixture"}')
         expect(routed.prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
-        expect(routed.prompt).toContain('"name":"skill"')
+        expect(routed.prompt).not.toContain('"inputSchema"')
+        expect(turn.primingPrompts.join("\n")).toContain('"name":"skill"')
         expect(routed.prompt).not.toContain("Apply every stored CLIENT INSTRUCTIONS part")
       })
     }
@@ -265,27 +267,28 @@ describe("instruction changes during tool continuations", () => {
     expect(routed.prompt).toContain(toolResult)
   })
 
-  test("schema-only provision growth retains routing with delta plus both schemas", () => {
+  test("declaring another primed tool retains startup identity and delta-only routing", () => {
     const request = "Use the installed skill fixture."
     const before = chatTurn("<available_skills>CATALOG</available_skills>", { tools: [skill(), read()], request })
     const provisionGrowth = chatTurn("<available_skills>CATALOG</available_skills>", {
       tools: [skill(), read()], request, declaredRead: true,
     })
-    expect(provisionGrowth.actionEnvelopeDigest).not.toBe(before.actionEnvelopeDigest)
+    expect(provisionGrowth.actionEnvelopeDigest).toBe(before.actionEnvelopeDigest)
     const provisionRoute = selectedPrompt(provisionGrowth, before.actionEnvelopeDigest)
     expect(provisionRoute.current).toBe(true)
     expect(provisionRoute.prompt).toBe(provisionGrowth.incrementalPrompt)
     expectStartupInstructions(provisionGrowth, ["<available_skills>CATALOG</available_skills>", "Use only installed skill IDs."])
-    // Delta-only: latest result plus both current schemas; the earlier
+    // Delta-only: latest result; both schemas and the earlier
     // call/result chain stays in remote history instead of being replayed.
-    for (const text of [`TOOL RESULT call_skill: ${toolResult}`,
-      '"name":"read"', '"name":"skill"']) expect(provisionRoute.prompt).toContain(text)
+    expect(provisionRoute.prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
+    for (const text of ['"name":"read"', '"name":"skill"']) expect(provisionGrowth.primingPrompts.join("\n")).toContain(text)
+    expect(provisionRoute.prompt).not.toContain('"inputSchema"')
     expect(provisionRoute.prompt).not.toContain(request)
     expect(provisionRoute.prompt).not.toContain('TOOL CALL call_read read: {"path":"fixture-alpha.txt"}')
     expect(provisionRoute.prompt).not.toContain('TOOL CALL call_skill skill: {"id":"fixture"}')
   })
 
-  test("ordinary changed selected schemas invalidate", () => {
+  test("ordinary changed offered schemas invalidate", () => {
     const before = parseOpenAIChatRequest(
       { model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Use skill fixture." }], tools: [skill()] },
       new Headers({ "x-session-id": "ordinary-schema-change" }),
@@ -307,11 +310,12 @@ describe("instruction changes during tool continuations", () => {
     expect(after.toolContinuation).toBe(true)
     expectStartupInstructions(after, [])
     expect(after.actionEnvelopeDigest).not.toBe(before.actionEnvelopeDigest)
-    expect(after.incrementalPrompt).toContain('"revision":{"type":"string"}')
+    expect(after.primingPrompts.join("\n")).toContain('"revision":{"type":"string"}')
+    expect(after.incrementalPrompt).not.toContain('"inputSchema"')
     const routed = selectedPrompt(after, before.actionEnvelopeDigest)
-    expect(routed.current).toBe(true)
-    expect(routed.prompt).toBe(after.incrementalPrompt)
-    expect(routed.prompt).toContain('"revision":{"type":"string"}')
+    expect(routed.current).toBe(false)
+    expect(routed.prompt).toBe(after.recoveryPrompt)
+    expect(routed.prompt).not.toContain('"inputSchema"')
     expect(routed.prompt).toContain(toolResult)
   })
 

@@ -5,9 +5,10 @@ import { basename, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { chromium, errors, type BrowserContext, type Locator, type Page } from "playwright-core"
 import { estimateTokens } from "./context.ts"
+import { runSerialStartup } from "./browser-turn-flow.ts"
 import { browserControlState } from "./browser-diagnostics.ts"
 import { THINKING_LABELS } from "./model-catalog.ts"
-import { EVERY_TURN_ENVELOPE_GUARD, INSTRUCTION_DIGEST_PREFIX_LENGTH, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
+import { EVERY_TURN_ENVELOPE_GUARD, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
 
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "max"
 
@@ -481,13 +482,8 @@ export function promptContractCurrent(
   expectedDigest: string,
   currentVersion: number | undefined,
   currentDigest: string | undefined,
-  toolContinuation: boolean,
 ) {
-  if (currentVersion !== expectedVersion) return false
-  if (currentDigest === expectedDigest) return true
-  const digestPattern = /^[a-f0-9]{64}$/
-  return toolContinuation && currentDigest !== undefined && digestPattern.test(currentDigest) && digestPattern.test(expectedDigest) &&
-    currentDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH) === expectedDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH)
+  return currentVersion === expectedVersion && currentDigest === expectedDigest
 }
 
 export function turnPrompt(input: BrowserTurnInput, bound: boolean, recovery: boolean, contractCurrent: boolean) {
@@ -558,7 +554,7 @@ export interface BrowserProtocol<Frame> {
 }
 
 export class BrowserResponse<Frame extends BrowserFrame> {
-  private readonly streams = new Map<number, { decoder: FrameDecoder<Frame>; hasText: boolean; finished: boolean }>()
+  private readonly streams = new Map<number, { decoder: FrameDecoder<Frame>; hasText: boolean; finished: boolean; safetyTail: string }>()
   private readonly frames: Frame[] = []
   private completed = false
   private domThinking = ""
@@ -584,7 +580,7 @@ export class BrowserResponse<Frame extends BrowserFrame> {
     if (this.completed) return []
     let stream = this.streams.get(responseID)
     if (!stream) {
-      stream = { decoder: this.protocol.decoder(), hasText: false, finished: false }
+      stream = { decoder: this.protocol.decoder(), hasText: false, finished: false, safetyTail: "" }
       this.streams.set(responseID, stream)
     }
     if (!stream.finished) this.append(stream.decoder.push(chunk), stream)
@@ -610,12 +606,13 @@ export class BrowserResponse<Frame extends BrowserFrame> {
   }
 
   confirm(completion: DomCompletion, baseline: number): readonly Frame[] {
-    if (this.completed || completion.assistantCount <= baseline || !isSettledResponse(completion)) return []
+    if (this.completed || completion.assistantCount <= baseline) return []
     const capturedText = this.capturedText()
     const domText = completion.text.trim()
-    // Safety-filter block as settled DOM prose: fail, never publish it as an
+    // Safety-filter block as current DOM prose: fail, never publish it as an
     // answer or let the repair net re-submit on it.
     if (isWebchatSafetyBlock(capturedText) || isWebchatSafetyBlock(domText)) throw new WebchatSafetyBlockError()
+    if (!isSettledResponse(completion)) return []
     if (hasTerminalEnvelope(domText) && domText.startsWith(capturedText.trim()) && domText.length > capturedText.trim().length)
       return this.publishDomCompletion(completion)
     if (hasTerminalEnvelope(capturedText)) return this.publishCapturedFrames()
@@ -661,14 +658,20 @@ export class BrowserResponse<Frame extends BrowserFrame> {
     return this.publish(frames)
   }
 
-  private append(frames: readonly Frame[], stream: { hasText: boolean }) {
+  private append(frames: readonly Frame[], stream: { hasText: boolean; safetyTail: string }) {
     for (const frame of frames) {
       if (frame.type === "error") throw new Error(frame.message)
       if (frame.type === "auth-required") throw new AuthenticationRequiredError()
       // Safety-filter block arriving over the stream: fail the turn now
       // instead of buffering it into a fallback answer or repair cycle.
-      if (frame.type === "text" && isWebchatSafetyBlock(frame.delta)) throw new WebchatSafetyBlockError()
-      if (frame.type === "text") stream.hasText = true
+      if (frame.type === "text") {
+        const text = stream.safetyTail + frame.delta
+        if (isWebchatSafetyBlock(text)) throw new WebchatSafetyBlockError()
+        // Retain enough of the fixed notice to recognize split text deltas,
+        // without rescanning the entire answer or mixing sibling streams.
+        stream.safetyTail = text.slice(-256)
+        stream.hasText = true
+      }
       this.frames.push(frame)
     }
   }
@@ -1452,6 +1455,7 @@ export class PageStreamCapture {
       generationKey: STREAM_GENERATION,
       armKey: STREAM_ARM,
       streamPattern: config.streamURLPattern ?? "",
+      safetyBlockMarker: WEBCHAT_SAFETY_BLOCK,
     })
     return capture
   }
@@ -1519,6 +1523,7 @@ function installCaptureScript(input: {
   generationKey: string
   armKey: string
   streamPattern: string
+  safetyBlockMarker: string
 }) {
   const scope = globalThis as unknown as Record<string, unknown>
   if (scope[input.armKey]) return
@@ -1598,6 +1603,10 @@ function installCaptureScript(input: {
         lastDomText = text
         lastDomChange = Date.now()
       }
+      return
+    }
+    if (text.includes(input.safetyBlockMarker)) {
+      send({ generation: value, type: "dom", assistantCount: assistants.length, complete: false, text })
       return
     }
     if (text !== lastDomText) {
@@ -2427,6 +2436,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         idleDeadline = performance.now() + effectiveIdleTimeout(this.config)
         if (event.type === "dom") {
           currentAssistantCount = event.assistantCount
+          if (event.assistantCount > baseline && isWebchatSafetyBlock(event.text)) throw new WebchatSafetyBlockError()
           if (event.complete && event.assistantCount > baseline) {
             const completion = await readDomCompletion(page, signal)
             currentAssistantCount = completion.assistantCount
@@ -2541,7 +2551,6 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         input.actionEnvelopeDigest,
         currentVersion,
         currentDigest,
-        input.toolContinuation,
       )
       const prompt = turnPrompt(input, bound, options.forceReload === true, contractCurrent)
       const carriesEnvelope = !bound || options.forceReload === true || !contractCurrent
@@ -2604,7 +2613,6 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         this.selectedModels.set(page, modelSignature)
       }
 
-      let primingEstimate = 0
       const startupIdentity = JSON.stringify([modelSignature, input.promptContractVersion, input.primingPrompts])
       // Startup priming is once per page: the primedContexts identity proves
       // this page already ran these exact startup turns. Re-prime only when
@@ -2613,18 +2621,21 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       // particular a kept-open tab after cancel never re-primes: its identity
       // still matches.
       const primedIdentity = this.primedContexts.get(page)
-      if (input.primingPrompts.length && (carriesEnvelope || !reusableSelection || primedIdentity !== startupIdentity)) {
-        this.primedContexts.delete(page)
-        for (const [index, primingPrompt] of input.primingPrompts.entries()) {
+      const primingEstimate = await runSerialStartup({
+        primingPrompts: input.primingPrompts,
+        startupIdentity,
+        primedIdentity,
+        carriesEnvelope,
+        reusableSelection,
+        reset: () => this.primedContexts.delete(setupPage),
+        commit: identity => this.primedContexts.set(setupPage, identity),
+        prime: async (primingPrompt, index) => {
           console.error(
             `aipass instruction priming part=${index + 1}/${input.primingPrompts.length} chars=${primingPrompt.length}`,
           )
-          primingEstimate +=
-            estimateTokens(primingPrompt) +
-            (await this.prime(page, primingPrompt, signal, mark, onFailure))
-        }
-        this.primedContexts.set(page, startupIdentity)
-      }
+          return estimateTokens(primingPrompt) + await this.prime(setupPage, primingPrompt, signal, mark, onFailure)
+        },
+      })
 
       mark("prompt-ready")
       await abortable(
@@ -2804,6 +2815,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         idleDeadline = performance.now() + effectiveIdleTimeout(this.config)
         if (event.type === "dom") {
           currentAssistantCount = event.assistantCount
+          if (event.assistantCount > baseline && isWebchatSafetyBlock(event.text)) throw new WebchatSafetyBlockError()
           if (pendingFinish !== undefined) continue
           if (event.complete && event.assistantCount > baseline && event.text) {
             const completion = await readDomCompletion(page, signal)
@@ -2874,7 +2886,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
           await this.lifecycle.fail(attempt, {
             possiblySubmitted,
             cancelled: error instanceof BrowserTurnAbortedError || signal?.aborted === true,
-            definitive: error instanceof NoResponseEvidenceError,
+            definitive: error instanceof NoResponseEvidenceError || error instanceof WebchatSafetyBlockError,
           })
       } finally {
         if (page && error instanceof NoResponseEvidenceError) this.retire(input.sessionMarker, page)

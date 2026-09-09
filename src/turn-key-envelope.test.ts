@@ -202,6 +202,19 @@ describe("echoed turn-key response routing", () => {
     expect(result.text).toBe('Rating: 9/10. Notes "Version 1" limits.')
   })
 
+  for (const prefixed of [false, true]) test(`valid chat followed by an action is not salvaged as chat (${prefixed ? "prefixed" : "bare"})`, async () => {
+    const chain = [
+      { type: "chat", key, text: "Reading the fixture." },
+      { type: "tool", key, ...mcp },
+    ].map(value => JSON.stringify(value)).join("\n")
+    const result = await collectOpenAIChatResult([
+      { type: "text", delta: `${prefixed ? `TURN KEY: ${key}\n\n` : ""}${chain}` },
+      { type: "finish", reason: "stop" },
+    ], offered)
+    expect(result.text).toBe("Reading the fixture.")
+    expect(result.toolCalls).toMatchObject([{ id: mcp.id, name: mcp.name, input: mcp.input }])
+  })
+
   test("malformed-envelope repair stays narrow", () => {
     // Valid envelopes bypass repair (undefined); tool envelopes never repair.
     expect(repairMalformedTextEnvelope(JSON.stringify({ type: "chat", key, id: "a", text: "plain ok" }))).toBeUndefined()

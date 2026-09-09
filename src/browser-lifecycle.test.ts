@@ -251,11 +251,14 @@ class FixturePage extends EventEmitter {
     this.submitted.resolve()
     if (this.stage === "cleanup" || this.stage === "complete") await this.reply()
   }
-  async reply() {
+  async reply(text = answer) {
     const source = { generation: this.generation, responseID: 1 }
     await this.binding?.({}, { ...source, type: "response", selected: true, matched: true, bodyPresent: true, contentType: "sse" })
-    await this.binding?.({}, { ...source, type: "chunk", chunk: `data: ${JSON.stringify({ type: "text", delta: answer })}\n\ndata: [DONE]\n\n` })
+    await this.binding?.({}, { ...source, type: "chunk", chunk: `data: ${JSON.stringify({ type: "text", delta: text })}\n\ndata: [DONE]\n\n` })
     await this.binding?.({}, { ...source, type: "finish" })
+  }
+  async domReply(text: string) {
+    await this.binding?.({}, { generation: this.generation, type: "dom", assistantCount: 1, complete: false, text })
   }
   observeClose() {
     if (!this.closed) { this.closed = true; this.emit("close") }
@@ -455,6 +458,50 @@ async function launchFixture(pages: FixturePage[], overrides: Partial<AttemptLif
   }
   return { adapter, collect, created, contextCloses: () => contextCloses, restore: () => launch.mockRestore() }
 }
+
+for (const priming of [false, true]) test(`incomplete DOM guardrail stops ${priming ? "startup" : "task"} before any fallback read`, async () => {
+  const page = new FixturePage("capture", "complete")
+  const fixture = await launchFixture([page])
+  const abort = new AbortController()
+  const input = { ...turn, primingPrompts: priming ? ["Startup fixture."] : [] }
+  const work = fixture.collect(input, abort.signal).catch(error => ({ name: error.name }))
+  try {
+    await page.submitted.promise
+    await page.domReply("ขออภัย! ข้อความของคุณอาจมีบางส่วนที่ขัดกับระบบความปลอดภัย")
+    expect(await within(work)).toEqual({ name: "WebchatSafetyBlockError" })
+    expect(page.sendCalls).toBe(1)
+  } finally {
+    abort.abort()
+    await work
+    await fixture.adapter.close()
+    fixture.restore()
+  }
+})
+
+test("webchat safety rejection records a definitive failed attempt, not an ambiguous pending submit", async () => {
+  const page = new FixturePage("capture", "complete")
+  const failures: Array<Parameters<AttemptLifecycle["fail"]>[1]> = []
+  let completions = 0
+  const fixture = await launchFixture([page], {
+    async fail(_attempt, outcome) { failures.push(outcome) },
+    async complete() { completions++ },
+  })
+  const abort = new AbortController()
+  const work = fixture.collect(turn, abort.signal).catch(error => ({ name: error.name }))
+  try {
+    await page.submitted.promise
+    await page.reply("ขออภัย! ข้อความของคุณอาจมีบางส่วนที่ขัดกับระบบความปลอดภัย")
+    expect(await work).toEqual({ name: "WebchatSafetyBlockError" })
+    expect(page.sendCalls).toBe(1)
+    expect(completions).toBe(0)
+    expect(failures).toEqual([{ possiblySubmitted: true, cancelled: false, definitive: true }])
+  } finally {
+    abort.abort()
+    await work
+    await fixture.adapter.close()
+    fixture.restore()
+  }
+})
 
 test("failure diagnostics capture bounded API/CDP metadata at cancellation before teardown", async () => {
   const sensitive = "fixture-sensitive-marker"

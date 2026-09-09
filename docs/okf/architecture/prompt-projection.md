@@ -1,8 +1,8 @@
 ---
 type: Architecture
 title: Prompt projection
-description: Preserve-mode startup turns, action-only opt-out, checkpoint compaction,
-  and token estimation.
+description: Startup-only instructions and tool schemas, delta-only bound turns, checkpoint
+  compaction, and token estimation.
 tags:
 - prompt
 - startup
@@ -21,15 +21,15 @@ sources:
 
 # Definition
 
-Preserve-mode startup submits the role/protocol turn, then each complete caller system/developer message in order, then the action contract and conversation; startup replies are consumed internally and never emitted as answers.[^runtime-guide]
+Preserve-mode startup submits the role/action protocol and startup control once, then each complete caller system/developer message in order, then each offered tool's complete schema in its own block. Startup replies are consumed internally and never emitted as client answers or actions.[^runtime-guide]
 
 # Replay and omission
 
-Startup replays after recovery, changed instructions or contracts, model or reasoning-variant switches, compaction, and newly opened pages; unchanged bound turns send only the task projection.[^runtime-guide] Explicit `instruction_mode: "action-only"` omits caller instruction text, and switching an existing affinity from preserve to action-only starts a fresh remote conversation.[^runtime-guide] Startup delivery as separate submissions is a v0.1.3 behavior change.[^releases]
+Unchanged bound turns send only the latest task/result delta with a turn key, every-turn envelope guard, and any required tool-choice constraint. Startup replays after recovery, changed instructions or schemas, model or reasoning-variant switches, compaction, and newly opened pages; task and correction prompts do not repeat the role or schema catalog.[^runtime-guide] Explicit `instruction_mode: "action-only"` omits caller instruction text, and switching an existing affinity from preserve to action-only starts a fresh remote conversation.[^runtime-guide] Serial startup delivery was introduced in v0.1.3.[^releases]
 
 # Compaction and estimate
 
-Callers compact with an exact `<conversation-checkpoint>` message that rotates the remote epoch; without a checkpoint the provider does not silently discard canonical history.[^runtime-guide] The token estimate is `ceil(UTF-8 byte length / 3)`.[^runtime-guide] Digest and estimate helpers live in the context module.[^context]
+Callers compact with an exact `<conversation-checkpoint>` message that rotates the remote epoch; without a checkpoint the provider does not silently discard canonical history. Startup retention is an upstream dependency, not a guarantee of model compliance.[^runtime-guide] The token estimate is `ceil(UTF-8 byte length / 3)`.[^runtime-guide] Digest and estimate helpers live in the context module.[^context]
 
 See also: [Provider runtime](provider-runtime.md) and [Request session contract](../runtime/request-session-contract.md).
 

@@ -20,6 +20,9 @@ sources:
 - id: manifest
   resource: repo:///package.json
   title: Package manifest
+- id: unit-boundary
+  resource: repo:///docs/releases/v0.1.4.md
+  title: v0.1.4 validation boundary
 ---
 
 # Agreement
@@ -30,6 +33,8 @@ The manifest version, release tag, and release note must agree before publicatio
 
 The v0.1.3 note records the local checks actually run, the single bounded real-client read cycle, and the explicit statement that one case is not a reliability guarantee.[^releases] Beyond that case, live tools, skills, file operations, MCP, every-model reliability, large-context behavior, and billing-accurate usage remain unverified, and usage stays estimated.[^releases]
 
+The v0.1.4 note distinguishes unit checks of startup sequencing and request/response contracts using Bun-native mocks from real-browser integration. Passing these unit checks does not establish resolution of the recorded browser lifecycle failure or a passing full integration suite.[^unit-boundary]
+
 # Rollback
 
 Rollback stops the provider, reinstalls the pinned prior version, and restarts with the same configuration and state directories without deleting browser credentials or session state; in-memory Responses IDs do not survive a restart.[^releases]
@@ -39,3 +44,4 @@ See also: [CLI lifecycle](../operations/cli-lifecycle.md) and [Model catalog](..
 [^release-ci]: Release workflow
 [^operations]: Operations and client setup
 [^releases]: v0.1.3 release notes
+[^unit-boundary]: v0.1.4 validation boundary

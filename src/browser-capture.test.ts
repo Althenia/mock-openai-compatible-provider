@@ -4,6 +4,28 @@ import { BrowserResponse, PageStreamCapture, type BrowserProtocol } from "./brow
 import { parseCommand } from "./config.ts"
 import { StreamFrameParser, openAIChatSSEChunks, type BrowserFrame } from "./protocol.ts"
 
+test("current DOM guardrail is captured without waiting for answer stability or send controls", async () => {
+  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  if (command.type !== "serve") throw Error("expected serve settings")
+  const browser = await chromium.launch({ executablePath: command.settings.chromeExecutable, headless: true })
+  try {
+    const page = await browser.newPage()
+    const installed = await PageStreamCapture.install(page, {})
+    await page.goto('data:text/html,<button data-testid="send-button">Send</button><div data-message-author-role="assistant">Earlier answer</div>')
+    const active = await installed.activate(1)
+    try {
+      const notice = "ขออภัย! ข้อความของคุณอาจมีบางส่วนที่ขัดกับระบบความปลอดภัย"
+      await page.evaluate(text => {
+        const answer = document.createElement("div")
+        answer.setAttribute("data-message-author-role", "assistant")
+        answer.innerText = text
+        document.body.append(answer)
+      }, notice)
+      expect(await active.next({ timeoutMs: 1000 })).toEqual({ type: "dom", assistantCount: 2, complete: false, text: notice })
+    } finally { await active.cleanup() }
+  } finally { await browser.close() }
+}, 10_000)
+
 test("interleaved fetch readers retain each UTF-8 body and the native reasoning/tool response", async () => {
   const wire = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
   const tool = '<aipass-envelope>{"type":"tool","key":"fixture","id":"call_1","name":"read","input":{}}</aipass-envelope>'

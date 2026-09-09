@@ -262,15 +262,19 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
       }
       const tasks = submissions.filter(({ prompt }) => prompt.startsWith("TURN KEY:"))
       expect(tasks).toHaveLength(cases.length)
-      for (const observation of tasks) {
+      for (const [taskIndex, observation] of tasks.entries()) {
         expect(observation.prompt).toStartWith("TURN KEY: processing-fixture-key\n\n")
-        const sections = ["USER: Inspect fixture-root.", 'TOOL CALL call_fixture read: {"path":"fixture-root"}', "TOOL RESULT call_fixture: fixture-alpha", "USER: Reply ready."]
+        const prior = ["USER: Inspect fixture-root.", 'TOOL CALL call_fixture read: {"path":"fixture-root"}']
+        const sections = [...(taskIndex === 0 ? prior : []), "TOOL RESULT call_fixture: fixture-alpha", "USER: Reply ready."]
         for (const [index, section] of sections.entries()) {
           expect(observation.prompt).toContain(section)
           if (index) expect(observation.prompt.indexOf(sections[index - 1]!)).toBeLessThan(observation.prompt.indexOf(section))
         }
         expect(observation.prompt.trimEnd()).toEndWith("USER: Reply ready.")
-        expect(observation.prompt).toBe(tasks[0]!.prompt)
+        if (taskIndex > 0) {
+          expect(observation.prompt).toBe(tasks[1]!.prompt)
+          for (const section of prior) expect(observation.prompt).not.toContain(section)
+        }
         expect(observation.prompt).not.toContain("SYSTEM: USER_RULE")
         expect(observation.prompt).not.toContain("DEVELOPER: AGENT_RULE")
       }

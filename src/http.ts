@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { model, type Reasoning } from "./config.ts"
-import { INSTRUCTION_DIGEST_PREFIX_LENGTH, PROMPT_CONTRACT_VERSION, WEBCHAT_ROLE_INSTRUCTION, serializeToolDefinitions, validName } from "./protocol.ts"
+import { INSTRUCTION_DIGEST_PREFIX_LENGTH, PROMPT_CONTRACT_VERSION, serializeToolDefinitions, validName } from "./protocol.ts"
 import { compactionDigest, estimateTokens } from "./context.ts"
 
 export interface OfferedToolSchema {
@@ -46,7 +46,7 @@ export interface ProjectedTurn {
   readonly attachments?: readonly RequestAttachment[]
   // Repo nonce submitted as TURN KEY; the response envelope must echo it.
   readonly promptKey?: string
-  // Full offered schemas plus the subset whose full schema was shown up front.
+  // Full offered schemas and names supplied during startup.
   readonly offeredToolSchemas: readonly OfferedToolSchema[]
   readonly provisionedActions: readonly string[]
 }
@@ -297,98 +297,6 @@ function toolSelection(definitions: ReturnType<typeof tools>, value: unknown) {
   return { definitions: selected, required: true }
 }
 
-function shortDescription(value?: string): string {
-  if (!value) return ""
-  return value.split("\n")[0]?.trim().slice(0, 80) ?? ""
-}
-
-function toolNameIndex(offered: readonly { readonly name: string; readonly description?: string }[]): string {
-  if (!offered.length) return ""
-  const lines = offered.map((tool) => {
-    const short = shortDescription(tool.description)
-    return short ? `- ${tool.name}: ${short}` : `- ${tool.name}`
-  })
-  return `Offered tool index (complete; schemas follow within budget). Respond in English unless the user explicitly requests another language in their message. Tool shape: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}}.\n${lines.join("\n")}`
-}
-
-function declaredToolNames(messages: unknown): string[] {
-  if (!Array.isArray(messages)) return []
-  const declared: string[] = []
-  for (const candidate of messages) {
-    const item = record(candidate)
-    if (!item || !Array.isArray(item.tool_calls)) continue
-    for (const call of item.tool_calls) {
-      const name = record(call)?.function ? record(record(call)?.function)?.name : undefined
-      if (typeof name === "string" && validName(name) && !declared.includes(name)) declared.push(name)
-    }
-  }
-  return declared
-}
-
-function escapeRegExp(value: string) {
-  return value
-    .split("")
-    .map((ch) => (/[.*+?^${}()|[\]\\]/.test(ch) ? `\\${ch}` : ch))
-    .join("")
-}
-
-function latestUserText(messages: unknown): string {
-  if (!Array.isArray(messages)) return ""
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const item = record(messages[index])
-    if (!item || item.role !== "user") continue
-    try {
-      const text = content(item.content, `messages[${index}]`)
-      const stripped = stripLoweredSystemUpdates(text).trim()
-      if (stripped) return stripped
-    } catch {
-      continue
-    }
-  }
-  return ""
-}
-
-export function namedOfferedTools(messages: unknown, offeredNames: readonly string[]): string[] {
-  const text = latestUserText(messages)
-  if (!text) return []
-  return offeredNames.filter((name) => {
-    if (!validName(name)) return false
-    try {
-      return new RegExp(`(?<![A-Za-z0-9_])${escapeRegExp(name)}(?![A-Za-z0-9_])`, "i").test(text)
-    } catch {
-      return false
-    }
-  })
-}
-
-// File-operation verb aliases: tool-name matching alone misses "create a new
-// file" / "delete the folder" because no offered tool is literally named
-// "create" or "delete". Map file-op verbs to the offered mutation tools so
-// create/update/delete of files/folders project full schemas up front:
-// patch covers add/update/delete files, write covers create, edit covers
-// update, shell covers delete/folder operations.
-export function fileOpAliasedTools(messages: unknown, offeredNames: readonly string[]): string[] {
-  const text = latestUserText(messages)
-  if (!text) return []
-  const hasFileNoun = /\b(files?|folders?|director(?:y|ies)|paths?|filenames?)\b/i.test(text)
-  const hasMkdir = /\b(mkdir|rmdir)\b/i.test(text)
-  if (!hasFileNoun && !hasMkdir) return []
-  const verbCreate = /\b(creat\w*|add\w*|\bnew\b|writ\w*)\b/i.test(text)
-  const verbUpdate = /\b(updat\w*|edit\w*|modif\w*|patch\w*|fix\w*|chang\w*|append\w*)\b/i.test(text)
-  const verbDelete = /\b(delet\w*|remov\w*|\brm\b|\bdel\b|rmdir|unlink)\b/i.test(text)
-  if (!verbCreate && !verbUpdate && !verbDelete) return []
-  const out: string[] = []
-  const take = (name: string) => {
-    if (offeredNames.includes(name) && !out.includes(name)) out.push(name)
-  }
-  // patch is the only file delete path (Add/Update/Delete File headers).
-  take("patch")
-  if (verbCreate) take("write")
-  if (verbUpdate) take("edit")
-  if (verbDelete || hasMkdir || /\b(folders?|director(?:y|ies))\b/i.test(text)) take("shell")
-  return out
-}
-
 function session(headers: Headers, input: Record<string, unknown>, override?: string | null) {
   if (override === null) return { marker: `anon_${randomUUID()}`, ephemeral: true }
   const raw =
@@ -511,9 +419,6 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   const instructions = instructionMode === "action-only" ? [] : (input.messages as unknown[])
     .filter(message => ["system", "developer"].includes(String(record(message)?.role)))
     .map(message => serializeMessages([message], "instructions"))
-  const primingPrompts = [WEBCHAT_ROLE_INSTRUCTION, ...instructions].map(prompt =>
-    `${prompt}\n\nStartup instruction only. No task or turn key yet. Acknowledge briefly with READY, then wait for the next submission. Do not request actions during startup.`,
-  )
   const omitLoweredSystemUpdates = instructionMode === "action-only"
   const conversation = serializeMessages(input.messages, "conversation", omitLoweredSystemUpdates)
   const incrementalTranscript = incrementalMessages(input.messages, conversation, omitLoweredSystemUpdates)
@@ -522,56 +427,23 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   if (stream && selection.required) throw new Error("streaming with required tool_choice is not supported")
   const offeredTools = selection.definitions
   const continuingTool = toolContinuation(input.messages)
-  // Agentic routing: every submit carries the full offered NAME index (names
-  // plus one-line short descriptions, always fits the byte budget, never
-  // capped). The model declares intent through the typed envelope; full JSON
-  // schemas are provisioned for declared/named tools within the submit budget.
-  // Tools arrive via the OpenAI request tools[] and differ per harness
-  // (codex/claude/opencode/pi/ycoding). Live evidence: a 17-tool full-schema
-  // start prompt (~24k chars) stalls with no response frames; the budgeted
-  // projection answers. Chat answers need no schemas.
-  const TOOL_CONTRACT_SUBMIT_BUDGET = 3_000
-  const declared = declaredToolNames(input.messages)
-  const offeredNames = offeredTools.map((tool) => tool.name)
-  const named = [...new Set([...namedOfferedTools(input.messages, offeredNames), ...fileOpAliasedTools(input.messages, offeredNames)])]
-  const provisionCandidates = selection.required
-    ? offeredTools
-    : offeredTools.filter((tool) => declared.includes(tool.name) || named.includes(tool.name))
-  // Stall protection on schema bodies only, never on the name index.
-  // Explicitly named offered tools are exempt from the cumulative budget:
-  // a live latest-request mention always projects its full schema even when
-  // its singleton body exceeds the budget. Budget applies only to non-named
-  // (declared-only) candidates; declared-plus-named ordering is preserved.
-  const namedSet = new Set(named)
-  const nonNamedCandidates = provisionCandidates.filter((tool) => !namedSet.has(tool.name))
-  const budgetedNonNamed = nonNamedCandidates.filter(
-    (_, index) =>
-      serializeToolDefinitions(nonNamedCandidates.slice(0, index + 1)).length <= TOOL_CONTRACT_SUBMIT_BUDGET,
-  )
-  const budgetedNonNamedSet = new Set(budgetedNonNamed.map((tool) => tool.name))
-  const provisioned =
-    selection.required
-      ? provisionCandidates
-      : provisionCandidates.filter(
-          (tool) => namedSet.has(tool.name) || budgetedNonNamedSet.has(tool.name),
-        )
-  const nameIndex = toolNameIndex(offeredTools)
-  const schemaContract = serializeToolDefinitions(provisioned, offeredTools.length > 0, false)
-  const actionContract = [schemaContract, nameIndex].filter(Boolean).join("\n")
-  // Repair re-provides the full offered set: a decline often means the capped
-  // projection hid the needed tool. Concise-natural contracts answer fast at
-  // this size (measured); dense-synthetic extremes may still idle out once.
-  const offeredContract = serializeToolDefinitions(offeredTools)
+  // Serial startup keeps complete tool schemas out of the task submit.
+  // Each schema is its own block; preserved instruction boundaries stay intact.
+  const startupProtocol = [
+    serializeToolDefinitions([], offeredTools.length > 0),
+    `Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(offeredTools.map(tool => tool.name))}. Request only names in this list. Full schemas for listed actions follow in startup blocks.`,
+  ].join("\n\n")
+  const primingPrompts = [
+    `${startupProtocol}\n\nStartup instruction only. No task or turn key yet. Acknowledge this and each subsequent startup instruction or tool-schema block briefly with READY, then wait for the next submission. Do not request actions during startup. Startup ends when a submission begins with TURN KEY.`,
+    ...instructions,
+    ...offeredTools.map(tool => serializeToolDefinitions([tool], true, false, false)),
+  ]
   const requiredNotice =
-    selection.required && provisioned.length > 0
-      ? "You must request one of the available actions before giving a final answer."
+    selection.required && offeredTools.length > 0
+      ? `You must request one of these available actions before giving a final answer: ${offeredTools.map(tool => tool.name).join(", ")}.`
       : ""
-  const toolDefinitions = [actionContract, requiredNotice].filter(Boolean).join("\n")
-  // Startup is submitted serially by the browser. Every task still carries
-  // current action schemas and chronological conversation, not startup text.
-  // The guard itself is injected at submit time (withTurnKey), so it need
-  // not be duplicated in the projected prompts here.
-  const initialPrompt = [toolDefinitions, conversation].filter(Boolean).join("\n")
+  // withTurnKey adds the per-turn envelope guard at submission time.
+  const initialPrompt = [requiredNotice, conversation].filter(Boolean).join("\n")
   const autoToolChoice = input.tool_choice === undefined || input.tool_choice === "auto"
   const toolRepairPrompt = autoToolChoice && offeredTools.length > 0
     ? [
@@ -579,39 +451,22 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
         "Do not override safety, privacy, authorization, or policy restrictions.",
         "If the previous response declined solely because you believed no client action was available and an action is needed for the unresolved latest user request, emit exactly one action frame now.",
         "Otherwise preserve the prior refusal or answer normally.",
-        offeredContract,
       ].join("\n")
     : undefined
   const rawActionEnvelopeDigest = createHash("sha256")
-    .update(JSON.stringify([PROMPT_CONTRACT_VERSION, primingPrompts, toolDefinitions]))
+    .update(JSON.stringify([PROMPT_CONTRACT_VERSION, primingPrompts]))
     .digest("hex")
-  // Keep instruction identity separate so tool-schema provisioning can reuse
-  // a continuation without suppressing a changed preserved instruction block.
-  const instructionDigest = createHash("sha256").update(JSON.stringify(primingPrompts)).digest("hex")
+  // Preserve instruction-boundary identity in the existing digest layout;
+  // complete startup identity also includes every offered tool schema.
+  const instructionDigest = createHash("sha256").update(JSON.stringify(instructions)).digest("hex")
   const actionEnvelopeDigest = [
     instructionMode === "action-only" ? "a0" : "b0",
     instructionDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH - 2),
     rawActionEnvelopeDigest.slice(INSTRUCTION_DIGEST_PREFIX_LENGTH),
   ].join("")
-  // Bound incremental turns are delta-only, like real LLM inference: the
-  // remote chat already holds the system/agents instructions (primed once),
-  // prior history, and previously shown schemas. Tool continuations resend
-  // only their schemas plus the latest delta (results since the last
-  // assistant message), never the full call/result chain. Full history is
-  // resent only via the recovery path (contract change / reload /
-  // compaction) or the repair/provision fallback.
-  // Preserve mode keeps the full initial shape for the first turn; the
-  // incremental delta alone routes bound continuations.
-  const incrementalPrompt = instructionMode === "preserve" && !continuingTool
-    ? initialPrompt
-    : continuingTool
-      ? [toolDefinitions, incrementalTranscript].filter(Boolean).join("\n")
-      : incrementalTranscript
-  // A recovery reload has no bound remote history, so it replays the full
-  // conversation: the model needs the preceding request for context.
-  const recoveryConversation = conversation
-  // Recovery replays the full contract: no bound history survives a reload.
-  const recoveryPrompt = [toolDefinitions, recoveryConversation].filter(Boolean).join("\n")
+  const incrementalPrompt = [requiredNotice, incrementalTranscript].filter(Boolean).join("\n")
+  // A fresh/recovery session re-primes startup before chronological history.
+  const recoveryPrompt = initialPrompt
   const reasoningMode = record(input.reasoning)?.mode ?? record(input.reasoning)?.effort
   if (
     reasoningMode !== undefined &&
@@ -645,10 +500,10 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
         ...(tool.description ? { description: tool.description } : {}),
         inputSchema: tool.inputSchema,
       })),
-      provisionedActions: provisioned.map((tool) => tool.name),
+      provisionedActions: offeredTools.map((tool) => tool.name),
     },
     offered: new Set(offeredTools.map((tool) => tool.name)),
-    projectedActions: provisioned.map((tool) => tool.name),
+    projectedActions: offeredTools.map((tool) => tool.name),
     stream,
     includeUsage: record(input.stream_options)?.include_usage === true,
     promptTokens: estimateTokens(initialPrompt) + primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0),

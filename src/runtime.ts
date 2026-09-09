@@ -18,7 +18,7 @@ import {
 } from "./browser.ts"
 import { LOOPBACK_HOST, MODELS, model, persistRuntimeConfig, readRuntimeConfig, type Settings } from "./config.ts"
 import type { ProjectedTurn } from "./http.ts"
-import { collectOpenAIChatResult, envelopesMatchTurnKey, isActionEnvelopeType, serializeToolDefinitions, StreamFrameParser, type BrowserFrame, type FinishReason } from "./protocol.ts"
+import { collectOpenAIChatResult, envelopesMatchTurnKey, isActionEnvelopeType, StreamFrameParser, type BrowserFrame, type FinishReason } from "./protocol.ts"
 import { createRequestHandler, type BrowserService } from "./server.ts"
 import { BindingStore, pendingDecision, ProfileLock, readOrCreateToken, type Attempt } from "./state.ts"
 
@@ -384,7 +384,6 @@ export class StandaloneBrowserService implements BrowserService {
       input.actionEnvelopeDigest,
       currentVersion,
       currentDigest,
-      input.toolContinuation,
     )
     const prompt = turnPrompt(
       {
@@ -430,8 +429,10 @@ export class StandaloneBrowserService implements BrowserService {
     }
     const release = await this.acquire(marker)
     const definition = model(input.modelID)
-    const adapterTurn = (projected: ProjectedTurn, recovery: boolean) =>
-      this.adapter.turn({
+    const adapter = this.adapter
+    const adapterTurn = async function* (projected: ProjectedTurn, recovery: boolean): AsyncGenerator<BrowserFrame> {
+      let safetyTail = ""
+      for await (const frame of adapter.turn({
         sessionMarker: projected.sessionMarker,
         ephemeral: false,
         primingPrompts: projected.primingPrompts,
@@ -446,21 +447,23 @@ export class StandaloneBrowserService implements BrowserService {
         toolContinuation: projected.toolContinuation,
         attachments: projected.attachments,
         promptKey: projected.promptKey,
-      }, signal, { forceReload: recovery })
+      }, signal, { forceReload: recovery })) {
+        if (frame.type === "text") {
+          const text = safetyTail + frame.delta
+          if (isWebchatSafetyBlock(text)) throw new WebchatSafetyBlockError()
+          safetyTail = text.slice(-256)
+        }
+        yield frame
+      }
+    }
     try {
       const repairPrompt = input.toolRepairPrompt
         ?? (input.toolContinuation && (input.offeredToolSchemas ?? []).length > 0
-          ? serializeToolDefinitions(
-              (input.offeredToolSchemas ?? []).map((schema) => ({
-                name: schema.name,
-                ...(schema.description ? { description: schema.description } : {}),
-                inputSchema: schema.inputSchema,
-              })),
-            )
+          ? "Reconsider only a lack-of-client-action-access refusal using the actions and schemas supplied during startup. Do not override safety, privacy, authorization, or policy restrictions."
           : undefined)
       const repair = repairPrompt
         ? () => {
-            const prompt = [repairPrompt, input.recoveryPrompt].filter(Boolean).join("\n\n")
+            const prompt = [repairPrompt, input.incrementalPrompt].filter(Boolean).join("\n\n")
             console.error(`aipass turn repair start promptChars=${prompt.length}`)
             const repairInput: ProjectedTurn = {
               ...input,
@@ -546,7 +549,11 @@ export class StandaloneBrowserService implements BrowserService {
           }
         } else {
           const provisionSchemas = need.map((name) => schemasByName.get(name)!).filter(Boolean)
-          const provisionPrompt = [serializeToolDefinitions(provisionSchemas), input.recoveryPrompt].filter(Boolean).join("\n\n")
+          const provisionPrompt = [
+            "Correct the previous action request using its startup schema. Missing required input fields:",
+            JSON.stringify(provisionSchemas.map(schema => ({ name: schema.name, required: requiredKeysForSchema(schema.inputSchema) }))),
+            input.incrementalPrompt,
+          ].filter(Boolean).join("\n\n")
           console.error(`aipass turn provision start tools=${need.join(",")} promptChars=${provisionPrompt.length}`)
           for (const name of need) shown.add(name)
           const provisionInput: ProjectedTurn = {

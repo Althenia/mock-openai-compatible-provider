@@ -27,8 +27,8 @@ function expectChatOnlyRole(prompt: string) {
   expect(prompt).toContain('{"type":"thinking","key":"<key>","id":"reason_1","text":"..."}')
 }
 
-function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = []) {
-  expect(primingPrompts).toHaveLength(instructions.length + 1)
+function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = [], tools: readonly string[] = []) {
+  expect(primingPrompts).toHaveLength(instructions.length + tools.length + 1)
   expectChatOnlyRole(primingPrompts[0]!)
   expect(primingPrompts[0]!).toStartWith("You are a text-generation assistant working only as the backend.")
   for (const [index, instruction] of instructions.entries()) {
@@ -36,13 +36,22 @@ function expectStartup(primingPrompts: readonly string[], instructions: readonly
     expect(prompt).toContain(instruction)
     expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
   }
-  for (const prompt of primingPrompts)
-    expect(prompt).toEndWith("Startup instruction only. No task or turn key yet. Acknowledge briefly with READY, then wait for the next submission. Do not request actions during startup.")
+  expect(primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
+  expect(primingPrompts[0]).toContain("Startup ends when a submission begins with TURN KEY.")
+  for (const [index, name] of tools.entries()) {
+    const prompt = primingPrompts[instructions.length + index + 1]!
+    expect(prompt).toContain(`"name":"${name}"`)
+    expect(prompt).toContain('"inputSchema"')
+    expect(prompt).not.toContain("Action shapes:")
+    expect(prompt).not.toContain("You are a text-generation assistant")
+  }
 }
 
 function expectTaskPromptsExcludeStartup(parsed: { turn: { primingPrompts: readonly string[], initialPrompt: string, incrementalPrompt: string, recoveryPrompt: string } }, instructions: readonly string[] = []) {
   for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
     expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
+    expect(prompt).not.toContain('"inputSchema"')
+    expect(prompt).not.toContain("Action shapes:")
     for (const instruction of instructions) expect(prompt).not.toContain(instruction)
   }
 }
@@ -69,7 +78,7 @@ describe("webchat role at the request boundary", () => {
               { type: "function_call", call_id: "call_directory", name: "read", arguments: '{"path":"fixture-root-37"}' },
               { type: "function_call_output", call_id: "call_directory", output: "fixture-folder-alpha\nfixture-folder-beta" },
             ] : [])], tools: [{ type: "function", ...tool }] }, new Headers({ "x-session-affinity": "startup-fixture" }))
-        expectStartup(parsed.turn.primingPrompts, startup.map(instruction => `${instruction.role.toUpperCase()}: ${instruction.content}`))
+        expectStartup(parsed.turn.primingPrompts, startup.map(instruction => `${instruction.role.toUpperCase()}: ${instruction.content}`), ["read"])
         expectTaskPromptsExcludeStartup(parsed, startup.map(instruction => instruction.content))
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
           for (const instruction of startup) {
@@ -80,7 +89,7 @@ describe("webchat role at the request boundary", () => {
         }
       }
     })
-    for (const scenario of ["no tools", "budgeted schemas", "file request", "disabled tools"] as const) {
+    for (const scenario of ["no tools", "startup schemas", "file request", "disabled tools"] as const) {
       test(`${endpoint} carries the output-only client-directed role with ${scenario}`, () => {
         const request = scenario === "file request"
           ? "Create a file at /tmp/aipass-role-fixture.txt with content hello aipass!"
@@ -101,20 +110,20 @@ describe("webchat role at the request boundary", () => {
               ...(scenario === "no tools" ? {} : { tools: [{ type: "function", ...fileTool }] }),
             }, new Headers())
 
-        expectStartup(parsed.turn.primingPrompts)
+        expectStartup(parsed.turn.primingPrompts, [], scenario === "no tools" || scenario === "disabled tools" ? [] : ["write"])
         expectTaskPromptsExcludeStartup(parsed)
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
           expect(prompt).toContain(request)
         }
-        if (scenario === "file request") {
+        if (scenario === "file request" || scenario === "startup schemas") {
           expect(parsed.projectedActions).toEqual(["write"])
-          expect(parsed.turn.initialPrompt).toContain('"inputSchema"')
+          expect(parsed.turn.primingPrompts.join("\n")).toContain('"inputSchema"')
         } else {
           expect(parsed.projectedActions).toEqual([])
           expect(parsed.turn.initialPrompt).not.toContain('"inputSchema"')
         }
-        if (scenario === "budgeted schemas") {
-          expect(parsed.turn.initialPrompt).toContain("- write: Write a file")
+        if (scenario === "startup schemas") {
+          expect(parsed.turn.primingPrompts.join("\n")).toContain('"description":"Write a file"')
           expect(parsed.offered).toEqual(new Set(["write"]))
           expect(parsed.turn.initialPrompt.length).toBeLessThan(4_000)
         }
@@ -127,7 +136,7 @@ describe("webchat role at the request boundary", () => {
     }
 
     for (const request of ["can use list current repo folders", "use jcodemunch mcp to find all AGENTS.md in this repo"]) {
-      test(`${endpoint} explains client-action declaration for natural requests without projected schemas: ${request}`, () => {
+      test(`${endpoint} primes client-action protocol and schemas for natural requests: ${request}`, () => {
         const tools = [
           { name: "read", description: "Read a file or list a directory", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
           { name: "execute", description: "Discover and call MCP tools", parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } },
@@ -135,14 +144,17 @@ describe("webchat role at the request boundary", () => {
         const parsed = endpoint === "chat"
           ? parseOpenAIChatRequest({ model: "gpt-5.6-terra", messages: [{ role: "user", content: request }], tools: tools.map(tool => ({ type: "function", function: tool })) }, new Headers())
           : parseOpenAIResponsesRequest({ model: "gpt-5.6-terra", input: request, tools: tools.map(tool => ({ type: "function", ...tool })) }, new Headers())
-        expect(parsed.projectedActions).toEqual([])
+        expect(parsed.projectedActions).toEqual(["read", "execute"])
         expect([...parsed.offered]).toEqual(["read", "execute"])
-        expectStartup(parsed.turn.primingPrompts)
+        expectStartup(parsed.turn.primingPrompts, [], ["read", "execute"])
         expectTaskPromptsExcludeStartup(parsed)
+        const startup = parsed.turn.primingPrompts.join("\n")
+        expect(startup).toContain('"description":"Read a file or list a directory"')
+        expect(startup).toContain('"description":"Discover and call MCP tools"')
+        expect(startup).toContain("Use the full schemas supplied during startup. Every action input must satisfy its schema, including all required fields.")
+        expect(startup).not.toContain("If a listed action has no supplied schema")
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-          expect(prompt).toContain("- read: Read a file or list a directory")
-          expect(prompt).toContain("- execute: Discover and call MCP tools")
-          expect(prompt).toContain('If a listed action has no supplied schema, declare its exact name with "input":{} and stop; the adapter supplies missing required-argument schemas before dispatch.')
+          expect(prompt).toBe(`USER: ${request}`)
           expect(prompt).not.toContain('"inputSchema"')
         }
       })
@@ -183,10 +195,11 @@ describe("webchat role at the request boundary", () => {
         ? parseOpenAIChatRequest({ ...common, messages: [{ role: "user", content: request }], tools: [{ type: "function", function: tool }] }, new Headers())
         : parseOpenAIResponsesRequest({ ...common, input: request, tools: [{ type: "function", ...tool }] }, new Headers())
       expect(parsed.projectedActions).toEqual([tool.name])
-      expectStartup(parsed.turn.primingPrompts)
+      expectStartup(parsed.turn.primingPrompts, [], [tool.name])
       expectTaskPromptsExcludeStartup(parsed)
+      expect(parsed.turn.primingPrompts.join("\n")).toContain(JSON.stringify({ name: tool.name, inputSchema: tool.parameters }))
       for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-        expect(prompt).toContain(JSON.stringify({ name: tool.name, inputSchema: tool.parameters }))
+        expect(prompt).toBe(`USER: ${request}`)
       }
     })
   }
@@ -221,6 +234,6 @@ describe("webchat role at the request boundary", () => {
     const { turn } = parseOpenAIChatRequest({
       model: "gpt-5.6-terra", messages: [{ role: "user", content: "Hello" }],
     }, new Headers())
-    expect(promptContractCurrent(turn.promptContractVersion, turn.actionEnvelopeDigest, 17, turn.actionEnvelopeDigest, true)).toBe(false)
+    expect(promptContractCurrent(turn.promptContractVersion, turn.actionEnvelopeDigest, 17, turn.actionEnvelopeDigest)).toBe(false)
   })
 })

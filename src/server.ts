@@ -32,14 +32,18 @@ function apiError(message: string, status: number, code: string, type = "invalid
   return json({ error: { message, type, param: null, code } }, status)
 }
 
+function safetyBlockError() {
+  return {
+    message: new WebchatSafetyBlockError().message,
+    type: "browser_error",
+    param: null,
+    code: "webchat_safety_block",
+  }
+}
+
 function browserError(error: unknown) {
   if (error instanceof WebchatSafetyBlockError)
-    return apiError(
-      "webchat safety filter blocked the response; revise the prompt and retry explicitly",
-      422,
-      "webchat_safety_block",
-      "browser_error",
-    )
+    return json({ error: safetyBlockError() }, 422)
   if (error instanceof NoResponseEvidenceError)
     return apiError(
       "browser submission produced activity but no recognizable assistant response",
@@ -103,7 +107,10 @@ function streamResponse(
         if (next.done) controller.close()
         else controller.enqueue(encoder.encode(next.value))
       } catch (error) {
-        controller.error(error)
+        if (error instanceof WebchatSafetyBlockError) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: safetyBlockError() })}\n\n`))
+          controller.close()
+        } else controller.error(error)
       }
     },
     async cancel(reason) {
@@ -209,7 +216,10 @@ function responsesStreamResponse(
         await abort().catch((cleanupError) =>
           console.error(`aipass response stream cleanup failed type=${cleanupError instanceof Error ? cleanupError.name : "unknown"}`),
         )
-        controller.error(error)
+        if (error instanceof WebchatSafetyBlockError) {
+          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ ...safetyBlockError(), type: "error" })}\n\n`))
+          controller.close()
+        } else controller.error(error)
       }
     },
     async cancel(reason) {

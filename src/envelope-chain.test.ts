@@ -210,7 +210,7 @@ describe("envelope-chain upgrade", () => {
     expect(shim.finish()).toEqual([{ type: "text", delta: chain }]);
   });
 
-  test("start prompt carries full name index but budgets schemas (stall guard)", () => {
+  test("startup supplies every schema separately while task prompts stay compact", () => {
     const tools = ["read", "glob", "grep", "shell", "write", "edit", "question"].map((name) => ({
       type: "function" as const,
       function: {
@@ -223,20 +223,24 @@ describe("envelope-chain upgrade", () => {
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }], tools },
       new Headers({ "x-session-id": "budgeted-index-session" }),
     );
-    // Name index is always complete (live 17-tool PTY stalls at ~24k full-schema chars).
-    expect(parsed.turn.initialPrompt).toContain("Offered tool index");
-    for (const name of ["read", "glob", "grep", "shell", "write", "edit", "question"]) {
-      expect(parsed.turn.initialPrompt).toContain(`- ${name}:`);
+    // Schema bodies are isolated startup submissions, never one large task.
+    expect(parsed.turn.primingPrompts).toHaveLength(tools.length + 1);
+    for (const [index, tool] of tools.entries()) {
+      expect(parsed.turn.primingPrompts[index + 1]).toContain(JSON.stringify({
+        name: tool.function.name, description: tool.function.description, inputSchema: tool.function.parameters,
+      }));
     }
-    // No tool declared/named yet: schemas stay out of the submit.
     expect(parsed.turn.initialPrompt).not.toContain('"inputSchema"');
-    // Naming a tool in the latest request projects its full schema.
+    expect(parsed.turn.initialPrompt).toBe("USER: hello");
+    // Naming a tool changes only the task, never the startup/schema identity.
     const named = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "use the read tool on x" }], tools },
       new Headers({ "x-session-id": "budgeted-index-session" }),
     );
-    expect(named.turn.initialPrompt).toContain('"name":"read"');
-    expect(named.turn.initialPrompt).toContain('"inputSchema"');
+    expect(named.turn.initialPrompt).toBe("USER: use the read tool on x");
+    expect(named.turn.initialPrompt).not.toContain('"inputSchema"');
+    expect(named.turn.primingPrompts).toEqual(parsed.turn.primingPrompts);
+    expect(named.turn.actionEnvelopeDigest).toBe(parsed.turn.actionEnvelopeDigest);
   });
 
   test("typeless tool envelope parses to tool-call (live terra omits type)", () => {
@@ -255,12 +259,12 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(22);
+    expect(PROMPT_CONTRACT_VERSION).toBe(23);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(22);
+    expect(parsed.turn.promptContractVersion).toBe(23);
   });
 
   test("submit-time fill carries the guard on every turn", () => {

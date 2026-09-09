@@ -10,6 +10,8 @@ import { StreamFrameParser, type BrowserFrame } from "./protocol.ts"
 for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated matching ${sibling} response during a selected turn`, async () => {
   const transportPulse = setInterval(() => {}, 10).unref()
   let startups = 0
+  const startupPrompts: string[] = []
+  let taskPrompt = ""
   const wire = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`
   const tool = '<aipass-envelope>{"type":"tool","key":"fixture-key","id":"read_1","name":"read","input":{}}</aipass-envelope>'
   const thinking = wire({ type: "reasoning-delta", delta: "selected thought" })
@@ -21,10 +23,13 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
     const path = new URL(request.url).pathname
     if (path === "/submit") {
       const body = await request.json() as { messages: { parts: { text: string }[] }[] }
-      if (!body.messages[0]!.parts[0]!.text.startsWith("TURN KEY:")) {
+      const prompt = body.messages[0]!.parts[0]!.text
+      if (!prompt.startsWith("TURN KEY:")) {
         startups++
+        startupPrompts.push(prompt)
         return new Response(wire({ type: "text", delta: "READY" }) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
       }
+      taskPrompt = prompt
     }
     if (path === "/submit") return new Response(new ReadableStream<Uint8Array>({
       async start(controller) {
@@ -84,12 +89,19 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
     async pending() {}, async bind(_, remote) { binding = remote }, async complete() {}, async fail() {},
   }, protocol)
   try {
-    const input = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Read the fixture." }] }, new Headers()).turn
+    const input = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Read the fixture." }],
+      tools: [{ type: "function", function: { name: "read", description: "fixture schema", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }],
+    }, new Headers()).turn
     const frames: BrowserFrame[] = []
     for await (const frame of adapter.turn({ ...input, promptKey: "fixture-key", model: { id: "fixture", name: "Fixture", thinking: [] } }, AbortSignal.timeout(15_000))) frames.push(frame)
     expect(frames).toEqual([
       { type: "reasoning", delta: "selected thought" }, { type: "text", delta: tool }, { type: "finish", reason: "stop" },
     ])
     expect(startups).toBe(input.primingPrompts.length)
+    expect(startupPrompts).toEqual([...input.primingPrompts])
+    expect(startupPrompts.join("\n")).toContain('"inputSchema"')
+    expect(taskPrompt).not.toContain('"inputSchema"')
+    expect(taskPrompt).not.toContain("fixture schema")
   } finally { release(); await adapter.close(); clearInterval(transportPulse); await server.stop(true); await rm(profilePath, { recursive: true, force: true }) }
 }, 20_000)
