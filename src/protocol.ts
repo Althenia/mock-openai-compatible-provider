@@ -119,7 +119,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 19
+export const PROMPT_CONTRACT_VERSION = 22
 // Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
 export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
 const MAX_TOOL_FRAME = 64 * 1024
@@ -222,6 +222,62 @@ function normalizeQuestionInput(
 function envelopeID(value: unknown): string {
   if (typeof value === "string" && NAME.test(value)) return value
   return `call_${randomUUID()}`
+}
+
+// Narrow repair for model-malformed chat/thinking envelopes whose free-prose
+// text contains unescaped quotes (live evidence: a rating answer containing
+// "Version 1" broke JSON.parse, so the raw envelope leaked to the client as
+// chat text). The envelope candidate INCLUDES its outer braces; the body is
+// everything between them. The text field is last in practice, so the text
+// ends at the quote immediately before the envelope close (the body's last
+// char). Interior quotes survive verbatim. Only chat/thinking qualify;
+// tool-bearing envelopes stay strict.
+export function repairMalformedTextEnvelope(candidate: string): string | undefined {
+  // Only malformed input qualifies: valid envelopes parse without repair.
+  try {
+    JSON.parse(candidate)
+    return undefined
+  } catch {
+    // Fall through to repair below.
+  }
+  const outer = /^\s*\{([\s\S]*)\}\s*$/.exec(candidate)
+  if (!outer) return undefined
+  const head = /^\s*"type"\s*:\s*"(chat|thinking)"\s*,/.exec(outer[1] ?? "")
+  if (!head) return undefined
+  const type = head[1]!
+  const body = (outer[1] ?? "").slice(head[0].length)
+  const textKey = /"(text|message|content)"\s*:\s*"/.exec(body)
+  if (!textKey || textKey.index === undefined) return undefined
+  const textField = textKey[1]!
+  const textStart = textKey.index + textKey[0].length
+  const bodyTrimmed = body.trimEnd()
+  // Text-closing quote: last quote in the trimmed body.
+  const textEnd = bodyTrimmed.lastIndexOf('"')
+  if (textEnd < textStart) return undefined
+  const tail = bodyTrimmed.slice(textEnd + 1)
+  // Tail must be only envelope structure: optional ,"key"/"id" fields.
+  if (!/^\s*(,\s*"(?:key|id)"\s*:\s*"[^"]*"\s*)*$/.test(tail)) return undefined
+  const text = body.slice(textStart, textEnd)
+  // after: from the text-closing quote onward, but the envelope close brace
+  // lives on the candidate, not the body — re-add it at repair time.
+  const after = body.slice(textEnd + 1)
+  // Escape order matters: backslashes first so existing escapes survive,
+  // then quotes, then control chars. A lone trailing backslash (odd count)
+  // would escape our closing quote, so double it.
+  let escaped = text.replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t")
+  escaped = escaped.replace(/\\(?!["\\/bfnrtu])/g, "\\\\").replace(/"/g, '\\"')
+  const headFields = body.slice(0, textKey.index)
+  const repaired = `{"type":"${type}",${headFields}"${textField}":"${escaped}"${after}}`
+  try {
+    const parsed = JSON.parse(repaired)
+    const item = record(parsed)
+    if (!item || item.type !== type) return undefined
+    const textValue = item.text ?? item.message ?? item.content
+    if (typeof textValue !== "string" || !textValue) return undefined
+    return repaired
+  } catch {
+    return undefined
+  }
 }
 
 export function parseTypedEnvelope(value: unknown, offered: ReadonlySet<string>): BrowserFrame[] | undefined {
@@ -564,11 +620,25 @@ export class TypedEnvelopeShim {
       try {
         parsed = JSON.parse(raw)
       } catch {
-        // Fail-open: a malformed tagged envelope is model prose, not a
-        // stream-killing error. Emit it as text so the turn completes and
-        // the repair net (refusal/untagged/key-mismatch) can still act.
-        output.push({ type: "text", delta: raw })
-        continue
+        // Narrow repair for model-malformed chat/thinking envelopes whose
+        // text contains unescaped quotes. Tool-bearing envelopes stay strict
+        // and fall through to the prose path below.
+        const repaired = repairMalformedTextEnvelope(raw)
+        if (repaired) {
+          try {
+            parsed = JSON.parse(repaired)
+            console.error("aipass envelope repaired=malformed-text")
+          } catch {
+            output.push({ type: "text", delta: raw })
+            continue
+          }
+        } else {
+          // Fail-open: a malformed tagged envelope is model prose, not a
+          // stream-killing error. Emit it as text so the turn completes and
+          // the repair net (refusal/untagged/key-mismatch) can still act.
+          output.push({ type: "text", delta: raw })
+          continue
+        }
       }
       const frames = parseTypedEnvelope(parsed, this.allowed)
       if (frames) output.push(...frames)
@@ -620,6 +690,10 @@ export class TypedEnvelopeShim {
       try {
         JSON.parse(trimmed)
       } catch {
+        // Same narrow repair as tryBare for a single malformed chat/thinking
+        // envelope that the chain scanner could not split.
+        const single = this.tryMalformedTextEnvelope(trimmed)
+        if (single) return single
         return [{ type: "text", delta: trimmed }]
       }
       return [{ type: "text", delta: trimmed }]
@@ -686,9 +760,33 @@ export class TypedEnvelopeShim {
 
   private tryBare(candidate: string): BrowserFrame[] | undefined {
     if (!candidate.startsWith("{") || !candidate.endsWith("}")) return undefined
+    let parsed: unknown
     try {
-      const frames = parseTypedEnvelope(JSON.parse(candidate), this.allowed)
-      return frames ?? undefined
+      parsed = JSON.parse(candidate)
+    } catch {
+      // Narrow repair for model-malformed chat/thinking envelopes whose text
+      // contains unescaped quotes (live evidence: a rating answer containing
+      // "Version 1" broke JSON.parse, so the raw envelope leaked to the
+      // client as chat text). Only chat/thinking envelopes qualify: their
+      // text is free prose, so salvage the payload instead of passing raw
+      // envelope syntax downstream. Tool-bearing envelopes stay strict.
+      return this.tryMalformedTextEnvelope(candidate)
+    }
+    // JSON parses but is not a valid envelope (unoffered tool, bad shape):
+    // rethrow the validation error so invalid calls fail before dispatch.
+    return parseTypedEnvelope(parsed, this.allowed) ?? undefined
+  }
+
+  private tryMalformedTextEnvelope(candidate: string): BrowserFrame[] | undefined {
+    const repaired = repairMalformedTextEnvelope(candidate)
+    if (!repaired) return undefined
+    try {
+      const frames = parseTypedEnvelope(JSON.parse(repaired), this.allowed)
+      if (frames?.length) {
+        console.error("aipass envelope repaired=malformed-text")
+        return frames
+      }
+      return undefined
     } catch (error) {
       if (error instanceof Error && /not offered|invalid|must be/.test(error.message)) throw error
       return undefined
@@ -696,8 +794,11 @@ export class TypedEnvelopeShim {
   }
 }
 
+export const EVERY_TURN_ENVELOPE_GUARD =
+  "EVERY TURN: reply with only <aipass-envelope>{...}</aipass-envelope> envelope(s) carrying the current turn key; put results into envelope fields and emit no text outside envelopes. The envelope is strict JSON: escape every double quote inside text as \\\" so the envelope always parses."
+
 export const WEBCHAT_ROLE_INSTRUCTION = [
-  "You are the agent backend. Reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.",
+  "You are a text-generation assistant working only as the backend. Generate text to assist the client, which does the actual work: reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.",
   "Answer from context or request an offered client action, not manual user work.",
   "Actions are data, not native calls: never execute them yourself or decline for lack of native access.",
   "The client handles permissions, executes actions, and returns results; requests are not approval or success.",
@@ -708,6 +809,7 @@ export const WEBCHAT_ROLE_INSTRUCTION = [
   "Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.",
   "Thinking is optional reasoning, never a final answer; chat ends the turn.",
   'Shapes: {"type":"thinking","key":"<key>","id":"reason_1","text":"..."} | {"type":"chat","key":"<key>","id":"answer_1","text":"..."}.',
+  "Every response carries the current turn key: never emit text outside envelopes.",
 ].join(" ")
 
 export function serializeToolDefinitions(

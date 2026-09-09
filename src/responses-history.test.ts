@@ -47,7 +47,9 @@ describe("process-memory Responses continuation", () => {
       expect(turns[1]!.primingPrompts[1]).toContain("NEW_TOP_LEVEL_RULE")
       expect(turns[1]!.primingPrompts[2]).toContain("RETAINED_MESSAGE_RULE")
       expect(turns[1]!.primingPrompts.join("\n")).not.toContain("OLD_TOP_LEVEL_RULE")
-      for (const prompt of [turns[1]!.initialPrompt, turns[1]!.incrementalPrompt, turns[1]!.recoveryPrompt]) {
+      // First-turn shape replays the full chain; bound routing is delta-only
+      // with the earlier chain living in remote history instead.
+      for (const prompt of [turns[1]!.initialPrompt, turns[1]!.recoveryPrompt]) {
         for (const value of ["ORIGINAL_TASK", "ASSISTANT REASONING: PRIOR_REASONING",
           "ASSISTANT: PRIOR_ASSISTANT", 'TOOL CALL call_lookup lookup: {"key":"fixture-alpha"}', "TOOL RESULT call_lookup: LOOKUP_RESULT"])
           expect(prompt).toContain(value)
@@ -57,6 +59,14 @@ describe("process-memory Responses continuation", () => {
         expect(prompt.indexOf("ORIGINAL_TASK")).toBeLessThan(prompt.indexOf("TOOL CALL call_lookup"))
         expect(prompt.indexOf("TOOL CALL call_lookup")).toBeLessThan(prompt.indexOf("TOOL RESULT call_lookup"))
       }
+      for (const value of ["TOOL RESULT call_lookup: LOOKUP_RESULT"])
+        expect(turns[1]!.incrementalPrompt).toContain(value)
+      for (const value of ["ORIGINAL_TASK", "ASSISTANT REASONING: PRIOR_REASONING",
+        "ASSISTANT: PRIOR_ASSISTANT", 'TOOL CALL call_lookup lookup: {"key":"fixture-alpha"}'])
+        expect(turns[1]!.incrementalPrompt).not.toContain(value)
+      expect(turns[1]!.incrementalPrompt).not.toContain("OLD_TOP_LEVEL_RULE")
+      expect(turns[1]!.incrementalPrompt).not.toContain("RETAINED_MESSAGE_RULE")
+      expect(turns[1]!.incrementalPrompt).not.toContain("NEW_TOP_LEVEL_RULE")
       await result(await handler(request({ previous_response_id: second.id, input: "FINAL_QUESTION" })), false)
       expect(turns[2]!.initialPrompt).toContain("ORIGINAL_TASK")
       expect(turns[2]!.initialPrompt).toContain("CONTINUATION_ANSWER")

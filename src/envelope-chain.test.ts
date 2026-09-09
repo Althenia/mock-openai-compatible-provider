@@ -8,6 +8,7 @@ import type { BrowserFrame } from "./protocol.ts";
 import {
   ENVELOPE_CLOSE,
   ENVELOPE_OPEN,
+  EVERY_TURN_ENVELOPE_GUARD,
   PROMPT_CONTRACT_VERSION,
   TypedEnvelopeShim,
   envelopeKeys,
@@ -151,8 +152,10 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("withTurnKey prepends TURN KEY as the first line", () => {
-    expect(withTurnKey("BODY", "key-1")).toBe("TURN KEY: key-1\n\nBODY");
-    expect(withTurnKey("BODY", "key-1").split("\n")[0]).toBe("TURN KEY: key-1");
+    const filled = withTurnKey("BODY", "key-1");
+    expect(filled.split("\n")[0]).toBe("TURN KEY: key-1");
+    expect(filled).toContain("BODY");
+    expect(filled).toContain(EVERY_TURN_ENVELOPE_GUARD);
   });
 
   test("envelopeKeys extracts every tagged and bare key", () => {
@@ -252,11 +255,20 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(19);
+    expect(PROMPT_CONTRACT_VERSION).toBe(22);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(19);
+    expect(parsed.turn.promptContractVersion).toBe(22);
+  });
+
+  test("submit-time fill carries the guard on every turn", () => {
+    const filled = withTurnKey("BODY", "key-1");
+    expect(filled.split("\n")[0]).toBe("TURN KEY: key-1");
+    expect(filled).toContain(EVERY_TURN_ENVELOPE_GUARD);
+    expect(filled.indexOf(EVERY_TURN_ENVELOPE_GUARD)).toBeLessThan(filled.indexOf("BODY"));
+    expect(withTurnKey(`${EVERY_TURN_ENVELOPE_GUARD}\n\nBODY`, "key-1").split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2);
+    expect(withTurnKey("BODY")).toContain(EVERY_TURN_ENVELOPE_GUARD);
   });
 });

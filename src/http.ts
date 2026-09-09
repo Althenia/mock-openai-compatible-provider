@@ -569,6 +569,8 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   const toolDefinitions = [actionContract, requiredNotice].filter(Boolean).join("\n")
   // Startup is submitted serially by the browser. Every task still carries
   // current action schemas and chronological conversation, not startup text.
+  // The guard itself is injected at submit time (withTurnKey), so it need
+  // not be duplicated in the projected prompts here.
   const initialPrompt = [toolDefinitions, conversation].filter(Boolean).join("\n")
   const autoToolChoice = input.tool_choice === undefined || input.tool_choice === "auto"
   const toolRepairPrompt = autoToolChoice && offeredTools.length > 0
@@ -591,15 +593,25 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
     instructionDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH - 2),
     rawActionEnvelopeDigest.slice(INSTRUCTION_DIGEST_PREFIX_LENGTH),
   ].join("")
-  const incrementalPrompt = instructionMode === "preserve"
+  // Bound incremental turns are delta-only, like real LLM inference: the
+  // remote chat already holds the system/agents instructions (primed once),
+  // prior history, and previously shown schemas. Tool continuations resend
+  // only their schemas plus the latest delta (results since the last
+  // assistant message), never the full call/result chain. Full history is
+  // resent only via the recovery path (contract change / reload /
+  // compaction) or the repair/provision fallback.
+  // Preserve mode keeps the full initial shape for the first turn; the
+  // incremental delta alone routes bound continuations.
+  const incrementalPrompt = instructionMode === "preserve" && !continuingTool
     ? initialPrompt
-    : [toolDefinitions, incrementalTranscript].filter(Boolean).join("\n\n")
-  // A recovery reload has no bound remote history. Tool continuations need
-  // their preceding request as well as the latest tool result to resume.
-  const recoveryConversation = continuingTool ? conversation : incrementalTranscript
-  const recoveryPrompt = instructionMode === "preserve"
-    ? initialPrompt
-    : [toolDefinitions, recoveryConversation].filter(Boolean).join("\n")
+    : continuingTool
+      ? [toolDefinitions, incrementalTranscript].filter(Boolean).join("\n")
+      : incrementalTranscript
+  // A recovery reload has no bound remote history, so it replays the full
+  // conversation: the model needs the preceding request for context.
+  const recoveryConversation = conversation
+  // Recovery replays the full contract: no bound history survives a reload.
+  const recoveryPrompt = [toolDefinitions, recoveryConversation].filter(Boolean).join("\n")
   const reasoningMode = record(input.reasoning)?.mode ?? record(input.reasoning)?.effort
   if (
     reasoningMode !== undefined &&

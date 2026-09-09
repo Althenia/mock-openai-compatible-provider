@@ -111,7 +111,7 @@ describe("internal continuation request fidelity", () => {
         expect(next.primingPrompts).toEqual([])
         expect(next.promptKey).toBe(parsed.turn.promptKey)
         for (const prompt of [next.initialPrompt, next.incrementalPrompt, next.recoveryPrompt]) {
-          expect(prompt).toContain("You are the agent backend. Reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.")
+          expect(prompt).toContain("You are a text-generation assistant working only as the backend.")
           expect(prompt).toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
           expect(prompt).toContain("Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.")
           expect(prompt).toContain("ORIGINAL_TASK")
@@ -205,6 +205,24 @@ describe("automatic tool-refusal repair", () => {
       { type: "finish", reason: "tool-calls" },
     ])
     expect(repairs).toBe(1)
+  })
+
+  test("surfaces a webchat safety block without repair or retry", async () => {
+    let repairs = 0
+    const repair = () => ({
+      async *[Symbol.asyncIterator](): AsyncGenerator<BrowserFrame> {
+        repairs++
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+      },
+    })
+    const blocked: BrowserFrame[] = [
+      { type: "text", delta: "ขออภัย! ข้อความของคุณอาจมีบางส่วนที่ขัดกับระบบความปลอดภัย (อาจเกิดจากระบบหรือโมเดล AI) รบกวนลองปรับแก้แล้วส่งใหม่อีกครั้ง" },
+      { type: "finish", reason: "stop" },
+    ]
+    const exposed: BrowserFrame[] = []
+    for await (const frame of repairToolRefusal(blocked, repair)) exposed.push(frame)
+    expect(exposed).toEqual(blocked)
+    expect(repairs).toBe(0)
   })
 
   test("does not repair a normal answer or an existing tool call", async () => {

@@ -15,13 +15,13 @@ test("startup preserves ordered instruction boundaries separately from the task"
     { role: "user", content: "TASK" },
   ])
   expect(turn.primingPrompts).toHaveLength(4)
-  expect(turn.primingPrompts[0]).toStartWith("You are the agent backend.")
+  expect(turn.primingPrompts[0]).toStartWith("You are a text-generation assistant working only as the backend.")
   for (const [index, instruction] of ["SYSTEM: HARNESS", "DEVELOPER: AGENT", "SYSTEM: WORKSPACE"].entries()) {
     expect(turn.primingPrompts[index + 1]).toContain(instruction)
   }
   for (const prompt of [turn.initialPrompt, turn.incrementalPrompt, turn.recoveryPrompt]) {
     expect(prompt).toContain("USER: TASK")
-    for (const text of ["You are the agent backend.", "HARNESS", "AGENT", "WORKSPACE"]) expect(prompt).not.toContain(text)
+    for (const text of ["You are a text-generation assistant working only as the backend.", "HARNESS", "AGENT", "WORKSPACE"]) expect(prompt).not.toContain(text)
   }
 })
 

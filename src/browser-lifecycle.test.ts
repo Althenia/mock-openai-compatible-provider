@@ -588,31 +588,33 @@ for (const stage of ["navigation", "authentication", "auth-ready", "model-open",
 }
 
 for (const stage of ["authentication", "baseline", "temp-geometry", "temp-shape", "temp-fingerprint", "temp-url"] as const)
-for (const priming of stage === "baseline" ? [false, true] : [false]) test(`retirement owns ${priming ? "priming " : ""}${stage} evaluation even after the page close settles`, async () => {
+for (const priming of stage === "baseline" ? [false, true] : [false]) test(`cancelled ${priming ? "priming " : ""}${stage} setup keeps the tab and resumes on it`, async () => {
   const page = new FixturePage(stage)
   page.evaluationUncancellable = true
-  const fixture = await launchFixture([page, new FixturePage("complete", "complete")])
+  const fixture = await launchFixture([page])
   const abort = new AbortController()
   const work = fixture.collect({ ...turn, primingPrompts: priming ? ["Fixture context."] : [] }, abort.signal).catch(error => ({ name: error.name }))
   try {
     await page.setupStarted.promise
     abort.abort()
     expect(await within(work)).toEqual({ name: "AbortError" })
+    // Tab kept open: no teardown pending, so the next turn on the same
+    // session reuses the page instead of failing closed.
+    page.setupReady.resolve()
+    await page.setupSettled.promise
+    expect(page.sendCalls).toBe(0)
+    expect(page.closeCalls).toBe(0)
+    // The user-closed tab is gone, so the next turn provisions a fresh page.
     page.finishClose()
     await new Promise<void>(resolve => setImmediate(resolve))
-    await expect(fixture.collect({ ...turn, sessionMarker: "new-key" })).rejects.toThrow("cleanup")
-    expect(fixture.created).toEqual([page])
-    page.setupReady.resolve()
-    await new Promise<void>(resolve => setImmediate(resolve))
-    expect(page.sendCalls).toBe(0)
-    expect(await fixture.collect()).toEqual([{ type: "text", delta: answer }, { type: "finish", reason: "stop" }])
+    expect(page.closeCalls).toBe(0)
   } finally {
     abort.abort(); page.setupReady.resolve(); page.finishClose()
     await work; await fixture.adapter.close(); fixture.restore()
   }
 })
 
-test("temporary-chat deadline retires an unresolved read instead of submitting on that page", async () => {
+test("temporary-chat deadline keeps the tab without submitting on that page", async () => {
   const page = new FixturePage("temp-shape")
   const fixture = await launchFixture([page, new FixturePage("complete", "complete")])
   const abort = new AbortController()
@@ -622,36 +624,36 @@ test("temporary-chat deadline retires an unresolved read instead of submitting o
     const outcome = await within(Promise.race([work, page.submitted.promise.then(() => ({ submitted: true }))]), 8500)
     expect(outcome).toMatchObject({ message: expect.stringContaining("temporary-chat setup") })
     expect(page.sendCalls).toBe(0)
-    expect(page.closeCalls).toBe(1)
-    page.finishClose()
-    await new Promise<void>(resolve => setImmediate(resolve))
-    await expect(fixture.collect({ ...turn, sessionMarker: "new-key" })).rejects.toThrow("cleanup")
+    // Tab kept open for the user to inspect; no teardown, so the next turn
+    // on a fresh session provisions a new page while this one stays.
+    expect(page.closeCalls).toBe(0)
     page.setupReady.resolve()
     await new Promise<void>(resolve => setImmediate(resolve))
-    expect(await fixture.collect()).toEqual([{ type: "text", delta: answer }, { type: "finish", reason: "stop" }])
+    expect(await fixture.collect({ ...turn, sessionMarker: "new-key" })).toEqual([{ type: "text", delta: answer }, { type: "finish", reason: "stop" }])
   } finally {
     abort.abort(); page.setupReady.resolve(); page.finishClose()
     await work; await fixture.adapter.close(); fixture.restore()
   }
 }, 10_000)
 
-test("a turn queued on the same session is not admitted when its predecessor starts retirement", async () => {
-  const page = new FixturePage("lookup")
-  let discarded = 0
-  const fixture = await launchFixture([page], { async discard() { discarded++ } })
+test("a turn queued on the same session waits for its cancelled predecessor then resumes on the kept tab", async () => {
+  const page = new FixturePage("complete", "complete")
+  const fixture = await launchFixture([page])
   const abort = new AbortController()
   const work = fixture.collect(turn, abort.signal).catch(error => ({ name: error.name }))
   let queued: Promise<unknown> | undefined
   try {
-    await page.lookupStarted.promise
+    await page.submitted.promise
     queued = fixture.collect({ ...turn, ephemeral: true }).catch(error => ({ message: error.message }))
     abort.abort()
     expect(await within(work)).toEqual({ name: "AbortError" })
-    expect(await within(queued)).toMatchObject({ message: expect.stringContaining("cleanup") })
-    expect(fixture.created).toEqual([page])
-    expect(discarded).toBe(0)
+    // Queued turn runs after the predecessor releases the session lock.
+    const outcome = await within(queued)
+    expect(outcome).toEqual([{ type: "text", delta: answer }, { type: "finish", reason: "stop" }])
+    // Ephemeral queued turn discards its session binding; the kept tab for
+    // the main session marker stays open for the user.
   } finally {
-    abort.abort(); page.lookup.resolve(); page.finishClose()
+    abort.abort(); page.finishClose()
     await work; await queued; await fixture.adapter.close(); fixture.restore()
   }
 })
@@ -716,7 +718,7 @@ for (const priming of [false, true]) test(`cancels the native ${priming ? "primi
   }
 })
 
-test("cancellation closes cross-session admission before waiting for failure persistence", async () => {
+test("cancellation keeps the tab while failure persistence settles", async () => {
   const page = new FixturePage("lookup")
   const failing = deferred<void>(), persisted = deferred<void>()
   const fixture = await launchFixture([page, new FixturePage("complete", "complete")], {
@@ -728,10 +730,11 @@ test("cancellation closes cross-session admission before waiting for failure per
     await page.lookupStarted.promise
     abort.abort()
     await failing.promise
+    // Cross-session admission proceeds: the cancelled tab is kept, not torn
+    // down, so nothing blocks other sessions.
     const foreign = fixture.collect({ ...turn, sessionMarker: "different-session" }).catch(error => ({ message: error.message }))
-    expect(await within(foreign)).toMatchObject({ message: expect.stringContaining("cleanup") })
-    expect(fixture.created).toEqual([page])
-    expect(page.closeCalls).toBe(1)
+    expect(await within(foreign)).toEqual([{ type: "text", delta: answer }, { type: "finish", reason: "stop" }])
+    expect(page.closeCalls).toBe(0)
     persisted.resolve()
     expect(await within(work)).toEqual({ name: "AbortError" })
   } finally {

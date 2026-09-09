@@ -47,6 +47,11 @@ class FakeDomPage {
 }
 
 describe("DOM completion stability", () => {
+  test("fails fast on the webchat safety-filter block instead of waiting", async () => {
+    const blocked = { assistantCount: 1, complete: true, settled: true, text: "ขออภัย! ข้อความของคุณอาจมีบางส่วนที่ขัดกับระบบความปลอดภัย" }
+    await expect(readDomCompletion(new FakeDomPage([blocked]) as never)).rejects.toMatchObject({ name: "WebchatSafetyBlockError" })
+  })
+
   test("normalizes early unsettled, empty, and absent-assistant snapshots to incomplete", async () => {
     for (const snapshot of [
       { assistantCount: 1, complete: true, settled: false, text: "answer" },

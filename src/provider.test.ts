@@ -30,7 +30,7 @@ const temporary: string[] = []
 
 function expectStartupPrompts(primingPrompts: readonly string[], instructions: readonly string[] = []) {
   expect(primingPrompts).toHaveLength(instructions.length + 1)
-  expect(primingPrompts[0]).toContain("You are the agent backend.")
+  expect(primingPrompts[0]).toContain("You are a text-generation assistant working only as the backend.")
   for (const [index, instruction] of instructions.entries()) {
     expect(primingPrompts[index + 1]).toContain(instruction)
     expect(primingPrompts[index + 1]).toContain("Acknowledge briefly with READY")
@@ -105,23 +105,23 @@ describe("compiled CLI contract", () => {
     expect(() => selectionPlan("gpt-5.6-terra", "max")).toThrow("does not support")
   })
 
-  test("observability defaults to headless with no screenshots", () => {
+  test("observability defaults to headed with no screenshots", () => {
     const command = parseCommand(["start", "--chrome", "/tmp/chrome"], environment("/tmp/home"), {
       verifyChrome: false,
     })
     if (command.type !== "serve") throw new Error("expected serve")
-    expect(command.settings.browserHeaded).toBe(false)
+    expect(command.settings.browserHeaded).toBe(true)
     expect(command.settings.screenshotDir).toBeUndefined()
   })
 
-  test("observability env enables headed plus screenshot dir", () => {
+  test("observability env disables headed and sets screenshot dir", () => {
     const command = parseCommand(["start", "--chrome", "/tmp/chrome"], {
       HOME: "/tmp/home",
-      AIPASS_BROWSER_HEADED: "1",
+      AIPASS_BROWSER_HEADED: "0",
       AIPASS_SCREENSHOT_DIR: "/tmp/shots",
     }, { verifyChrome: false })
     if (command.type !== "serve") throw new Error("expected serve")
-    expect(command.settings.browserHeaded).toBe(true)
+    expect(command.settings.browserHeaded).toBe(false)
     expect(command.settings.screenshotDir).toBe("/tmp/shots")
   })
 })
@@ -330,7 +330,7 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.incrementalPrompt).not.toContain("PRIVATE_SYSTEM")
     expect(parsed.turn.incrementalPrompt).not.toContain('"name":"read"')
     expect(parsed.turn.incrementalPrompt).not.toContain("<aipass-action>")
-    expect(parsed.turn.promptContractVersion).toBe(19)
+    expect(parsed.turn.promptContractVersion).toBe(22)
     expect(parsed.turn.actionEnvelopeDigest).toMatch(/^[a-f0-9]{64}$/)
     expect(parsed.turn.toolContinuation).toBe(false)
     expect(parsed.turn.recoveryPrompt).not.toContain("PRIVATE_SYSTEM")
@@ -341,6 +341,7 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.recoveryPrompt).not.toContain('"inputSchema"')
     expect(parsed.turn.recoveryPrompt).toContain("ASSISTANT: previous")
     expect(parsed.turn.recoveryPrompt).toBe(parsed.turn.initialPrompt)
+    expect(parsed.turn.incrementalPrompt).toBe(parsed.turn.recoveryPrompt)
     expect(parsed.offered).toEqual(new Set(["read"]))
 
     const continuation = parseOpenAIChatRequest(

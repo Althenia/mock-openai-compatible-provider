@@ -7,7 +7,7 @@ import { chromium, errors, type BrowserContext, type Locator, type Page } from "
 import { estimateTokens } from "./context.ts"
 import { browserControlState } from "./browser-diagnostics.ts"
 import { THINKING_LABELS } from "./model-catalog.ts"
-import { INSTRUCTION_DIGEST_PREFIX_LENGTH, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
+import { EVERY_TURN_ENVELOPE_GUARD, INSTRUCTION_DIGEST_PREFIX_LENGTH, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
 
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "max"
 
@@ -469,8 +469,11 @@ export async function captureStepScreenshot(
 }
 
 export function withTurnKey(prompt: string, promptKey?: string): string {
-  if (!promptKey) return prompt
-  return `TURN KEY: ${promptKey}\n\n${prompt}`
+  // Submit-time injection: the guard rides every fill regardless of bound /
+  // incremental / repair / provision routing, so headed debugging shows it.
+  const guarded = prompt.startsWith(EVERY_TURN_ENVELOPE_GUARD) ? prompt : `${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`
+  if (!promptKey) return guarded
+  return `TURN KEY: ${promptKey}\n\n${guarded}`
 }
 
 export function promptContractCurrent(
@@ -610,6 +613,9 @@ export class BrowserResponse<Frame extends BrowserFrame> {
     if (this.completed || completion.assistantCount <= baseline || !isSettledResponse(completion)) return []
     const capturedText = this.capturedText()
     const domText = completion.text.trim()
+    // Safety-filter block as settled DOM prose: fail, never publish it as an
+    // answer or let the repair net re-submit on it.
+    if (isWebchatSafetyBlock(capturedText) || isWebchatSafetyBlock(domText)) throw new WebchatSafetyBlockError()
     if (hasTerminalEnvelope(domText) && domText.startsWith(capturedText.trim()) && domText.length > capturedText.trim().length)
       return this.publishDomCompletion(completion)
     if (hasTerminalEnvelope(capturedText)) return this.publishCapturedFrames()
@@ -659,6 +665,9 @@ export class BrowserResponse<Frame extends BrowserFrame> {
     for (const frame of frames) {
       if (frame.type === "error") throw new Error(frame.message)
       if (frame.type === "auth-required") throw new AuthenticationRequiredError()
+      // Safety-filter block arriving over the stream: fail the turn now
+      // instead of buffering it into a fallback answer or repair cycle.
+      if (frame.type === "text" && isWebchatSafetyBlock(frame.delta)) throw new WebchatSafetyBlockError()
       if (frame.type === "text") stream.hasText = true
       this.frames.push(frame)
     }
@@ -703,6 +712,25 @@ export class NoResponseEvidenceError extends Error {
   constructor() {
     super("browser submission produced no response evidence")
     this.name = "NoResponseEvidenceError"
+  }
+}
+
+// The webchat safety filter replaces the assistant answer with a Thai
+// block notice. It is not a refusal to a tool and not a late answer: fail
+// the turn immediately instead of falling back, waiting, or repairing.
+const WEBCHAT_SAFETY_BLOCK = "ขัดกับระบบความปลอดภัย"
+const WEBCHAT_SAFETY_BLOCK_SHORT = "ระบบความปลอดภัย"
+
+export function isWebchatSafetyBlock(text: string): boolean {
+  if (!text) return false
+  if (text.includes(WEBCHAT_SAFETY_BLOCK)) return true
+  return text.includes(WEBCHAT_SAFETY_BLOCK_SHORT) && text.includes("ส่งใหม่")
+}
+
+export class WebchatSafetyBlockError extends Error {
+  constructor() {
+    super("webchat safety filter blocked the response; revise the prompt and retry explicitly")
+    this.name = "WebchatSafetyBlockError"
   }
 }
 
@@ -2066,10 +2094,14 @@ export async function readDomSnapshot(
  */
 export async function readDomCompletion(page: Page, signal?: AbortSignal): Promise<DomCompletion> {
   const first = await readDomSnapshot(page, signal)
+  // Safety-filter block renders as settled assistant prose: fail fast before
+  // the stability wait, so the turn errors instead of falling back or idling.
+  if (first.text && isWebchatSafetyBlock(first.text)) throw new WebchatSafetyBlockError()
   if (first.assistantCount === 0 || !first.complete || !first.settled || !first.text.trim())
     return { ...first, complete: false }
   await abortable(new Promise<void>((resolve) => setTimeout(resolve, DOM_STABILITY_MS)), signal)
   const second = await readDomSnapshot(page, signal)
+  if (second.text && isWebchatSafetyBlock(second.text)) throw new WebchatSafetyBlockError()
   if (
     !second.complete ||
     !second.settled ||
@@ -2235,12 +2267,14 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       owned = true
       // These Playwright setup APIs have no native signal. Keep admission
       // closed until their late result and all of its resources are reclaimed.
+      // The tab itself stays open for the user: only detach adapter tracking
+      // if setup never completed; a created page keeps its session mapping.
       const work = setup.then(() => undefined, () => undefined).then(async () => {
         await capture?.stop()
-        if (page) await (retirement ?? this.retire(sessionMarker, page))
+        if (page && !this.pages.get(sessionMarker)) await (retirement ?? this.retire(sessionMarker, page))
       }).finally(() => this.pendingSetups.delete(work))
       this.pendingSetups.add(work)
-      if (page) retirement = this.retire(sessionMarker, page)
+      if (page && !this.pages.get(sessionMarker)) retirement = this.retire(sessionMarker, page)
     }
     signal?.addEventListener("abort", cleanup, { once: true })
     if (signal?.aborted) cleanup()
@@ -2442,6 +2476,10 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
     let possiblySubmitted = false
     let completed = false
     let admitted = false
+    // A kept-open tab after a cancel/failure resumes on the same page: skip
+    // the teardown gate when the session page is alive, since no teardown is
+    // actually pending for it. User-closed tabs still fail closed via retire.
+    let resumedKeptPage = false
     let stage = "session-setup"
     let stageStarted = performance.now()
     let diagnosed = false
@@ -2460,7 +2498,18 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
     signal?.addEventListener("abort", onAbort, { once: true })
     try {
       aborted(signal)
-      this.assertAvailable()
+      // Resume path: the session tab survived a cancel/failure and is still
+      // open for the user. Skip the teardown gate and stale-page eviction for
+      // it — the binding + prompt-contract check below decides whether the
+      // page is reusable. Anything else still fails closed on pending cleanup.
+      const kept = this.pages.get(input.sessionMarker)
+      if (kept && !kept.isClosed()) {
+        resumedKeptPage = true
+        page = kept
+      } else {
+        this.assertAvailable()
+        if (kept) this.pages.delete(input.sessionMarker)
+      }
       admitted = true
       if (input.compactionDigest && (await this.lifecycle.rotate?.(input.sessionMarker, input.compactionDigest))) {
         const existing = this.pages.get(input.sessionMarker)
@@ -2506,6 +2555,12 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         promptHash: promptHash(JSON.stringify([input.model.id, input.reasoning, input.compactionDigest, input.primingPrompts, prompt])),
       })
       page = await this.page(input.sessionMarker, signal, mark, onFailure)
+      // Resumed kept page: verify the URL still matches the durable binding
+      // before trusting it. On mismatch (user navigated away, tab repurposed),
+      // fall through to the normal navigation below which restores the target.
+      if (resumedKeptPage && bound && binding && page.url() !== binding) {
+        console.error(`aipass turn resume url-mismatch rebinding`)
+      }
       const target = bound && binding ? binding : this.config.chatURL
       if (options.forceReload) this.selectedModels.delete(page)
       if (options.forceReload || page.url() !== target) {
@@ -2528,6 +2583,8 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       )
       if (this.setupOperations.get(page)?.size) {
         diagnose("deadline")
+        // The temp-chat control never settled: leave the tab for the user to
+        // inspect and throw. The next turn re-checks the page on arrival.
         throw new Error("AIPass temporary-chat setup did not settle before its deadline")
       }
       console.error(`aipass temp chat state=${tempChat}`)
@@ -2549,7 +2606,14 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
 
       let primingEstimate = 0
       const startupIdentity = JSON.stringify([modelSignature, input.promptContractVersion, input.primingPrompts])
-      if (input.primingPrompts.length && (carriesEnvelope || !reusableSelection || this.primedContexts.get(page) !== startupIdentity)) {
+      // Startup priming is once per page: the primedContexts identity proves
+      // this page already ran these exact startup turns. Re-prime only when
+      // the identity changed (new page, model switch, changed instructions)
+      // or the envelope forces a fresh contract (recovery/compaction). In
+      // particular a kept-open tab after cancel never re-primes: its identity
+      // still matches.
+      const primedIdentity = this.primedContexts.get(page)
+      if (input.primingPrompts.length && (carriesEnvelope || !reusableSelection || primedIdentity !== startupIdentity)) {
         this.primedContexts.delete(page)
         for (const [index, primingPrompt] of input.primingPrompts.entries()) {
           console.error(
@@ -2799,7 +2863,11 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
       completed = true
     } catch (error) {
       onFailure(error)
-      if (page && (signal?.aborted || error instanceof BrowserTurnAbortedError)) this.retire(input.sessionMarker, page)
+      // Tabs stay open on cancel/failure: the user owns the Chrome window and
+      // decides when to close tabs. Stale-context safety comes from the
+      // durable binding + prompt-contract check on the next turn, which
+      // replays startup when the contract changed, plus the same-hash
+      // fail-closed pending-attempt check for ambiguous submissions.
       try {
         if (page && !signal?.aborted) await captureStepScreenshot(page, this.config.screenshotDir, "failed")
         if (attempt && !completed)
@@ -2809,7 +2877,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
             definitive: error instanceof NoResponseEvidenceError,
           })
       } finally {
-        if (page && !(error instanceof NoResponseEvidenceError)) this.retire(input.sessionMarker, page)
+        if (page && error instanceof NoResponseEvidenceError) this.retire(input.sessionMarker, page)
       }
       throw error
     } finally {
@@ -2819,7 +2887,9 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
           if (capture) await abortable(capture.cleanup(), signal)
         } catch (error) {
           diagnose(signal?.aborted ? "cancelled" : "failed")
-          if (page) this.retire(input.sessionMarker, page)
+          // Keep the tab even here: capture cleanup failing must not destroy
+          // user-visible context. Surface the error; the next turn re-checks
+          // the binding and contract before reusing the page.
           throw error
         }
       } finally {

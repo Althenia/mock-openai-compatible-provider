@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { createRequestHandler, type BrowserService } from "./server.ts"
 import type { ProjectedTurn } from "./http.ts"
 import type { BrowserFrame } from "./protocol.ts"
-import { NoResponseEvidenceError } from "./browser.ts"
+import { NoResponseEvidenceError, WebchatSafetyBlockError } from "./browser.ts"
 
 interface ChatCompletionBody {
   readonly object: string
@@ -441,5 +441,40 @@ describe("Bun HTTP boundary", () => {
     )
     expect(responses.status).toBe(422)
     expect(await responses.json()).toEqual(expected)
+  })
+
+  test("returns a non-retryable error for webchat safety-filter blocks", async () => {
+    const token = "a".repeat(64)
+    const blocked: BrowserService = {
+      async *turn() {
+        throw new WebchatSafetyBlockError()
+      },
+      async login() {},
+      async close() {},
+    }
+    const handler = createRequestHandler({ token, browser: blocked, shutdown: async () => undefined })
+    const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" }
+    const expected = {
+      error: {
+        message: "webchat safety filter blocked the response; revise the prompt and retry explicitly",
+        type: "browser_error",
+        param: null,
+        code: "webchat_safety_block",
+      },
+    }
+    for (const path of ["/v1/chat/completions", "/v1/responses"]) {
+      const body = path === "/v1/chat/completions"
+        ? { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] }
+        : { model: "gpt-5.6-terra", input: "hello" }
+      const response = await handler(
+        new Request(`http://127.0.0.1${path}`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        }),
+      )
+      expect(response.status).toBe(422)
+      expect(await response.json()).toEqual(expected)
+    }
   })
 })

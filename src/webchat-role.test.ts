@@ -13,7 +13,8 @@ const fileTool = {
 }
 
 function expectChatOnlyRole(prompt: string) {
-  expect(prompt).toContain("You are the agent backend. Reason, plan, choose actions, and answer using supplied user, agent, and workspace instructions.")
+  expect(prompt).toContain("You are a text-generation assistant working only as the backend.")
+  expect(prompt).toContain("Generate text to assist the client, which does the actual work")
   expect(prompt).toContain("Answer from context or request an offered client action, not manual user work.")
   expect(prompt).toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
   expect(prompt).toContain("The client handles permissions, executes actions, and returns results; requests are not approval or success.")
@@ -29,11 +30,11 @@ function expectChatOnlyRole(prompt: string) {
 function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = []) {
   expect(primingPrompts).toHaveLength(instructions.length + 1)
   expectChatOnlyRole(primingPrompts[0]!)
-  expect(primingPrompts[0]!).toStartWith("You are the agent backend.")
+  expect(primingPrompts[0]!).toStartWith("You are a text-generation assistant working only as the backend.")
   for (const [index, instruction] of instructions.entries()) {
     const prompt = primingPrompts[index + 1]!
     expect(prompt).toContain(instruction)
-    expect(prompt).not.toContain("You are the agent backend.")
+    expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
   }
   for (const prompt of primingPrompts)
     expect(prompt).toEndWith("Startup instruction only. No task or turn key yet. Acknowledge briefly with READY, then wait for the next submission. Do not request actions during startup.")
@@ -41,7 +42,7 @@ function expectStartup(primingPrompts: readonly string[], instructions: readonly
 
 function expectTaskPromptsExcludeStartup(parsed: { turn: { primingPrompts: readonly string[], initialPrompt: string, incrementalPrompt: string, recoveryPrompt: string } }, instructions: readonly string[] = []) {
   for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-    expect(prompt).not.toContain("You are the agent backend.")
+    expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
     for (const instruction of instructions) expect(prompt).not.toContain(instruction)
   }
 }

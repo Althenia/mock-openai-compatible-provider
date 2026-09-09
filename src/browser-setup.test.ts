@@ -162,7 +162,7 @@ test("native authentication rejects visible login or a missing composer but acce
       }, protocol)
       try {
         const input = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Reply ready." }] }, new Headers()).turn
-        expect(input.primingPrompts[0]).toStartWith("You are the agent backend.")
+        expect(input.primingPrompts[0]).toStartWith("You are a text-generation assistant working only as the backend.")
         const work = (async () => {
           const frames: BrowserFrame[] = []
           // Startup ordering is covered by browser-priming.test.ts; this deadline covers authentication.

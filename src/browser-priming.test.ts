@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { PlaywrightBrowserAdapter, type AttemptLifecycle, type BrowserProtocol } from "./browser.ts"
+import { PlaywrightBrowserAdapter, withTurnKey, type AttemptLifecycle, type BrowserProtocol } from "./browser.ts"
 import { parseCommand } from "./config.ts"
 import { estimateTokens } from "./context.ts"
 import { parseOpenAIChatRequest } from "./http.ts"
@@ -128,15 +128,15 @@ for (const mode of ["preserve", "action-only"] as const) test(`${mode} serial st
       ],
     }, new Headers()).turn
     const turn = { ...input, promptKey: "priming-fixture-key", model: { id: "fixture", name: "Fixture", thinking: [] } }
-    const keyed = (prompt: string) => `TURN KEY: priming-fixture-key\n\n${prompt}`
+    const keyed = (prompt: string) => withTurnKey(prompt, "priming-fixture-key")
     expect(input.primingPrompts).toHaveLength(mode === "preserve" ? 3 : 1)
-    expect(input.primingPrompts[0]).toStartWith("You are the agent backend.")
+    expect(input.primingPrompts[0]).toStartWith("You are a text-generation assistant working only as the backend.")
     if (mode === "preserve") {
       expect(input.primingPrompts[1]).toContain("SYSTEM: " + "Synthetic preserved client instruction.\n".repeat(220))
       expect(input.primingPrompts[2]).toContain("DEVELOPER: AGENT_RULE")
     }
     for (const prompt of [input.initialPrompt, input.incrementalPrompt, input.recoveryPrompt]) {
-      expect(prompt).not.toContain("You are the agent backend.")
+      expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
       expect(prompt).not.toContain("Synthetic preserved client instruction.")
       expect(prompt).not.toContain("DEVELOPER: AGENT_RULE")
       if (mode === "preserve") expect(prompt).toContain("USER: Earlier fixture task.\n\nASSISTANT: Earlier fixture answer.")

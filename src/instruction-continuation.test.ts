@@ -112,7 +112,7 @@ function selectedPrompt(turn: ProjectedTurn, currentDigest: string, currentVersi
 
 function expectStartupInstructions(turn: ProjectedTurn, instructions: readonly string[]) {
   expect(turn.primingPrompts).toHaveLength(instructions.length + 1)
-  expect(turn.primingPrompts[0]).toContain("You are the agent backend.")
+  expect(turn.primingPrompts[0]).toContain("You are a text-generation assistant working only as the backend.")
   for (const [index, instruction] of instructions.entries()) {
     expect(turn.primingPrompts[index + 1]).toContain(instruction)
     expect(turn.primingPrompts[index + 1]).toContain("Acknowledge briefly with READY")
@@ -184,7 +184,7 @@ describe("instruction fidelity is independent of session affinity", () => {
 describe("instruction changes during tool continuations", () => {
   for (const endpoint of ["chat", "responses"] as const) {
     for (const length of [8_000, 8_001, 44_771]) {
-      test(`${endpoint} keeps the full request inline on a current bound continuation (${length} instruction characters)`, () => {
+      test(`${endpoint} keeps the tool delta plus schemas on a current bound continuation (${length} instruction characters)`, () => {
         const head = "INSTRUCTION_HEAD\n"
         const middle = "\n<available_skills>EXACT_CATALOG_MIDDLE</available_skills>\n"
         const tail = "\nINSTRUCTION_TAIL"
@@ -197,7 +197,8 @@ describe("instruction changes during tool continuations", () => {
         const routed = selectedPrompt(turn, turn.actionEnvelopeDigest)
         expect(routed.current).toBe(true)
         expectStartupInstructions(turn, endpoint === "chat" ? [instructions, "Use only installed skill IDs."] : [instructions])
-        for (const prompt of [turn.initialPrompt, routed.prompt, turn.recoveryPrompt]) {
+        // First-turn shape still carries the full request inline.
+        for (const prompt of [turn.initialPrompt, turn.recoveryPrompt]) {
           expect(prompt).not.toContain(instructions)
           expect(prompt).not.toContain("Use only installed skill IDs.")
           expect(prompt).toContain(originalRequest)
@@ -208,6 +209,15 @@ describe("instruction changes during tool continuations", () => {
           expect(prompt).toContain('"name":"skill"')
           expect(prompt).not.toContain("Apply every stored CLIENT INSTRUCTIONS part")
         }
+        // Bound routing is delta-only: schemas plus the latest result, with
+        // the full chain living in the remote chat history instead.
+        expect(routed.prompt).not.toContain(instructions)
+        expect(routed.prompt).not.toContain("Use only installed skill IDs.")
+        expect(routed.prompt).not.toContain(originalRequest)
+        expect(routed.prompt).not.toContain('TOOL CALL call_skill skill: {"id":"fixture"}')
+        expect(routed.prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
+        expect(routed.prompt).toContain('"name":"skill"')
+        expect(routed.prompt).not.toContain("Apply every stored CLIENT INSTRUCTIONS part")
       })
     }
 
@@ -255,7 +265,7 @@ describe("instruction changes during tool continuations", () => {
     expect(routed.prompt).toContain(toolResult)
   })
 
-  test("schema-only provision growth retains routing without dropping either call/result pair", () => {
+  test("schema-only provision growth retains routing with delta plus both schemas", () => {
     const request = "Use the installed skill fixture."
     const before = chatTurn("<available_skills>CATALOG</available_skills>", { tools: [skill(), read()], request })
     const provisionGrowth = chatTurn("<available_skills>CATALOG</available_skills>", {
@@ -266,10 +276,13 @@ describe("instruction changes during tool continuations", () => {
     expect(provisionRoute.current).toBe(true)
     expect(provisionRoute.prompt).toBe(provisionGrowth.incrementalPrompt)
     expectStartupInstructions(provisionGrowth, ["<available_skills>CATALOG</available_skills>", "Use only installed skill IDs."])
-    for (const text of [request,
-      'TOOL CALL call_read read: {"path":"fixture-alpha.txt"}', "TOOL RESULT call_read: fixture alpha",
-      'TOOL CALL call_skill skill: {"id":"fixture"}', `TOOL RESULT call_skill: ${toolResult}`,
+    // Delta-only: latest result plus both current schemas; the earlier
+    // call/result chain stays in remote history instead of being replayed.
+    for (const text of [`TOOL RESULT call_skill: ${toolResult}`,
       '"name":"read"', '"name":"skill"']) expect(provisionRoute.prompt).toContain(text)
+    expect(provisionRoute.prompt).not.toContain(request)
+    expect(provisionRoute.prompt).not.toContain('TOOL CALL call_read read: {"path":"fixture-alpha.txt"}')
+    expect(provisionRoute.prompt).not.toContain('TOOL CALL call_skill skill: {"id":"fixture"}')
   })
 
   test("ordinary changed selected schemas invalidate", () => {

@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto"
 
 import {
   AuthenticationRequiredError,
+  isWebchatSafetyBlock,
   NoResponseEvidenceError,
   PlaywrightBrowserAdapter,
+  WebchatSafetyBlockError,
   loginWithSystemChrome,
   promptContractCurrent,
   sameOrigin,
@@ -479,6 +481,9 @@ export class StandaloneBrowserService implements BrowserService {
         let progressed = false
         const validate = async (frames: BrowserFrame[], projected: ProjectedTurn) => {
           try {
+            // Safety-filter blocks never enter the repair net: fail the turn
+            // instead of re-submitting a prompt the filter already rejected.
+            if (isWebchatSafetyBlock(responseText(frames))) throw new WebchatSafetyBlockError()
             if (isEnvelopeKeyMismatch(frames, projected.promptKey))
               throw new Error(`browser response TURN KEY mismatch${progressed ? " after reasoning progress" : ""}`)
             // Validate a copy of the terminal chain, but publish the original
@@ -758,6 +763,15 @@ export async function* repairToolRefusal(
   }
   // Typed actions already belong to the envelope validator. Their nested
   // calls and input strings are neither legacy calls nor access refusals.
+  const bufferedText = responseText(buffered)
+  // Safety-filter blocks never repair: the filter rejected the prompt, so a
+  // re-submit would burn quota for the same block. Yield the text so the
+  // caller surfaces it as a failure.
+  if (isWebchatSafetyBlock(bufferedText) || isWebchatSafetyBlock(sample)) {
+    console.error(`aipass turn repair skipped reason=safety-block sampleChars=${sample.length}`)
+    yield* buffered
+    return
+  }
   const typedAction = extractJsonObjects(responseText(buffered)).some((value) => {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return false
     const type = (value as Record<string, unknown>).type

@@ -277,7 +277,7 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
       expect(tasks[2]!.actions).toEqual(["fill", "send"])
       for (const index of [0, 4, 9, 13, 17]) {
         expect(submissions[index]!.actions.slice(-3)).toEqual(["closed", "fill", "send"])
-        expect(submissions[index]!.prompt).toStartWith("You are the agent backend.")
+        expect(submissions[index]!.prompt).toStartWith("You are a text-generation assistant working only as the backend.")
         expect(submissions[index + 1]!.prompt).toStartWith("SYSTEM: USER_RULE")
         expect(submissions[index + 2]!.prompt).toStartWith("DEVELOPER: AGENT_RULE")
       }

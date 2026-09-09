@@ -9,7 +9,7 @@ import {
   type OpenAIChatResult,
 } from "./protocol.ts"
 import { MODELS } from "./config.ts"
-import { NoResponseEvidenceError } from "./browser.ts"
+import { NoResponseEvidenceError, WebchatSafetyBlockError } from "./browser.ts"
 
 export interface BrowserService {
   turn(input: ProjectedTurn, signal?: AbortSignal): AsyncIterable<BrowserFrame>
@@ -33,6 +33,13 @@ function apiError(message: string, status: number, code: string, type = "invalid
 }
 
 function browserError(error: unknown) {
+  if (error instanceof WebchatSafetyBlockError)
+    return apiError(
+      "webchat safety filter blocked the response; revise the prompt and retry explicitly",
+      422,
+      "webchat_safety_block",
+      "browser_error",
+    )
   if (error instanceof NoResponseEvidenceError)
     return apiError(
       "browser submission produced activity but no recognizable assistant response",

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { BrowserResponse, type BrowserProtocol, type BrowserTurnInput } from "./browser.ts"
 import { estimateTokens } from "./context.ts"
 import { parseOpenAIChatRequest } from "./http.ts"
-import { collectOpenAIChatResult, envelopesMatchTurnKey, hasTerminalEnvelope, hasThinkingOnlyEnvelope, StreamFrameParser, TypedEnvelopeShim, type BrowserFrame } from "./protocol.ts"
+import { collectOpenAIChatResult, envelopesMatchTurnKey, hasTerminalEnvelope, hasThinkingOnlyEnvelope, repairMalformedTextEnvelope, StreamFrameParser, TypedEnvelopeShim, type BrowserFrame } from "./protocol.ts"
 import { StandaloneBrowserService } from "./runtime.ts"
 import { createRequestHandler } from "./server.ts"
 
@@ -184,6 +184,32 @@ describe("echoed turn-key response routing", () => {
       }
     }
     expect(submissions).toBe(1)
+  })
+
+  test("salvages a chat envelope whose text contains unescaped quotes", async () => {
+    // Live evidence: a rating answer containing "Version 1" broke JSON.parse,
+    // so the raw envelope leaked to the client as chat text.
+    const malformed = `{"type":"chat","key":"${key}","id":"answer_1","text":"Rating: 9/10. Notes "Version 1" limits."}`
+    expect(() => JSON.parse(malformed)).toThrow()
+    const repaired = repairMalformedTextEnvelope(malformed)
+    expect(repaired).toBeDefined()
+    expect(JSON.parse(repaired!).text).toBe('Rating: 9/10. Notes "Version 1" limits.')
+    const shim = new TypedEnvelopeShim(offered)
+    const frames = [...malformed].flatMap(chunk => shim.push(chunk))
+    frames.push(...shim.finish())
+    expect(frames).toEqual([{ type: "text", delta: 'Rating: 9/10. Notes "Version 1" limits.' }])
+    const result = await collectOpenAIChatResult([{ type: "text", delta: malformed }, { type: "finish", reason: "stop" }], offered)
+    expect(result.text).toBe('Rating: 9/10. Notes "Version 1" limits.')
+  })
+
+  test("malformed-envelope repair stays narrow", () => {
+    // Valid envelopes bypass repair (undefined); tool envelopes never repair.
+    expect(repairMalformedTextEnvelope(JSON.stringify({ type: "chat", key, id: "a", text: "plain ok" }))).toBeUndefined()
+    expect(repairMalformedTextEnvelope(JSON.stringify({ type: "tool", name: "read", input: {} }))).toBeUndefined()
+    expect(repairMalformedTextEnvelope("not json")).toBeUndefined()
+    expect(repairMalformedTextEnvelope(JSON.stringify({ type: "chat", key, id: "a", text: "" }))).toBeUndefined()
+    const thinking = `{"type":"thinking","key":"${key}","id":"t","text":"Thought "quoted" here"}`
+    expect(JSON.parse(repairMalformedTextEnvelope(thinking)!).text).toBe('Thought "quoted" here')
   })
 
   test("runtime rejects a mismatched echoed key without exposing a tool call", async () => {

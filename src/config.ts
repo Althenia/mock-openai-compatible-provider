@@ -155,7 +155,11 @@ export function parseCommand(
     navigationTimeoutMs: positiveInteger(environment.AIPASS_NAVIGATION_TIMEOUT_MS, 90_000),
     streamIdleTimeoutMs: positiveInteger(environment.AIPASS_STREAM_IDLE_TIMEOUT_MS, 120_000),
     streamURLPattern: environment.AIPASS_STREAM_URL_PATTERN?.trim() || undefined,
-    browserHeaded: /^(1|true|yes|on)$/i.test(environment.AIPASS_BROWSER_HEADED?.trim() ?? ""),
+    // Headed by default: the user owns the Chrome window, watches turns live,
+    // and closes tabs themselves. Set AIPASS_BROWSER_HEADED=0 to run headless.
+    browserHeaded: /^(0|false|no|off)$/i.test(environment.AIPASS_BROWSER_HEADED?.trim() ?? "")
+      ? false
+      : true,
     screenshotDir: environment.AIPASS_SCREENSHOT_DIR?.trim() || undefined,
   }
   if (command === "start" || command === "serve") return { type: "serve", settings }
