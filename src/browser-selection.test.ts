@@ -24,7 +24,7 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
     if (path === "/submit") {
       const body = await request.json() as { messages: { parts: { text: string }[] }[] }
       const prompt = body.messages[0]!.parts[0]!.text
-      if (!prompt.startsWith("TURN KEY:")) {
+      if (prompt.includes("Initialization submission only.")) {
         startups++
         startupPrompts.push(prompt)
         return new Response(wire({ type: "text", delta: "READY" }) + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } })
@@ -52,7 +52,7 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
       <script>
         document.querySelector('#send').onclick = async () => {
           const response = await fetch(new Request('/submit', { method: 'POST', body: JSON.stringify({ messages: [{ parts: [{ type: 'text', text: document.querySelector('#prompt').value }] }] }) }));
-          if (!document.querySelector('#prompt').value.startsWith('TURN KEY:')) {
+          if (document.querySelector('#prompt').value.includes('Initialization submission only.')) {
             await response.text();
             const article = document.createElement('article'); article.dataset.role = 'assistant';
             article.innerHTML = '<p>READY</p><button aria-label="Like"><svg viewBox="0 0 21 20"><path d="M4.75 5.75H2.75" /></svg></button><button aria-label="Dislike"><svg viewBox="0 0 21 20"><path d="M16.1898 12.75H18.1898" /></svg></button>';
@@ -96,10 +96,13 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
     const frames: BrowserFrame[] = []
     for await (const frame of adapter.turn({ ...input, promptKey: "fixture-key", model: { id: "fixture", name: "Fixture", thinking: [] } }, AbortSignal.timeout(15_000))) frames.push(frame)
     expect(frames).toEqual([
-      { type: "reasoning", delta: "selected thought" }, { type: "text", delta: tool }, { type: "finish", reason: "stop" },
+      { type: "text", delta: tool }, { type: "reasoning", delta: "selected thought" }, { type: "finish", reason: "stop" },
     ])
     expect(startups).toBe(input.primingPrompts.length)
-    expect(startupPrompts).toEqual([...input.primingPrompts])
+    for (const [index, prompt] of startupPrompts.entries()) {
+      expect(prompt).toMatch(/^TURN KEY: [^\n]+\n\n/)
+      expect(prompt).toEndWith(input.primingPrompts[index]!)
+    }
     expect(startupPrompts.join("\n")).toContain('"inputSchema"')
     expect(taskPrompt).not.toContain('"inputSchema"')
     expect(taskPrompt).not.toContain("fixture schema")

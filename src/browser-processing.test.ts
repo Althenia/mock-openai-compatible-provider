@@ -255,12 +255,12 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
     expect(navigations).toBe(1)
     if (failure) expect(submissions).toEqual([])
     else {
-      expect(submissions.map(({ selected }) => selected)).toEqual(cases.flatMap(([index, reasoning], turn) => Array(turn === 2 ? 1 : 4).fill(`${index}:${reasoning}`)))
+      expect(submissions.map(({ selected }) => selected)).toEqual(cases.flatMap(([index, reasoning], turn) => Array(turn === 2 ? 1 : 2).fill(`${index}:${reasoning}`)))
       for (const observation of submissions) {
         expect(observation.pickerClosed).toBe(true)
         expect(observation.filledWhileOpen).toBe(false)
       }
-      const tasks = submissions.filter(({ prompt }) => prompt.startsWith("TURN KEY:"))
+      const tasks = submissions.filter(({ prompt }) => prompt.startsWith("TURN KEY: processing-fixture-key\n"))
       expect(tasks).toHaveLength(cases.length)
       for (const [taskIndex, observation] of tasks.entries()) {
         expect(observation.prompt).toStartWith("TURN KEY: processing-fixture-key\n\n")
@@ -279,11 +279,15 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
         expect(observation.prompt).not.toContain("DEVELOPER: AGENT_RULE")
       }
       expect(tasks[2]!.actions).toEqual(["fill", "send"])
-      for (const index of [0, 4, 9, 13, 17]) {
+      for (const index of [0, 2, 5, 7, 9]) {
         expect(submissions[index]!.actions.slice(-3)).toEqual(["closed", "fill", "send"])
-        expect(submissions[index]!.prompt).toStartWith("You are a text-generation assistant working only as the backend.")
-        expect(submissions[index + 1]!.prompt).toStartWith("SYSTEM: USER_RULE")
-        expect(submissions[index + 2]!.prompt).toStartWith("DEVELOPER: AGENT_RULE")
+        const initialization = submissions[index]!.prompt
+        expect(initialization).toMatch(/^TURN KEY: [^\n]+\n\n/)
+        expect(initialization).toContain("Initialization submission only.")
+        expect(initialization).toContain("You are a text-generation assistant working only as the backend.")
+        expect(initialization).toContain("SYSTEM: USER_RULE")
+        expect(initialization).toContain("DEVELOPER: AGENT_RULE")
+        expect(initialization.indexOf("SYSTEM: USER_RULE")).toBeLessThan(initialization.indexOf("DEVELOPER: AGENT_RULE"))
       }
     }
   } finally {

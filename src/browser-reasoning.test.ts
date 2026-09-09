@@ -23,7 +23,7 @@ for (const scenario of ["selected", "unselected", "cancel", "late-dom", "late-do
     const path = new URL(request.url).pathname
     if (path === "/submit") {
       const prompt = await request.text()
-      if (!prompt.startsWith("TURN KEY:") && prompt !== "unrelated") {
+      if (prompt.includes("Initialization submission only.")) {
         return new Response(`data: ${JSON.stringify({ type: "text", delta: "READY" })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
       }
       key = /^TURN KEY: (.+)/m.exec(prompt)?.[1] ?? ""
@@ -52,8 +52,8 @@ for (const scenario of ["selected", "unselected", "cancel", "late-dom", "late-do
         document.querySelector('#send').onclick = async () => {
           const prompt = document.querySelector('#prompt').value;
           document.querySelector('#send').disabled = false;
-          await (await fetch('/submit', {method:'POST', body:${scenario === "unselected" ? "prompt.startsWith('TURN KEY:') ? 'unrelated' : prompt" : "prompt"}})).text();
-          if (!prompt.startsWith('TURN KEY:')) {
+          await (await fetch('/submit', {method:'POST', body:${scenario === "unselected" ? "prompt.includes('Initialization submission only.') ? prompt : 'unrelated'" : "prompt"}})).text();
+          if (prompt.includes('Initialization submission only.')) {
             const article = document.createElement('article'); article.dataset.role = 'assistant';
             article.textContent = 'READY';
             for (const [label, path] of [['Like', 'M4.75 5.75H2.75'], ['Dislike', 'M16.1898 12.75H18.1898']]) {
@@ -211,7 +211,7 @@ test("a completed thinking-only webchat message waits for the later tool reply",
     async fetch(request) {
       if (request.method === "POST") {
         const prompt = await request.text()
-        if (new URL(request.url).pathname === "/submit" && !prompt.startsWith("TURN KEY:")) {
+        if (new URL(request.url).pathname === "/submit" && prompt.includes("Initialization submission only.")) {
           return new Response(`data: ${JSON.stringify({ type: "text", delta: "READY" })}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
         }
         const final = new URL(request.url).pathname === "/final"
@@ -228,7 +228,7 @@ test("a completed thinking-only webchat message waits for the later tool reply",
             const prompt = document.querySelector('#prompt').value;
             document.querySelector('#send').disabled = true;
             await (await fetch('/submit', {method:'POST', body:prompt})).text();
-            if (!prompt.startsWith('TURN KEY:')) {
+            if (prompt.includes('Initialization submission only.')) {
               const article = document.createElement('article'); article.dataset.role = 'assistant'; article.textContent = 'READY';
               for (const [label, path] of [['Like', 'M4.75 5.75H2.75'], ['Dislike', 'M16.1898 12.75H18.1898']]) {
                 const button = document.createElement('button'); button.setAttribute('aria-label', label);
