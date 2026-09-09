@@ -5,10 +5,11 @@ import { basename, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { chromium, errors, type BrowserContext, type Locator, type Page } from "playwright-core"
 import { estimateTokens } from "./context.ts"
-import { runSerialStartup } from "./browser-turn-flow.ts"
+import { runSerialStartup, withTurnKey } from "./browser-turn-flow.ts"
+export { withTurnKey } from "./browser-turn-flow.ts"
 import { browserControlState } from "./browser-diagnostics.ts"
 import { THINKING_LABELS } from "./model-catalog.ts"
-import { EVERY_TURN_ENVELOPE_GUARD, estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
+import { estimateCapturedTextTokens, hasTerminalEnvelope, hasThinkingOnlyEnvelope, type BrowserFrame } from "./protocol.ts"
 
 export type ReasoningLevel = "none" | "low" | "medium" | "high" | "max"
 
@@ -469,14 +470,6 @@ export async function captureStepScreenshot(
   }
 }
 
-export function withTurnKey(prompt: string, promptKey?: string): string {
-  // Submit-time injection: the guard rides every fill regardless of bound /
-  // incremental / repair / provision routing, so headed debugging shows it.
-  const guarded = prompt.startsWith(EVERY_TURN_ENVELOPE_GUARD) ? prompt : `${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`
-  if (!promptKey) return guarded
-  return `TURN KEY: ${promptKey}\n\n${guarded}`
-}
-
 export function promptContractCurrent(
   expectedVersion: number,
   expectedDigest: string,
@@ -559,6 +552,8 @@ export class BrowserResponse<Frame extends BrowserFrame> {
   private completed = false
   private domThinking = ""
   private domTurnKey: string | undefined
+  private drainedFrames = 0
+  private drainedText = ""
   outputEstimate = 0
 
   constructor(private readonly protocol: BrowserProtocol<Frame>) {}
@@ -585,6 +580,18 @@ export class BrowserResponse<Frame extends BrowserFrame> {
     }
     if (!stream.finished) this.append(stream.decoder.push(chunk), stream)
     return []
+  }
+
+  drainCapturedText(): readonly Frame[] {
+    if (this.completed) return []
+    const output: Frame[] = []
+    for (const frame of this.frames.slice(this.drainedFrames)) {
+      if (frame.type !== "text") continue
+      this.drainedText += frame.delta
+      output.push(frame)
+    }
+    this.drainedFrames = this.frames.length
+    return output
   }
 
   finish(responseID = 0, deferDomThinking = false): readonly Frame[] {
@@ -677,6 +684,8 @@ export class BrowserResponse<Frame extends BrowserFrame> {
   }
 
   private publish(frames: Frame[]): readonly Frame[] {
+    if (this.drainedText && !frames.map(frame => frame.type === "text" ? frame.delta : "").join("").startsWith(this.drainedText))
+      throw new Error("browser response changed after progressive capture")
     this.completed = true
     if (this.domTurnKey) frames = frames.filter((frame) => frame.type !== "reasoning" || frame.domTurnKey === this.domTurnKey)
     let text = ""
@@ -686,7 +695,13 @@ export class BrowserResponse<Frame extends BrowserFrame> {
       else if (frame.type === "tool-call") this.outputEstimate += estimateTokens(JSON.stringify(frame.input))
     }
     if (this.domTurnKey) this.outputEstimate += estimateCapturedTextTokens(text)
-    return frames
+    let consumed = this.drainedText.length
+    return frames.flatMap(frame => {
+      if (frame.type !== "text" || consumed === 0) return [frame]
+      const delta = frame.delta.slice(consumed)
+      consumed = Math.max(0, consumed - frame.delta.length)
+      return delta ? [this.protocol.text(delta)] : []
+    })
   }
 }
 
@@ -2493,7 +2508,10 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
     let stage = "session-setup"
     let stageStarted = performance.now()
     let diagnosed = false
-    const mark = (value: string) => { stage = value; stageStarted = performance.now() }
+    const mark = (value: string) => {
+      stage = value
+      stageStarted = performance.now()
+    }
     const diagnose = (reason: "cancelled" | "deadline" | "failed") => {
       if (diagnosed) return
       diagnosed = true
@@ -2831,6 +2849,7 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         if (event.type === "chunk") {
           framesObserved = true
           response.push(event.chunk, event.responseID)
+          yield* response.drainCapturedText()
           continue
         }
         yield* await readProgress()

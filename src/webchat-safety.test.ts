@@ -85,7 +85,7 @@ for (const phase of ["initial", "wrong-key", "repair", "provision"] as const) {
 }
 
 for (const path of ["/v1/chat/completions", "/v1/responses"]) {
-  for (const progressed of [false, true]) test(`${path} exposes a structured guardrail failure ${progressed ? "after reasoning" : "before streaming"}`, async () => {
+  for (const progressed of [false, true]) test(`${path} exposes a structured guardrail failure ${progressed ? "after reasoning" : "before the first backend frame"}`, async () => {
     const token = "a".repeat(64)
     let submissions = 0
     const handler = createRequestHandler({
@@ -105,9 +105,11 @@ for (const path of ["/v1/chat/completions", "/v1/responses"]) {
         ...(path === "/v1/responses" ? { input: "Hello" } : { messages: [{ role: "user", content: "Hello" }] }),
       }),
     }))
-    expect(response.status).toBe(progressed ? 200 : 422)
+    expect(response.status).toBe(200)
     const body = await response.text()
     expect(body).toContain('"code":"webchat_safety_block"')
+    expect(body).toContain(path === "/v1/responses" ? "event: error" : '"error":{')
+    expect(body).not.toContain("[DONE]")
     expect(body).not.toContain("response.completed")
     expect(body).not.toContain('"finish_reason":"stop"')
     if (progressed) expect(body).toContain("Visible reasoning.")

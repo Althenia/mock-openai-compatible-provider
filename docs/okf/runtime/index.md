@@ -1,7 +1,7 @@
 # Interface
 
 * [Model catalog](model-catalog.md) - TypeScript-mastered provider model IDs with Processing variants, parity-tested against the review matrix.
-* [Request session contract](request-session-contract.md) - Authenticated loopback endpoints, session binding headers, and single-use stored Responses continuations.
+* [Request session contract](request-session-contract.md) - Authenticated OpenAI-compatible endpoints, session routing, retained Responses continuations, and streaming failure semantics.
 
 # Workflow
 

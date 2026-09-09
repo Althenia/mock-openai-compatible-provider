@@ -1,3 +1,5 @@
+import { EVERY_TURN_ENVELOPE_GUARD } from "./protocol.ts"
+
 export type SerialStartupOptions = {
   readonly primingPrompts: readonly string[]
   readonly startupIdentity: string
@@ -17,7 +19,14 @@ export async function runSerialStartup(options: SerialStartupOptions): Promise<n
   if (!required) return 0
   options.reset()
   let estimate = 0
-  for (const [index, prompt] of options.primingPrompts.entries()) estimate += await options.prime(prompt, index)
+  for (const [index, prompt] of options.primingPrompts.entries()) {
+    estimate += await options.prime(withTurnKey(prompt, crypto.randomUUID()), index)
+  }
   options.commit(options.startupIdentity)
   return estimate
+}
+export function withTurnKey(prompt: string, promptKey?: string): string {
+  const guarded = prompt.startsWith(EVERY_TURN_ENVELOPE_GUARD) ? prompt : `${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`
+  if (!promptKey) return guarded
+  return `TURN KEY: ${promptKey}\n\n${guarded}`
 }

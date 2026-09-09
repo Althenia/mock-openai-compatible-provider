@@ -119,7 +119,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 23
+export const PROMPT_CONTRACT_VERSION = 24
 // Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
 export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
 const MAX_TOOL_FRAME = 64 * 1024

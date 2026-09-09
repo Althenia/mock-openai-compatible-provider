@@ -2,6 +2,7 @@ import { expect, mock, test } from "bun:test"
 import { runSerialStartup } from "./browser-turn-flow.ts"
 import { estimateTokens } from "./context.ts"
 import { parseOpenAIChatRequest } from "./http.ts"
+import { EVERY_TURN_ENVELOPE_GUARD } from "./protocol.ts"
 
 const messages = [
   { role: "system", content: "Synthetic preserved client instruction.\n".repeat(220) },
@@ -19,12 +20,16 @@ function turn(mode: "preserve" | "action-only", nextMessages = messages) {
 
 for (const mode of ["preserve", "action-only"] as const) test(`${mode} projects serial startup separately from full caller history`, () => {
   const input = turn(mode)
-  expect(input.primingPrompts).toHaveLength(mode === "preserve" ? 3 : 1)
+  expect(input.primingPrompts).toHaveLength(1)
   expect(input.primingPrompts[0]).toStartWith("You are a text-generation assistant working only as the backend.")
   expect(input.primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
   if (mode === "preserve") {
-    expect(input.primingPrompts[1]).toContain("SYSTEM: " + "Synthetic preserved client instruction.\n".repeat(220))
-    expect(input.primingPrompts[2]).toContain("DEVELOPER: AGENT_RULE")
+    expect(input.primingPrompts[0]).toContain("SYSTEM: " + "Synthetic preserved client instruction.\n".repeat(220))
+    expect(input.primingPrompts[0]).toContain("DEVELOPER: AGENT_RULE")
+    expect(input.primingPrompts[0]!.indexOf("SYSTEM:")).toBeLessThan(input.primingPrompts[0]!.indexOf("DEVELOPER:"))
+  } else {
+    expect(input.primingPrompts[0]).not.toContain("Synthetic preserved client instruction.")
+    expect(input.primingPrompts[0]).not.toContain("DEVELOPER: AGENT_RULE")
   }
   for (const prompt of [input.initialPrompt, input.recoveryPrompt]) {
     expect(prompt).toContain("USER: Earlier fixture task.\n\nASSISTANT: Earlier fixture answer.\n\nUSER: Reply ready.")
@@ -35,7 +40,7 @@ for (const mode of ["preserve", "action-only"] as const) test(`${mode} projects 
 })
 
 test("serial startup gates each next request and commits identity only after every internal reply", async () => {
-  const input = turn("preserve")
+  const input = { primingPrompts: ["first", "second", "third"] }
   const first = Promise.withResolvers<number>()
   const second = Promise.withResolvers<number>()
   const third = Promise.withResolvers<number>()
@@ -51,17 +56,17 @@ test("serial startup gates each next request and commits identity only after eve
   expect(resets).toHaveBeenCalledTimes(1)
   await Promise.resolve()
   expect(requests).toHaveBeenCalledTimes(1)
-  expect(requests).toHaveBeenLastCalledWith(input.primingPrompts[0], 0)
+  expect(requests).toHaveBeenLastCalledWith(expect.stringContaining(`${EVERY_TURN_ENVELOPE_GUARD}\n\n${input.primingPrompts[0]}`), 0)
   expect(commits).not.toHaveBeenCalled()
   first.resolve(estimateTokens(input.primingPrompts[0]!) + estimateTokens("READY"))
   await Promise.resolve()
   expect(requests).toHaveBeenCalledTimes(2)
-  expect(requests).toHaveBeenLastCalledWith(input.primingPrompts[1], 1)
+  expect(requests).toHaveBeenLastCalledWith(expect.stringContaining(`${EVERY_TURN_ENVELOPE_GUARD}\n\n${input.primingPrompts[1]}`), 1)
   expect(commits).not.toHaveBeenCalled()
   second.resolve(estimateTokens(input.primingPrompts[1]!) + estimateTokens("READY"))
   await Promise.resolve()
   expect(requests).toHaveBeenCalledTimes(3)
-  expect(requests).toHaveBeenLastCalledWith(input.primingPrompts[2], 2)
+  expect(requests).toHaveBeenLastCalledWith(expect.stringContaining(`${EVERY_TURN_ENVELOPE_GUARD}\n\n${input.primingPrompts[2]}`), 2)
   expect(commits).not.toHaveBeenCalled()
   third.resolve(estimateTokens(input.primingPrompts[2]!) + estimateTokens("READY"))
   await expect(work).resolves.toBe(input.primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt) + estimateTokens("READY"), 0))
@@ -71,7 +76,7 @@ test("serial startup gates each next request and commits identity only after eve
 })
 
 test("startup failure and cancellation short-circuit without committing, then a later recovery re-primes", async () => {
-  const input = turn("preserve")
+  const input = { primingPrompts: ["first", "second", "third"] }
   for (const error of [Error("fixture startup failed"), new DOMException("fixture cancelled", "AbortError")]) {
     const requests = mock(async (_prompt: string, _index: number) => 7)
       .mockResolvedValueOnce(5)
@@ -83,12 +88,12 @@ test("startup failure and cancellation short-circuit without committing, then a 
       prime: requests, reset, commit: commits,
     }
     await expect(runSerialStartup(options)).rejects.toBe(error)
-    expect(requests.mock.calls).toEqual([[input.primingPrompts[0], 0], [input.primingPrompts[1], 1]])
+    expect(requests.mock.calls).toEqual(input.primingPrompts.slice(0, 2).map((prompt, index) => [expect.stringContaining(`${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`), index]))
     expect(reset).toHaveBeenCalledTimes(1)
     expect(commits).not.toHaveBeenCalled()
     requests.mockClear()
     await expect(runSerialStartup({ ...options, primedIdentity: undefined })).resolves.toBe(21)
-    expect(requests.mock.calls).toEqual(input.primingPrompts.map((prompt, index) => [prompt, index]))
+    expect(requests.mock.calls).toEqual(input.primingPrompts.map((prompt, index) => [expect.stringContaining(`${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`), index]))
     expect(reset).toHaveBeenCalledTimes(2)
     expect(commits.mock.calls).toEqual([["fixture"]])
   }
@@ -107,7 +112,7 @@ for (const scenario of [
   const commit = mock((_identity: string) => undefined)
   const options = { ...scenario, primingPrompts: scenario.prompts, startupIdentity: "current", prime, reset, commit }
   await expect(runSerialStartup(options)).resolves.toBe(scenario.expected ? 13 : 0)
-  expect(prime.mock.calls).toEqual(scenario.expected ? [["STARTUP", 0]] : [])
+  expect(prime.mock.calls).toEqual(scenario.expected ? [[expect.stringContaining(`${EVERY_TURN_ENVELOPE_GUARD}\n\nSTARTUP`), 0]] : [])
   expect(reset).toHaveBeenCalledTimes(scenario.expected ? 1 : 0)
   expect(commit.mock.calls).toEqual(scenario.expected ? [["current"]] : [])
   prime.mockClear()

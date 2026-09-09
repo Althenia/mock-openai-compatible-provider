@@ -333,7 +333,10 @@ describe("Bun HTTP boundary", () => {
     const root = (await (await handler(request(false))).json()) as ResponsesBody
     const failed = await handler(request(true, root.id))
     expect(failed.status).toBe(200)
-    await expect(failed.text()).rejects.toThrow("late failure")
+    const failureBody = await failed.text()
+    expect(failureBody).toContain("event: error")
+    expect(failureBody).toContain("late failure")
+    expect(failureBody).not.toContain("response.completed")
     const retry = await handler(request(false, root.id))
     expect(retry.status).toBe(400)
     expect(discarded).toEqual([root.id])

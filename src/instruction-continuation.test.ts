@@ -110,14 +110,21 @@ function selectedPrompt(turn: ProjectedTurn, currentDigest: string, currentVersi
 }
 
 function expectStartupInstructions(turn: ProjectedTurn, instructions: readonly string[]) {
-  expect(turn.primingPrompts).toHaveLength(instructions.length + turn.provisionedActions.length + 1)
-  expect(turn.primingPrompts[0]).toContain("You are a text-generation assistant working only as the backend.")
-  expect(turn.primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
-  for (const [index, instruction] of instructions.entries()) {
-    expect(turn.primingPrompts[index + 1]).toContain(instruction)
-    expect(turn.primingPrompts[index + 1]).not.toContain("READY")
+  expect(turn.primingPrompts).toHaveLength(1)
+  const startup = turn.primingPrompts[0]!
+  expect(startup).toContain("You are a text-generation assistant working only as the backend.")
+  expect(startup.match(/READY/g)).toHaveLength(1)
+  let previous = startup.indexOf("You are a text-generation assistant working only as the backend.")
+  for (const instruction of instructions) {
+    const index = startup.indexOf(instruction)
+    expect(index).toBeGreaterThan(previous)
+    previous = index
   }
-  for (const [index, name] of turn.provisionedActions.entries()) expect(turn.primingPrompts[instructions.length + index + 1]).toContain(`"name":"${name}"`)
+  for (const name of turn.provisionedActions) {
+    const index = startup.indexOf(`"name":"${name}"`)
+    expect(index).toBeGreaterThan(previous)
+    previous = index
+  }
 }
 
 describe("instruction fidelity is independent of session affinity", () => {

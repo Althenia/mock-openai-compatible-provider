@@ -28,22 +28,22 @@ function expectChatOnlyRole(prompt: string) {
 }
 
 function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = [], tools: readonly string[] = []) {
-  expect(primingPrompts).toHaveLength(instructions.length + tools.length + 1)
+  expect(primingPrompts).toHaveLength(1)
   expectChatOnlyRole(primingPrompts[0]!)
   expect(primingPrompts[0]!).toStartWith("You are a text-generation assistant working only as the backend.")
   for (const [index, instruction] of instructions.entries()) {
-    const prompt = primingPrompts[index + 1]!
+    const prompt = primingPrompts[0]!
     expect(prompt).toContain(instruction)
-    expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
+    if (index) expect(prompt.indexOf(instructions[index - 1]!)).toBeLessThan(prompt.indexOf(instruction))
   }
   expect(primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
-  expect(primingPrompts[0]).toContain("Startup ends when a submission begins with TURN KEY.")
-  for (const [index, name] of tools.entries()) {
-    const prompt = primingPrompts[instructions.length + index + 1]!
+  expect(primingPrompts[0]).toContain("Initialization submission only.")
+  expect(primingPrompts[0]!.match(/You are a text-generation assistant/g)).toHaveLength(1)
+  for (const name of tools) {
+    const prompt = primingPrompts[0]!
     expect(prompt).toContain(`"name":"${name}"`)
     expect(prompt).toContain('"inputSchema"')
-    expect(prompt).not.toContain("Action shapes:")
-    expect(prompt).not.toContain("You are a text-generation assistant")
+    for (const instruction of instructions) expect(prompt.indexOf(instruction)).toBeLessThan(prompt.indexOf(`"name":"${name}"`))
   }
 }
 
@@ -110,7 +110,7 @@ describe("webchat role at the request boundary", () => {
               ...(scenario === "no tools" ? {} : { tools: [{ type: "function", ...fileTool }] }),
             }, new Headers())
 
-        expectStartup(parsed.turn.primingPrompts, [], scenario === "no tools" || scenario === "disabled tools" ? [] : ["write"])
+        expectStartup(parsed.turn.primingPrompts, [], scenario === "no tools" ? [] : ["write"])
         expectTaskPromptsExcludeStartup(parsed)
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
           expect(prompt).toContain(request)

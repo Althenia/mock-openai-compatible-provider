@@ -29,14 +29,14 @@ import { estimateTokens } from "./context.ts"
 const temporary: string[] = []
 
 function expectStartupPrompts(primingPrompts: readonly string[], instructions: readonly string[] = [], tools: readonly string[] = []) {
-  expect(primingPrompts).toHaveLength(instructions.length + tools.length + 1)
+  expect(primingPrompts).toHaveLength(1)
   expect(primingPrompts[0]).toContain("You are a text-generation assistant working only as the backend.")
   expect(primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
   for (const [index, instruction] of instructions.entries()) {
-    expect(primingPrompts[index + 1]).toContain(instruction)
-    expect(primingPrompts[index + 1]).not.toContain("READY")
+    expect(primingPrompts[0]).toContain(instruction)
+    if (index) expect(primingPrompts[0]!.indexOf(instructions[index - 1]!)).toBeLessThan(primingPrompts[0]!.indexOf(instruction))
   }
-  for (const [index, name] of tools.entries()) expect(primingPrompts[instructions.length + index + 1]).toContain(`"name":"${name}"`)
+  for (const name of tools) expect(primingPrompts[0]).toContain(`"name":"${name}"`)
 }
 
 afterEach(async () => {
@@ -332,7 +332,7 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.incrementalPrompt).not.toContain("PRIVATE_SYSTEM")
     expect(parsed.turn.incrementalPrompt).not.toContain('"name":"read"')
     expect(parsed.turn.incrementalPrompt).not.toContain("<aipass-action>")
-    expect(parsed.turn.promptContractVersion).toBe(23)
+    expect(parsed.turn.promptContractVersion).toBe(24)
     expect(parsed.turn.actionEnvelopeDigest).toMatch(/^[a-f0-9]{64}$/)
     expect(parsed.turn.toolContinuation).toBe(false)
     expect(parsed.turn.recoveryPrompt).not.toContain("PRIVATE_SYSTEM")
@@ -985,7 +985,7 @@ describe("authenticated OpenAI request boundary", () => {
     expectStartupPrompts(parsed.turn.primingPrompts, [], ["read", "question"])
   })
 
-  test("a bulky question schema is preserved in its own startup block", () => {
+  test("a bulky question schema is preserved in the combined initialization", () => {
     const bulky = (name: string) => ({
       type: "function",
       function: {
@@ -1025,8 +1025,9 @@ describe("authenticated OpenAI request boundary", () => {
     )
     expect(parsed.projectedActions).toEqual(["read", "question"])
     expect(parsed.turn.provisionedActions).toEqual(["read", "question"])
-    expect(parsed.turn.primingPrompts[2]).toContain('"name":"question"')
-    expect(parsed.turn.primingPrompts[2]).toContain(tools[1]!.function.description)
+    expect(parsed.turn.primingPrompts).toHaveLength(1)
+    expect(parsed.turn.primingPrompts[0]).toContain('"name":"question"')
+    expect(parsed.turn.primingPrompts[0]).toContain(tools[1]!.function.description)
     expect(parsed.turn.initialPrompt).not.toContain('"inputSchema"')
   })
 

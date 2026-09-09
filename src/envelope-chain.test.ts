@@ -210,7 +210,7 @@ describe("envelope-chain upgrade", () => {
     expect(shim.finish()).toEqual([{ type: "text", delta: chain }]);
   });
 
-  test("startup supplies every schema separately while task prompts stay compact", () => {
+  test("one startup submission supplies the complete schema catalog while task prompts stay compact", () => {
     const tools = ["read", "glob", "grep", "shell", "write", "edit", "question"].map((name) => ({
       type: "function" as const,
       function: {
@@ -223,10 +223,10 @@ describe("envelope-chain upgrade", () => {
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }], tools },
       new Headers({ "x-session-id": "budgeted-index-session" }),
     );
-    // Schema bodies are isolated startup submissions, never one large task.
-    expect(parsed.turn.primingPrompts).toHaveLength(tools.length + 1);
-    for (const [index, tool] of tools.entries()) {
-      expect(parsed.turn.primingPrompts[index + 1]).toContain(JSON.stringify({
+    // Complete schemas share the one ordered initialization submission, never a task.
+    expect(parsed.turn.primingPrompts).toHaveLength(1);
+    for (const tool of tools) {
+      expect(parsed.turn.primingPrompts[0]).toContain(JSON.stringify({
         name: tool.function.name, description: tool.function.description, inputSchema: tool.function.parameters,
       }));
     }
@@ -259,12 +259,12 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(23);
+    expect(PROMPT_CONTRACT_VERSION).toBe(24);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(23);
+    expect(parsed.turn.promptContractVersion).toBe(24);
   });
 
   test("submit-time fill carries the guard on every turn", () => {

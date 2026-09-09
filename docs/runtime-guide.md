@@ -14,12 +14,14 @@ reliability.
   `prompt_cache_key`, or `user`. Unaffiliated Chat Completions requests are
   stateless. Initial Responses requests receive a new response-ID session;
   `store: false` is ephemeral.
-- Stored Responses retain actual input and emitted output items in process
-  memory. A continuation replays those items before new input, including
-  function-call IDs/results and separately labeled assistant reasoning
-  summaries. Prior top-level `instructions` do not carry forward.
+- Stored Responses retain actual input, emitted output items, and initialization
+  state in process memory. A continuation replays retained items before new
+  input, including function-call IDs/results and separately labeled assistant
+  reasoning summaries. Omitted top-level `instructions` inherit retained
+  initialization; an explicit replacement or empty string updates or clears it.
 - Responses retention is bounded to 1,000 records and 16 MiB of serialized
-  UTF-8 history payloads. It does not write message history to disk.
+  UTF-8 history and retained-initialization payloads. It does not write message
+  history to disk.
 - `previous_response_id` is single-use and cannot be combined with `store: false`.
   Missing, consumed, evicted, oversized, or restarted history returns
   `previous_response_not_found` rather than submitting incomplete history.
@@ -30,17 +32,22 @@ reliability.
 - Same-hash ambiguous submissions fail closed. A recognized webchat safety
   block records a definitive failed attempt rather than an ambiguous pending
   submission. The persistent profile is protected by a PID-identified lock.
-- Recognized webchat safety blocks stop immediately, without automatic retry,
-  repair, or fallback. Before streaming they return HTTP 422 with code
-  `webchat_safety_block`; after reasoning has already streamed, the response
-  ends with a structured SSE error carrying that code, not a successful finish.
+- Admitted and validated streaming requests return HTTP 200 and their standard
+  stream-start record before browser work completes. Authorization, request
+  validation, reservation, and capacity preflight failures remain normal HTTP
+  errors before SSE starts. Browser/auth/safety failures after streaming starts
+  are terminal API-compatible error records, never successful completion records
+  (a nested `error` object for Chat; a typed, sequenced `error` event for Responses);
+  non-streaming requests retain their HTTP error responses. Recognized webchat
+  safety blocks stop immediately, without automatic retry, repair, or fallback.
 
 ## Client action loop
 
 Webchat has no native function-calling API. AIPass supplies offered tool names
-and complete schemas during startup, validates returned envelopes, and converts valid actions
-to OpenAI-compatible calls. Only the calling client executes them and returns
-tool results. MCP actions use their exact offered names through the same path.
+and complete schemas during initialization, validates returned envelopes, and
+converts valid actions to OpenAI-compatible calls. Only the calling client
+executes them and returns tool results. MCP actions use their exact offered
+names through the same path.
 
 ```text
 <aipass-envelope>{"type":"tool","key":"current_turn_key","id":"call_unique","name":"read","input":{"path":"package.json"}}</aipass-envelope>
@@ -66,27 +73,39 @@ retain narrow text recovery; non-strict fallback behavior is unchanged.
 
 ## Prompt contract
 
-For preserve-mode requests, startup uses separate completed webchat turns:
+For both APIs, a new initialization submits one keyed webchat turn containing
+the AIPass role/action protocol and the complete offered tool catalog with full
+schemas. In preserve mode it also carries ordered caller system/developer or
+Responses instructions; action-only intentionally omits those caller
+instructions. Its internal `READY` reply is never emitted as a client answer or
+action. Subsequent task and action-result turns send only the keyed latest
+delta. Per-turn `tool_choice` changes action availability for that turn but does
+not remove the retained initialization catalog. Explicit `tools: []` clears the
+active catalog; omitted tools retain it.
 
-1. Submit the AIPass role/action protocol and startup control instruction once,
-   then wait for its reply internally. The control instruction tells the backend
-   to acknowledge startup blocks with `READY` until a keyed task arrives.
-2. Submit each complete supplied system/developer message as its own turn, in
-   original order, waiting for each reply before proceeding.
-3. Submit each offered tool's full definition in its own startup block. Do not
-   repeat the role/protocol or startup acknowledgment instruction in these blocks.
-4. Submit the conversation in chronological order, including
-   matched tool-call/result text and the latest user task.
+Unchanged bound turns send only the latest task/result delta; recovery, changed
+initialization/contracts, model or reasoning-variant switches, compaction, and
+newly opened pages require initialization again before the task. This relies on
+the webchat retaining initialization context; it is not a guarantee of model
+compliance. Each initialization, task, result, repair, and correction submission
+carries its current `TURN KEY` and the short every-turn envelope guard. Prompt
+projection logs contain only action names and character counts, never prompt
+content.
 
-Startup replies are never emitted as client answers or actions. Unchanged bound
-turns send only the latest task/result delta; recovery, changed instructions/contracts,
-model or reasoning-variant switches, compaction, and newly opened pages replay
-startup before the task. This relies on the webchat retaining startup context;
-it is not a guarantee of model compliance. Tool-schema changes invalidate the
-startup contract even during a tool-result continuation. Each task submission
-still carries its current `TURN KEY`, the every-turn envelope guard, and any
-required/named `tool_choice` constraint. Prompt projection logs contain only action names and character counts,
-never prompt content.
+Streaming clients first receive the standard Chat Completions assistant-role
+chunk or Responses `response.created` and `response.in_progress` events. The
+provider forwards actual assistant output through those APIs, not custom
+provider-status data. Initialization/setup status is not fabricated as model
+reasoning or answer text. The harness continues to own tool dispatch and the
+agent loop; no harness changes are needed to consume the standard stream.
+
+Agent-turn progression preserves whole-response validation: attributed DOM
+reasoning and complete, current-key thinking envelopes can stream while the
+backend turn is still open. Answers and tool calls wait for the entire response
+to pass validation. A later error can terminate already-visible reasoning, but
+it must not publish an invalid answer/action or a successful completion. Raw,
+unattributed reasoning and incomplete or mismatched envelopes are not trusted
+as progressive output.
 
 The webchat backend owns reasoning, planning, action selection, and answers.
 AIPass owns transport and structured-response validation. The calling client
@@ -94,14 +113,17 @@ owns permissions, dispatch, and returned results. User, agent, and workspace
 instructions must be supplied in request system/developer messages (or Responses
 instructions/input messages); AIPass does not infer them or load caller
 workspace files. These are ordinary webchat submissions, not native system-role
-messages; upstream rules remain authoritative. Each startup turn adds latency
-and consumes provider quota.
+messages; upstream rules remain authoritative. Chat bound initialization and
+Responses continuation state are bounded and process-local; after restart or
+eviction callers must supply initialization again. Each initialization adds
+latency and consumes provider quota.
 
 ## Compaction and recovery
 
-Long instruction messages remain intact in their own startup turns without silent truncation. This preserves
-transmitted request content; it does not establish an upstream context limit or
-guarantee that every model uses large requests correctly.
+Long instruction messages remain intact in the combined initialization without
+silent truncation. This preserves transmitted request content; it does not
+establish an upstream context limit or guarantee that every model uses large
+requests correctly.
 
 The caller decides when to compact using its model catalog. The provider keeps a
 conservative website-visible estimate:

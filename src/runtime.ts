@@ -18,7 +18,17 @@ import {
 } from "./browser.ts"
 import { LOOPBACK_HOST, MODELS, model, persistRuntimeConfig, readRuntimeConfig, type Settings } from "./config.ts"
 import type { ProjectedTurn } from "./http.ts"
-import { collectOpenAIChatResult, envelopesMatchTurnKey, isActionEnvelopeType, StreamFrameParser, type BrowserFrame, type FinishReason } from "./protocol.ts"
+import {
+  collectOpenAIChatResult,
+  ENVELOPE_CLOSE,
+  ENVELOPE_OPEN,
+  envelopesMatchTurnKey,
+  isActionEnvelopeType,
+  parseTypedEnvelope,
+  StreamFrameParser,
+  type BrowserFrame,
+  type FinishReason,
+} from "./protocol.ts"
 import { createRequestHandler, type BrowserService } from "./server.ts"
 import { BindingStore, pendingDecision, ProfileLock, readOrCreateToken, type Attempt } from "./state.ts"
 
@@ -208,6 +218,126 @@ function hasAllRequiredKeys(input: unknown, required: readonly string[]): boolea
   if (typeof input !== "object" || input === null || Array.isArray(input)) return false
   const record = input as Record<string, unknown>
   return required.every((key) => key in record)
+}
+
+class KeyedThinkingParser {
+  private text = ""
+  private scanAt = 0
+  private blocked = false
+  private readonly published: string[] = []
+
+  constructor(
+    private readonly expectedKey: string,
+    private readonly offered: ReadonlySet<string>,
+  ) {}
+
+  push(chunk: string): string[] {
+    this.text += chunk
+    if (this.blocked) return []
+    const output: string[] = []
+    const publish: string[] = []
+    let invalid = false
+    while (true) {
+      const open = this.text.indexOf(ENVELOPE_OPEN, this.scanAt)
+      if (open < 0) {
+        this.scanAt = Math.max(0, this.text.length - ENVELOPE_OPEN.length + 1)
+        break
+      }
+      const close = this.text.indexOf(ENVELOPE_CLOSE, open + ENVELOPE_OPEN.length)
+      if (close < 0) {
+        this.scanAt = open
+        break
+      }
+      const end = close + ENVELOPE_CLOSE.length
+      let headerPrefix: string | undefined
+      if (this.published.length === 0) {
+        const prefix = this.text.slice(0, open)
+        const header = /^\s*TURN KEY:[ \t]+(\S+)[ \t]*\r?\n\s*$/.exec(prefix)
+        if (header && header[1] !== this.expectedKey) {
+          this.blocked = true
+          invalid = true
+          break
+        }
+        if (header) headerPrefix = prefix
+      }
+      const body = this.text.slice(open + ENVELOPE_OPEN.length, close)
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body)
+      } catch {
+        this.blocked = true
+        invalid = true
+        break
+      }
+      if (!envelopesMatchTurnKey(this.text.slice(0, end), this.expectedKey) ||
+          typeof parsed !== "object" || parsed === null || Array.isArray(parsed) ||
+          (parsed as Record<string, unknown>).key !== this.expectedKey) {
+        this.blocked = true
+        invalid = true
+        break
+      }
+      let frames: readonly BrowserFrame[]
+      try {
+        frames = parseTypedEnvelope(parsed, this.offered) ?? []
+      } catch {
+        this.blocked = true
+        invalid = true
+        break
+      }
+      if (frames.length === 0) {
+        this.blocked = true
+        invalid = true
+        break
+      }
+      // Thinking is non-terminal and can be shown while the browser turn is
+      // still open. Chat and actions remain transactional until the complete
+      // chain, correlation key, and action inputs have all been validated.
+      if (frames.some((frame) => frame.type !== "reasoning")) {
+        this.blocked = true
+        break
+      }
+      const raw = this.text.slice(open, end)
+      if (headerPrefix) publish.push(headerPrefix)
+      publish.push(raw)
+      output.push(raw)
+      this.scanAt = end
+    }
+    if (invalid) return []
+    this.published.push(...publish)
+    return output
+  }
+
+  withoutPublished(frames: readonly BrowserFrame[]): BrowserFrame[] {
+    if (this.published.length === 0) return [...frames]
+    const text = responseText(frames)
+    const ranges: Array<{ readonly start: number; readonly end: number }> = []
+    let searchAt = 0
+    for (const published of this.published) {
+      const start = text.indexOf(published, searchAt)
+      if (start < 0) continue
+      ranges.push({ start, end: start + published.length })
+      searchAt = start + published.length
+    }
+    const output: BrowserFrame[] = []
+    let textOffset = 0
+    for (const frame of frames) {
+      if (frame.type !== "text") {
+        output.push(frame)
+        continue
+      }
+      const start = textOffset
+      const end = start + frame.delta.length
+      let cursor = start
+      for (const range of ranges) {
+        if (range.end <= cursor || range.start >= end) continue
+        if (range.start > cursor) output.push({ type: "text", delta: frame.delta.slice(cursor - start, range.start - start) })
+        cursor = Math.max(cursor, Math.min(end, range.end))
+      }
+      if (cursor < end) output.push({ type: "text", delta: frame.delta.slice(cursor - start) })
+      textOffset = end
+    }
+    return output
+  }
 }
 
 function declaredFromEnvelopeValue(value: unknown): Array<{ readonly name: string; readonly input: unknown }> {
@@ -482,6 +612,7 @@ export class StandaloneBrowserService implements BrowserService {
       const collected: BrowserFrame[] = []
       try {
         let progressed = false
+        let reasoningSource: "dom" | "typed" | undefined
         const validate = async (frames: BrowserFrame[], projected: ProjectedTurn) => {
           try {
             // Safety-filter blocks never enter the repair net: fail the turn
@@ -497,40 +628,66 @@ export class StandaloneBrowserService implements BrowserService {
             throw error
           }
         }
-        const collectOne = async function* (projected: ProjectedTurn, progressive: boolean): AsyncGenerator<BrowserFrame, BrowserFrame[]> {
+        interface CollectedAttempt {
+          readonly frames: BrowserFrame[]
+          readonly progressiveParser?: KeyedThinkingParser
+        }
+        const collectOne = async function* (projected: ProjectedTurn, progressive: boolean): AsyncGenerator<BrowserFrame, CollectedAttempt> {
           const source = recoverNoResponseEvidence(
             (recovery) => adapterTurn(projected, recovery),
             projected.initialPrompt !== projected.incrementalPrompt,
           )
           const raw: BrowserFrame[] = []
+          const progressiveParser = progressive && projected.promptKey
+            ? new KeyedThinkingParser(projected.promptKey, new Set(projected.offeredActions))
+            : undefined
           for await (const frame of source) {
             if (signal?.aborted) throw new Error("browser turn was cancelled")
-            // Only browser-attributed DOM text may cross the validation gate.
-            // Native payloads cannot set domTurnKey through StreamFrameParser.
+            // Browser-attributed DOM reasoning and complete tagged thinking
+            // envelopes may cross early. Terminal chat/actions remain in raw
+            // until the entire response chain validates.
             if (progressive && frame.type === "reasoning" && projected.promptKey && frame.domTurnKey === projected.promptKey) {
+              if (reasoningSource === undefined || reasoningSource === "dom") {
+                reasoningSource = "dom"
+                progressed = true
+                collected.push(frame)
+                yield frame
+              }
+              continue
+            }
+            raw.push(frame)
+            if (frame.type !== "text" || !progressiveParser) continue
+            for (const envelope of progressiveParser.push(frame.delta)) {
+              if (reasoningSource !== undefined && reasoningSource !== "typed") continue
+              reasoningSource = "typed"
               progressed = true
-              collected.push(frame)
-              yield frame
-            } else raw.push(frame)
+              const published = { type: "text" as const, delta: envelope }
+              collected.push(published)
+              yield published
+            }
           }
-          if (isEnvelopeKeyMismatch(raw, projected.promptKey)) return raw
+          if (isEnvelopeKeyMismatch(raw, projected.promptKey)) return { frames: raw, progressiveParser }
           const frames: BrowserFrame[] = []
           for await (const frame of repairToolRefusal(raw, repair, projected.offeredActions)) frames.push(frame)
-          return frames
+          return { frames, progressiveParser }
         }
-        const collectValidated = async function* (projected: ProjectedTurn, progressive = false): AsyncGenerator<BrowserFrame, BrowserFrame[]> {
-          let frames = yield* collectOne(projected, progressive)
-          if (isEnvelopeKeyMismatch(frames, projected.promptKey) && !progressed) {
+        const collectValidated = async function* (projected: ProjectedTurn, progressive = false): AsyncGenerator<BrowserFrame, CollectedAttempt> {
+          let attempt = yield* collectOne(projected, progressive)
+          if (isEnvelopeKeyMismatch(attempt.frames, projected.promptKey) && !progressed) {
             console.error("aipass turn key mismatch retry=true")
-            frames = yield* collectOne(projected, progressive)
+            attempt = yield* collectOne(projected, progressive)
           }
-          await validate(frames, projected)
-          return frames
+          await validate(attempt.frames, projected)
+          return attempt
         }
-        const initialCollected = yield* collectValidated(input, true)
+        const initialAttempt = yield* collectValidated(input, true)
+        const initialCollected = initialAttempt.frames
         // Leave envelopes intact for the serializer: decoding here would
         // let quoted envelope examples in chat text be interpreted twice.
-        const finalFrames = (frames: BrowserFrame[]) => progressed ? frames.filter(frame => frame.type !== "reasoning") : frames
+        const finalFrames = (attempt: CollectedAttempt) => {
+          const frames = attempt.progressiveParser?.withoutPublished(attempt.frames) ?? attempt.frames
+          return reasoningSource ? frames.filter(frame => frame.type !== "reasoning") : frames
+        }
         const schemasByName = new Map((input.offeredToolSchemas ?? []).map((schema) => [schema.name, schema]))
         const seen = new Set<string>()
         const need: string[] = []
@@ -543,7 +700,7 @@ export class StandaloneBrowserService implements BrowserService {
           need.push(declared.name)
         }
         if (need.length === 0) {
-          for (const frame of finalFrames(initialCollected)) {
+          for (const frame of finalFrames(initialAttempt)) {
             collected.push(frame)
             yield frame
           }
@@ -565,9 +722,9 @@ export class StandaloneBrowserService implements BrowserService {
             compactionDigest: undefined,
             toolRepairPrompt: undefined,
           }
-          const provisionCollected = yield* collectValidated(provisionInput)
-          console.error(`aipass turn provision done tools=${need.join(",")} frames=${provisionCollected.length}`)
-          for (const frame of finalFrames(provisionCollected)) {
+          const provisionAttempt = yield* collectValidated(provisionInput)
+          console.error(`aipass turn provision done tools=${need.join(",")} frames=${provisionAttempt.frames.length}`)
+          for (const frame of finalFrames(provisionAttempt)) {
             collected.push(frame)
             yield frame
           }

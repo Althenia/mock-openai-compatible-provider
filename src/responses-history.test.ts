@@ -23,7 +23,7 @@ function service(turn: BrowserService["turn"]): BrowserService {
 
 describe("process-memory Responses continuation", () => {
   for (const stream of [false, true]) {
-    test(`replays input, emitted reasoning/call, and results without old top-level instructions (${stream ? "SSE" : "JSON"})`, async () => {
+    test(`replays input, emitted reasoning/call, results, and effective top-level initialization (${stream ? "SSE" : "JSON"})`, async () => {
       const turns: ProjectedTurn[] = []
       const handler = createRequestHandler({ token, shutdown: async () => {}, browser: service(async function* (turn) {
         turns.push(turn)
@@ -43,11 +43,11 @@ describe("process-memory Responses continuation", () => {
         input: [{ type: "function_call_output", call_id: "call_lookup", output: "LOOKUP_RESULT" }],
       })), !stream)
       expect(turns[1]!.sessionMarker).toBe(turns[0]!.sessionMarker)
-      expect(turns[1]!.primingPrompts).toHaveLength(4)
-      expect(turns[1]!.primingPrompts[1]).toContain("NEW_TOP_LEVEL_RULE")
-      expect(turns[1]!.primingPrompts[2]).toContain("RETAINED_MESSAGE_RULE")
-      expect(turns[1]!.primingPrompts[3]).toContain('"name":"lookup"')
-      expect(turns[1]!.primingPrompts[3]).toContain('"inputSchema"')
+      expect(turns[1]!.primingPrompts).toHaveLength(1)
+      expect(turns[1]!.primingPrompts[0]).toContain("NEW_TOP_LEVEL_RULE")
+      expect(turns[1]!.primingPrompts[0]).toContain("RETAINED_MESSAGE_RULE")
+      expect(turns[1]!.primingPrompts[0]).toContain('"name":"lookup"')
+      expect(turns[1]!.primingPrompts[0]).toContain('"inputSchema"')
       expect(turns[1]!.primingPrompts.join("\n")).not.toContain("OLD_TOP_LEVEL_RULE")
       // First-turn shape replays the full chain; bound routing is delta-only
       // with the earlier chain living in remote history instead.
@@ -76,8 +76,10 @@ describe("process-memory Responses continuation", () => {
       expect(turns[2]!.initialPrompt).toContain("CONTINUATION_ANSWER")
       expect(turns[2]!.initialPrompt).toContain("FINAL_QUESTION")
       expect(turns[2]!.initialPrompt).not.toContain("NEW_TOP_LEVEL_RULE")
-      expect(turns[2]!.primingPrompts.join("\n")).not.toContain("NEW_TOP_LEVEL_RULE")
+      expect(turns[2]!.primingPrompts.join("\n")).toContain("NEW_TOP_LEVEL_RULE")
       expect(turns[2]!.primingPrompts.join("\n")).toContain("RETAINED_MESSAGE_RULE")
+      expect(turns[2]!.primingPrompts).toEqual(turns[1]!.primingPrompts)
+      expect(turns[2]!.actionEnvelopeDigest).toBe(turns[1]!.actionEnvelopeDigest)
       expect(turns[2]!.initialPrompt.match(/ORIGINAL_TASK/g)).toHaveLength(1)
       const consumed = await handler(request({ previous_response_id: first.id, input: "branch" }))
       expect(consumed.status).toBe(400)
@@ -125,7 +127,7 @@ describe("process-memory Responses continuation", () => {
     expect(lastPrompt).not.toContain("FIRST_CONTEXT")
   })
 
-  test("an oversized response is unavailable without truncation or eviction of unrelated retained history", async () => {
+  test("an oversized response fails before submission without eviction of unrelated retained history", async () => {
     let calls = 0
     const handler = createRequestHandler({ token, shutdown: async () => {}, browser: service(async function* () {
       calls++
@@ -133,13 +135,12 @@ describe("process-memory Responses continuation", () => {
       yield { type: "finish", reason: "stop" }
     }) })
     const retained = await result(await handler(request({ input: "SAFE_CONTEXT" })), false)
-    const oversized = await result(await handler(request({ input: "x".repeat(16 * 1024 * 1024), stream: true })), true)
-    const missing = await handler(request({ previous_response_id: oversized.id, input: "continue" }))
-    expect(missing.status).toBe(400)
-    expect(await missing.json()).toMatchObject({ error: { code: "previous_response_not_found" } })
-    expect(calls).toBe(2)
+    const oversized = await handler(request({ input: "x".repeat(16 * 1024 * 1024), stream: true }))
+    expect(oversized.status).toBe(507)
+    expect(await oversized.json()).toMatchObject({ error: { code: "session_initialization_capacity" } })
+    expect(calls).toBe(1)
     await result(await handler(request({ previous_response_id: retained.id, input: "continue" })), false)
-    expect(calls).toBe(3)
+    expect(calls).toBe(2)
   })
 
   test("retains the existing 1,000 response limit independently of payload bytes", async () => {
@@ -157,9 +158,11 @@ describe("process-memory Responses continuation", () => {
   test("byte eviction does not steal a reserved predecessor from an in-flight continuation", async () => {
     let entered!: () => void
     let release!: () => void
+    const turns: ProjectedTurn[] = []
     const started = new Promise<void>((resolve) => { entered = resolve })
     const gate = new Promise<void>((resolve) => { release = resolve })
     const handler = createRequestHandler({ token, shutdown: async () => {}, browser: service(async function* (turn) {
+      turns.push(turn)
       if (turn.initialPrompt.includes("HELD_CONTINUATION")) {
         entered()
         await gate
@@ -168,19 +171,25 @@ describe("process-memory Responses continuation", () => {
       yield { type: "finish", reason: "stop" }
     }) })
     const input = "x".repeat(9 * 1024 * 1024)
-    const first = await result(await handler(request({ input })), false)
+    const first = await result(await handler(request({ input, instructions: "RESERVED_RULE", tools: [tool] })), false)
     const pending = handler(request({ previous_response_id: first.id, input: "HELD_CONTINUATION" }))
     try {
       await started
-      const next = await result(await handler(request({ input })), false)
+      const next = await handler(request({ input }))
+      expect(next.status).toBe(507)
+      expect(await next.json()).toMatchObject({ error: { code: "session_initialization_capacity" } })
       const conflict = await handler(request({ previous_response_id: first.id, input: "conflict" }))
       expect(conflict.status).toBe(409)
       expect(await conflict.json()).toMatchObject({ error: { code: "previous_response_in_use" } })
-      expect((await handler(request({ previous_response_id: next.id, input: "evicted" }))).status).toBe(400)
     } finally { release() }
     const continued = await result(await pending, false)
     expect((await handler(request({ previous_response_id: first.id, input: "consumed" }))).status).toBe(400)
     expect((await handler(request({ previous_response_id: continued.id, input: "valid" }))).status).toBe(200)
+    for (const turn of turns) {
+      expect(turn.primingPrompts.join("\n")).toContain("RESERVED_RULE")
+      expect(turn.offeredActions).toEqual(["lookup"])
+    }
+    expect(turns[1]!.actionEnvelopeDigest).toBe(turns[0]!.actionEnvelopeDigest)
   })
 
   test("cancelled streams retain neither partial child history nor the consumed predecessor", async () => {
@@ -196,7 +205,14 @@ describe("process-memory Responses continuation", () => {
     const first = await result(await handler(request({ input: "ROOT_INPUT" })), false)
     const stream = await handler(request({ previous_response_id: first.id, input: "CANCELLED_INPUT", stream: true }))
     const reader = stream.body!.getReader()
-    const created = new TextDecoder().decode((await reader.read()).value)
+    const decoder = new TextDecoder()
+    let streamed = ""
+    while (!streamed.includes("PARTIAL")) {
+      const chunk = await reader.read()
+      expect(chunk.done).toBe(false)
+      streamed += decoder.decode(chunk.value, { stream: true })
+    }
+    const created = streamed.split("\n\n").find(part => part.startsWith("event: response.created\n"))!
     const childID = JSON.parse(created.split("\ndata: ")[1]!).response.id
     await reader.cancel()
     for (const id of [first.id, childID]) {

@@ -1,5 +1,5 @@
 import type { ProjectedTurn } from "./http.ts"
-import { authorize, parseOpenAIChatRequest, parseOpenAIResponsesRequest } from "./http.ts"
+import { authorize, parseOpenAIChatRequest, parseOpenAIResponsesRequest, requestSession } from "./http.ts"
 import {
   collectOpenAIChatResult,
   openAIChatCompletion,
@@ -10,6 +10,12 @@ import {
 } from "./protocol.ts"
 import { MODELS } from "./config.ts"
 import { NoResponseEvidenceError, WebchatSafetyBlockError } from "./browser.ts"
+import { streamingFrames } from "./stream-progress.ts"
+import {
+  SessionInitializationCapacityError,
+  SessionInitializationStore,
+  type SessionInitialization,
+} from "./session-initialization.ts"
 
 export interface BrowserService {
   turn(input: ProjectedTurn, signal?: AbortSignal): AsyncIterable<BrowserFrame>
@@ -41,6 +47,15 @@ function safetyBlockError() {
   }
 }
 
+function sessionCapacityError() {
+  return {
+    message: "session initialization capacity is exhausted",
+    type: "server_error",
+    param: null,
+    code: "session_initialization_capacity",
+  }
+}
+
 function browserError(error: unknown) {
   if (error instanceof WebchatSafetyBlockError)
     return json({ error: safetyBlockError() }, 422)
@@ -52,6 +67,15 @@ function browserError(error: unknown) {
       "browser_error",
     )
   return apiError(error instanceof Error ? error.message : "browser turn failed", 502, "upstream_error", "server_error")
+}
+
+function streamError(error: unknown, sequenceNumber?: number) {
+  const detail = error instanceof WebchatSafetyBlockError ? safetyBlockError()
+    : error instanceof SessionInitializationCapacityError ? sessionCapacityError()
+    : { message: error instanceof Error ? error.message : "browser turn failed", code: "upstream_error", type: "server_error", param: null }
+  return sequenceNumber === undefined
+    ? `data: ${JSON.stringify({ error: detail })}\n\n`
+    : `event: error\ndata: ${JSON.stringify({ ...detail, type: "error", sequence_number: sequenceNumber })}\n\n`
 }
 
 function modelObject(model: (typeof MODELS)[number]) {
@@ -87,33 +111,34 @@ async function* prepend(first: BrowserFrame, iterator: AsyncIterator<BrowserFram
 function streamResponse(
   model: string,
   offered: ReadonlySet<string>,
-  first: BrowserFrame,
-  iterator: AsyncIterator<BrowserFrame>,
+  frames: AsyncIterable<BrowserFrame>,
   promptTokens: number,
   includeUsage: boolean,
   requireTool: boolean,
   onCancel: () => void,
 ) {
-  const output = openAIChatSSEChunks(model, prepend(first, iterator), offered, {
+  const output = openAIChatSSEChunks(model, frames, offered, {
     promptTokens,
     includeUsage,
     requireTool,
   })[Symbol.asyncIterator]()
   const encoder = new TextEncoder()
+  let cancelled = false
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const next = await output.next()
+        if (cancelled) return
         if (next.done) controller.close()
         else controller.enqueue(encoder.encode(next.value))
       } catch (error) {
-        if (error instanceof WebchatSafetyBlockError) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: safetyBlockError() })}\n\n`))
-          controller.close()
-        } else controller.error(error)
+        if (cancelled) return
+        controller.enqueue(encoder.encode(streamError(error)))
+        controller.close()
       }
     },
     async cancel(reason) {
+      cancelled = true
       onCancel()
       await output.return?.(reason)
     },
@@ -174,8 +199,7 @@ function responsesStreamResponse(
   responseID: string,
   model: string,
   offered: ReadonlySet<string>,
-  first: BrowserFrame,
-  iterator: AsyncIterator<BrowserFrame>,
+  frames: AsyncIterable<BrowserFrame>,
   promptTokens: number,
   requireTool: boolean,
   onComplete: (output: readonly Record<string, unknown>[]) => void,
@@ -183,17 +207,19 @@ function responsesStreamResponse(
   onCancel: () => void,
 ) {
   let completedOutput: readonly Record<string, unknown>[] = []
-  const output = openAIResponsesSSEChunks(responseID, model, prepend(first, iterator), offered, {
+  const output = openAIResponsesSSEChunks(responseID, model, frames, offered, {
     promptTokens,
     requireTool,
     onCompletedOutput: (items) => { completedOutput = items },
   })[Symbol.asyncIterator]()
   const encoder = new TextEncoder()
+  let cancelled = false
+  let sequenceNumber = 0
   let settled = false
   const complete = () => {
     if (settled) return
-    settled = true
     onComplete(completedOutput)
+    settled = true
   }
   const abort = async () => {
     if (settled) return
@@ -204,25 +230,27 @@ function responsesStreamResponse(
     async pull(controller) {
       try {
         const next = await output.next()
+        if (cancelled) return
         if (next.done) {
           await abort()
           controller.close()
         } else {
           const completed = next.value.startsWith("event: response.completed\n")
-          controller.enqueue(encoder.encode(next.value))
           if (completed) complete()
+          controller.enqueue(encoder.encode(next.value))
+          sequenceNumber++
         }
       } catch (error) {
         await abort().catch((cleanupError) =>
           console.error(`aipass response stream cleanup failed type=${cleanupError instanceof Error ? cleanupError.name : "unknown"}`),
         )
-        if (error instanceof WebchatSafetyBlockError) {
-          controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ ...safetyBlockError(), type: "error" })}\n\n`))
-          controller.close()
-        } else controller.error(error)
+        if (cancelled) return
+        controller.enqueue(encoder.encode(streamError(error, sequenceNumber)))
+        controller.close()
       }
     },
     async cancel(reason) {
+      cancelled = true
       onCancel()
       try {
         await output.return?.(reason)
@@ -242,10 +270,92 @@ function recordValue(value: unknown): Record<string, unknown> {
     : { data: value }
 }
 
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function instructionMessages(value: unknown): readonly unknown[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const instructions = value.filter((candidate) => {
+    const item = recordValue(candidate)
+    return item.role === "system" || item.role === "developer"
+  })
+  return instructions.length ? instructions : undefined
+}
+
+function effectiveChatInitialization(
+  input: Record<string, unknown>,
+  retained: SessionInitialization | undefined,
+): { readonly input: Record<string, unknown>; readonly initialization: SessionInitialization; readonly shouldRetain: boolean } {
+  const explicitInstructions = instructionMessages(input.messages)
+  const retainedInstructions = Array.isArray(retained?.instructions) ? retained.instructions : undefined
+  const instructions = explicitInstructions ?? retainedInstructions
+  const toolsPresent = hasOwn(input, "tools")
+  const tools = toolsPresent ? input.tools : retained?.tools
+  const modePresent = hasOwn(input, "instruction_mode")
+  const instructionMode = modePresent ? input.instruction_mode : retained?.instructionMode
+  const effective = {
+    ...input,
+    ...(!explicitInstructions && instructions && Array.isArray(input.messages)
+      ? { messages: [...instructions, ...input.messages] }
+      : {}),
+    ...(!toolsPresent && tools !== undefined ? { tools } : {}),
+    ...(!modePresent && instructionMode !== undefined ? { instruction_mode: instructionMode } : {}),
+  }
+  const initialization: SessionInitialization = {
+    ...(instructions ? { instructions } : {}),
+    ...(Array.isArray(tools) ? { tools } : {}),
+    ...(instructionMode === "preserve" || instructionMode === "action-only" ? { instructionMode } : {}),
+  }
+  return {
+    input: effective,
+    initialization,
+    shouldRetain: retained !== undefined || explicitInstructions !== undefined || toolsPresent || modePresent,
+  }
+}
+
+function effectiveResponsesInitialization(
+  input: Record<string, unknown>,
+  retained: SessionInitialization | undefined,
+): { readonly input: Record<string, unknown>; readonly initialization: SessionInitialization } {
+  const instructionsPresent = hasOwn(input, "instructions")
+  if (instructionsPresent && typeof input.instructions !== "string") throw new Error("instructions must be a string")
+  const instructions = instructionsPresent ? input.instructions as string :
+    typeof retained?.instructions === "string" ? retained.instructions : undefined
+  const toolsPresent = hasOwn(input, "tools")
+  const tools = toolsPresent ? input.tools : retained?.tools
+  const modePresent = hasOwn(input, "instruction_mode")
+  const instructionMode = modePresent ? input.instruction_mode : retained?.instructionMode
+  const effective = {
+    ...input,
+    ...(!instructionsPresent && instructions !== undefined ? { instructions } : {}),
+    ...(!toolsPresent && tools !== undefined ? { tools } : {}),
+    ...(!modePresent && instructionMode !== undefined ? { instruction_mode: instructionMode } : {}),
+  }
+  return {
+    input: effective,
+    initialization: {
+      ...(instructions !== undefined ? { instructions } : {}),
+      ...(Array.isArray(tools) ? { tools } : {}),
+      ...(instructionMode === "preserve" || instructionMode === "action-only" ? { instructionMode } : {}),
+    },
+  }
+}
+
+function initializationCapacityError() {
+  return json({ error: sessionCapacityError() }, 507)
+}
+
 export function createRequestHandler(dependencies: RequestHandlerDependencies) {
   const responseHistoryBudget = 16 * 1024 * 1024
   let shutdownStarted = false
-  const responseSessions = new Map<string, { sessionMarker: string; items: readonly unknown[]; bytes: number }>()
+  const chatInitializations = new SessionInitializationStore()
+  const responseSessions = new Map<string, {
+    sessionMarker: string
+    items: readonly unknown[]
+    initialization: SessionInitialization
+    bytes: number
+  }>()
   const responseReservations = new Set<string>()
   let retainedResponseBytes = 0
   const forgetResponse = (id: string) => {
@@ -253,6 +363,23 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
     if (!stored) return
     retainedResponseBytes -= stored.bytes
     responseSessions.delete(id)
+  }
+  const responseCapacityVictims = (bytes: number, previous?: string): string[] => {
+    if (bytes > responseHistoryBudget) throw new SessionInitializationCapacityError()
+    const predecessor = previous === undefined ? undefined : responseSessions.get(previous)
+    let count = responseSessions.size - (predecessor ? 1 : 0) + 1
+    let retained = retainedResponseBytes - (predecessor?.bytes ?? 0) + bytes
+    const victims: string[] = []
+    for (const [id, stored] of responseSessions) {
+      if (count <= 1_000 && retained <= responseHistoryBudget) break
+      if (id === previous || responseReservations.has(id)) continue
+      victims.push(id)
+      count--
+      retained -= stored.bytes
+    }
+    if (count > 1_000 || retained > responseHistoryBudget)
+      throw new SessionInitializationCapacityError()
+    return victims
   }
   return async (request: Request) => {
     const failure = authorize(request.headers.get("authorization") ?? undefined, dependencies.token)
@@ -284,6 +411,7 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
       let parsed: ReturnType<typeof parseOpenAIResponsesRequest>
       let responseInput: unknown
       let responseItems: readonly unknown[] = []
+      let responseInitialization: SessionInitialization = {}
       let previous: string | undefined
       try {
         responseInput = await request.json()
@@ -296,7 +424,9 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
         if (previous !== undefined && responseReservations.has(previous))
           return apiError(`previous_response_id ${previous} is already continuing`, 409, "previous_response_in_use")
         if (previous !== undefined) responseReservations.add(previous)
-        const body = recordValue(responseInput)
+        const initialized = effectiveResponsesInitialization(recordValue(responseInput), continuation?.initialization)
+        const body = initialized.input
+        responseInitialization = initialized.initialization
         const currentItems = typeof body.input === "string"
           ? [{ role: "user", content: body.input }]
           : Array.isArray(body.input) ? body.input : undefined
@@ -305,58 +435,44 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
           responseInput = { ...body, input: responseItems }
         }
         parsed = parseOpenAIResponsesRequest(responseInput, request.headers, continuation?.sessionMarker)
+        if (parsed.store) {
+          const baseBytes = Buffer.byteLength(JSON.stringify({
+            items: responseItems,
+            initialization: responseInitialization,
+          }), "utf8")
+          responseCapacityVictims(baseBytes, previous)
+        }
       } catch (error) {
         if (previous !== undefined) responseReservations.delete(previous)
+        if (error instanceof SessionInitializationCapacityError) return initializationCapacityError()
         return apiError(error instanceof Error ? error.message : "invalid response request", 400, "invalid_request")
       }
-      let iterator: AsyncIterator<BrowserFrame>
-      let first: IteratorResult<BrowserFrame>
       const streamAbort = new AbortController()
-      try {
-        const signal = parsed.stream ? AbortSignal.any([request.signal, streamAbort.signal]) : request.signal
-        iterator = dependencies.browser.turn(parsed.turn, signal)[Symbol.asyncIterator]()
-        first = await iterator.next()
-      } catch (error) {
-        if (previous !== undefined) responseReservations.delete(previous)
-        return browserError(error)
-      }
-      if (first.done) {
-        if (previous !== undefined) responseReservations.delete(previous)
-        return apiError("browser turn ended before its first frame", 502, "upstream_error", "server_error")
-      }
-      if (first.value.type === "auth-required") {
-        await iterator.return?.()
-        if (previous !== undefined) responseReservations.delete(previous)
-        return apiError("browser authentication is required", 428, "browser_authentication_required", "authentication_error")
-      }
-      if (first.value.type === "error") {
-        await iterator.return?.()
-        if (previous !== undefined) responseReservations.delete(previous)
-        return apiError(first.value.message, 502, "upstream_error", "server_error")
-      }
       const rememberResponse = (output: readonly Record<string, unknown>[]) => {
+        if (!parsed.store) return
+        const items = [...responseItems, ...output]
+        const bytes = Buffer.byteLength(JSON.stringify({ items, initialization: responseInitialization }), "utf8")
+        const victims = responseCapacityVictims(bytes, previous)
+        for (const id of victims) forgetResponse(id)
         if (previous !== undefined) {
           responseReservations.delete(previous)
           forgetResponse(previous)
         }
-        if (!parsed.store) return
-        const items = [...responseItems, ...output]
-        const bytes = Buffer.byteLength(JSON.stringify(items), "utf8")
-        if (bytes > responseHistoryBudget) return
-        responseSessions.set(parsed.responseID, { sessionMarker: parsed.turn.sessionMarker, items, bytes })
+        responseSessions.set(parsed.responseID, {
+          sessionMarker: parsed.turn.sessionMarker,
+          items,
+          initialization: responseInitialization,
+          bytes,
+        })
         retainedResponseBytes += bytes
-        for (const id of responseSessions.keys()) {
-          if (responseSessions.size <= 1_000 && retainedResponseBytes <= responseHistoryBudget) break
-          if (!responseReservations.has(id)) forgetResponse(id)
-        }
       }
       if (parsed.stream) {
+        const signal = AbortSignal.any([request.signal, streamAbort.signal])
         return responsesStreamResponse(
           parsed.responseID,
           parsed.turn.modelID,
           parsed.offered,
-          first.value,
-          iterator,
+          streamingFrames(() => dependencies.browser.turn(parsed.turn, signal), signal),
           parsed.promptTokens,
           parsed.requireTool,
           rememberResponse,
@@ -368,6 +484,26 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
           () => streamAbort.abort(),
         )
       }
+      let iterator: AsyncIterator<BrowserFrame>
+      let first: IteratorResult<BrowserFrame>
+      try {
+        iterator = dependencies.browser.turn(parsed.turn, request.signal)[Symbol.asyncIterator]()
+        first = await iterator.next()
+      } catch (error) {
+        if (previous !== undefined) responseReservations.delete(previous)
+        return browserError(error)
+      }
+      if (first.done) {
+        if (previous !== undefined) responseReservations.delete(previous)
+        return apiError("browser turn ended before its first frame", 502, "upstream_error", "server_error")
+      }
+      if (first.value.type === "auth-required" || first.value.type === "error") {
+        await iterator.return?.()
+        if (previous !== undefined) responseReservations.delete(previous)
+        return first.value.type === "auth-required"
+          ? apiError("browser authentication is required", 428, "browser_authentication_required", "authentication_error")
+          : apiError(first.value.message, 502, "upstream_error", "server_error")
+      }
       try {
         const result = await collectOpenAIChatResult(prepend(first.value, iterator), parsed.offered, parsed.requireTool)
         const response = responsesObject(parsed.responseID, parsed.turn.modelID, result, parsed.promptTokens)
@@ -375,14 +511,35 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
         return json(response)
       } catch (error) {
         if (previous !== undefined) responseReservations.delete(previous)
+        if (error instanceof SessionInitializationCapacityError) {
+          if (previous !== undefined) forgetResponse(previous)
+          await dependencies.browser.discard?.(parsed.turn.sessionMarker).catch((cleanupError) =>
+            console.error(`aipass response cleanup failed type=${cleanupError instanceof Error ? cleanupError.name : "unknown"}`),
+          )
+          return initializationCapacityError()
+        }
         return browserError(error)
       }
     }
     if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
       let parsed: ReturnType<typeof parseOpenAIChatRequest>
       try {
-        parsed = parseOpenAIChatRequest(await request.json(), request.headers)
+        const input = recordValue(await request.json())
+        const identified = typeof input.model === "string" && input.model
+          ? requestSession(request.headers, input)
+          : undefined
+        const retained = identified && !identified.ephemeral
+          ? chatInitializations.get(identified.marker)
+          : undefined
+        const initialized = effectiveChatInitialization(input, retained)
+        parsed = parseOpenAIChatRequest(initialized.input, request.headers)
+        // Admission is independent of upstream availability: once a valid
+        // logical-session request updates initialization, a browser failure
+        // must not make the next omitted-field retry lose that accepted state.
+        if (identified && !identified.ephemeral && initialized.shouldRetain)
+          chatInitializations.set(identified.marker, initialized.initialization)
       } catch (error) {
+        if (error instanceof SessionInitializationCapacityError) return initializationCapacityError()
         return apiError(error instanceof Error ? error.message : "invalid chat request", 400, "invalid_request")
       }
       console.error(
@@ -391,9 +548,20 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
       let iterator: AsyncIterator<BrowserFrame>
       let first: IteratorResult<BrowserFrame>
       const streamAbort = new AbortController()
+      if (parsed.stream) {
+        const signal = AbortSignal.any([request.signal, streamAbort.signal])
+        return streamResponse(
+          parsed.turn.modelID,
+          parsed.offered,
+          streamingFrames(() => dependencies.browser.turn(parsed.turn, signal), signal),
+          parsed.promptTokens,
+          parsed.includeUsage,
+          parsed.requireTool,
+          () => streamAbort.abort(),
+        )
+      }
       try {
-        const signal = parsed.stream ? AbortSignal.any([request.signal, streamAbort.signal]) : request.signal
-        iterator = dependencies.browser.turn(parsed.turn, signal)[Symbol.asyncIterator]()
+        iterator = dependencies.browser.turn(parsed.turn, request.signal)[Symbol.asyncIterator]()
         first = await iterator.next()
       } catch (error) {
         return browserError(error)
@@ -407,17 +575,6 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
         await iterator.return?.()
         return apiError(first.value.message, 502, "upstream_error", "server_error")
       }
-      if (parsed.stream)
-        return streamResponse(
-          parsed.turn.modelID,
-          parsed.offered,
-          first.value,
-          iterator,
-          parsed.promptTokens,
-          parsed.includeUsage,
-          parsed.requireTool,
-          () => streamAbort.abort(),
-        )
       try {
         return json(
           await openAIChatCompletion(

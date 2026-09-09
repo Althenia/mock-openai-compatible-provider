@@ -297,7 +297,12 @@ function toolSelection(definitions: ReturnType<typeof tools>, value: unknown) {
   return { definitions: selected, required: true }
 }
 
-function session(headers: Headers, input: Record<string, unknown>, override?: string | null) {
+export interface RequestSession {
+  readonly marker: string
+  readonly ephemeral: boolean
+}
+
+export function requestSession(headers: Headers, input: Record<string, unknown>, override?: string | null): RequestSession {
   if (override === null) return { marker: `anon_${randomUUID()}`, ephemeral: true }
   const raw =
     override ??
@@ -408,7 +413,7 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   if (responseFormat !== undefined && responseFormat !== "text")
     throw new Error("only text response_format is supported")
   model(input.model)
-  const sessionValue = session(headers, input, sessionOverride)
+  const sessionValue = requestSession(headers, input, sessionOverride)
   const sessionMarker = sessionValue.marker
   const instructionMode = input.instruction_mode ?? "preserve"
   if (instructionMode !== "preserve" && instructionMode !== "action-only")
@@ -422,28 +427,30 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   const omitLoweredSystemUpdates = instructionMode === "action-only"
   const conversation = serializeMessages(input.messages, "conversation", omitLoweredSystemUpdates)
   const incrementalTranscript = incrementalMessages(input.messages, conversation, omitLoweredSystemUpdates)
-  const selection = toolSelection(tools(input.tools), input.tool_choice)
+  const catalogTools = tools(input.tools)
+  const selection = toolSelection(catalogTools, input.tool_choice)
   const stream = input.stream === true
   if (stream && selection.required) throw new Error("streaming with required tool_choice is not supported")
   const offeredTools = selection.definitions
   const continuingTool = toolContinuation(input.messages)
-  // Serial startup keeps complete tool schemas out of the task submit.
-  // Each schema is its own block; preserved instruction boundaries stay intact.
+  // Initialization is one ordered webchat submission: client protocol,
+  // caller instruction boundaries, then the complete active tool catalog.
+  // Ordinary task/result turns carry only their keyed conversation delta.
   const startupProtocol = [
-    serializeToolDefinitions([], offeredTools.length > 0),
-    `Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(offeredTools.map(tool => tool.name))}. Request only names in this list. Full schemas for listed actions follow in startup blocks.`,
-  ].join("\n\n")
-  const primingPrompts = [
-    `${startupProtocol}\n\nStartup instruction only. No task or turn key yet. Acknowledge this and each subsequent startup instruction or tool-schema block briefly with READY, then wait for the next submission. Do not request actions during startup. Startup ends when a submission begins with TURN KEY.`,
+    serializeToolDefinitions([], catalogTools.length > 0),
     ...instructions,
-    ...offeredTools.map(tool => serializeToolDefinitions([tool], true, false, false)),
-  ]
-  const requiredNotice =
-    selection.required && offeredTools.length > 0
+    `Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(catalogTools.map(tool => tool.name))}. Request only names in this list.`,
+    serializeToolDefinitions(catalogTools, catalogTools.length > 0, false, false),
+    "Initialization submission only. Store the client protocol, ordered harness instructions, and complete offered action catalog for subsequent turns. Reply once with exactly one chat envelope carrying the current turn key and text READY; request no action. Subsequent submissions are task or action-result turns.",
+  ].filter(Boolean).join("\n\n")
+  const primingPrompts = [startupProtocol]
+  const toolChoiceNotice = input.tool_choice === "none"
+    ? "Do not request a client action on this turn; answer without actions."
+    : selection.required && offeredTools.length > 0
       ? `You must request one of these available actions before giving a final answer: ${offeredTools.map(tool => tool.name).join(", ")}.`
       : ""
   // withTurnKey adds the per-turn envelope guard at submission time.
-  const initialPrompt = [requiredNotice, conversation].filter(Boolean).join("\n")
+  const initialPrompt = [toolChoiceNotice, conversation].filter(Boolean).join("\n")
   const autoToolChoice = input.tool_choice === undefined || input.tool_choice === "auto"
   const toolRepairPrompt = autoToolChoice && offeredTools.length > 0
     ? [
@@ -464,7 +471,7 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
     instructionDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH - 2),
     rawActionEnvelopeDigest.slice(INSTRUCTION_DIGEST_PREFIX_LENGTH),
   ].join("")
-  const incrementalPrompt = [requiredNotice, incrementalTranscript].filter(Boolean).join("\n")
+  const incrementalPrompt = [toolChoiceNotice, incrementalTranscript].filter(Boolean).join("\n")
   // A fresh/recovery session re-primes startup before chronological history.
   const recoveryPrompt = initialPrompt
   const reasoningMode = record(input.reasoning)?.mode ?? record(input.reasoning)?.effort
@@ -500,7 +507,7 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
         ...(tool.description ? { description: tool.description } : {}),
         inputSchema: tool.inputSchema,
       })),
-      provisionedActions: offeredTools.map((tool) => tool.name),
+      provisionedActions: catalogTools.map((tool) => tool.name),
     },
     offered: new Set(offeredTools.map((tool) => tool.name)),
     projectedActions: offeredTools.map((tool) => tool.name),

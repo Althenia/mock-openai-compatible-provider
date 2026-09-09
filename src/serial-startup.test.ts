@@ -7,17 +7,20 @@ const parse = (messages: unknown[]) => parseOpenAIChatRequest({
   model: "gemini-3.1-flash-lite", session_id: "serial-startup", messages,
 }, new Headers()).turn
 
-test("startup preserves ordered instruction boundaries separately from the task", () => {
+test("one startup submission preserves ordered instruction boundaries separately from the task", () => {
   const turn = parse([
     { role: "system", content: "HARNESS" },
     { role: "developer", content: "AGENT" },
     { role: "system", content: "WORKSPACE" },
     { role: "user", content: "TASK" },
   ])
-  expect(turn.primingPrompts).toHaveLength(4)
-  expect(turn.primingPrompts[0]).toStartWith("You are a text-generation assistant working only as the backend.")
-  for (const [index, instruction] of ["SYSTEM: HARNESS", "DEVELOPER: AGENT", "SYSTEM: WORKSPACE"].entries()) {
-    expect(turn.primingPrompts[index + 1]).toContain(instruction)
+  expect(turn.primingPrompts).toHaveLength(1)
+  const startup = turn.primingPrompts[0]!
+  expect(startup).toStartWith("You are a text-generation assistant working only as the backend.")
+  let previous = 0
+  for (const instruction of ["SYSTEM: HARNESS", "DEVELOPER: AGENT", "SYSTEM: WORKSPACE"]) {
+    expect(startup.indexOf(instruction)).toBeGreaterThan(previous)
+    previous = startup.indexOf(instruction)
   }
   for (const prompt of [turn.initialPrompt, turn.incrementalPrompt, turn.recoveryPrompt]) {
     expect(prompt).toContain("USER: TASK")
@@ -45,7 +48,7 @@ test("startup alone carries all schemas and one acknowledgement instruction", ()
   expect(startup.match(/You are a text-generation assistant/g)).toHaveLength(1)
   expect(startup.match(/Action shapes:/g)).toHaveLength(1)
   for (const name of ["read", "question"]) expect(startup).toContain(`"name":"${name}"`)
-  expect(turn.primingPrompts).toHaveLength(5)
+  expect(turn.primingPrompts).toHaveLength(1)
   expect(turn.provisionedActions).toEqual(["read", "question"])
   for (const prompt of [turn.initialPrompt, turn.incrementalPrompt, turn.recoveryPrompt]) expect(prompt).toBe("USER: read the file")
   expect(project("ask a question").actionEnvelopeDigest).toBe(turn.actionEnvelopeDigest)
@@ -62,23 +65,29 @@ test("ordinary preserve-mode bound user turns send only the new task", () => {
   expect(turn.recoveryPrompt).toBe(turn.initialPrompt)
 })
 
-test("startup replaces the active offered set when tools are removed or disabled", () => {
+test("the full startup catalog is independent of per-turn tool choice", () => {
   const tool = (name: string) => ({ type: "function", function: { name, parameters: { type: "object" } } })
   const project = (tools: unknown[], tool_choice?: string) => parseOpenAIChatRequest({
     model: "gemini-3.1-flash-lite", tools, tool_choice, messages: [{ role: "user", content: "Continue" }],
   }, new Headers()).turn
   const initial = project([tool("read"), tool("question")])
   const removed = project([tool("question")])
-  const disabled = project([tool("question")], "none")
-  for (const [turn, names] of [[initial, ["read", "question"]], [removed, ["question"]], [disabled, []]] as const) {
+  const disabled = project([tool("read"), tool("question")], "none")
+  for (const [turn, names, prompt] of [
+    [initial, ["read", "question"], "USER: Continue"],
+    [removed, ["question"], "USER: Continue"],
+    [disabled, ["read", "question"], "Do not request a client action on this turn; answer without actions.\nUSER: Continue"],
+  ] as const) {
     expect(turn.primingPrompts[0]).toContain(`Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(names)}`)
     expect(turn.primingPrompts[0]).toContain("Request only names in this list.")
-    expect(turn.initialPrompt).toBe("USER: Continue")
+    expect(turn.initialPrompt).toBe(prompt)
   }
   expect(removed.primingPrompts.join("\n")).not.toContain('"name":"read"')
-  expect(disabled.primingPrompts).toHaveLength(1)
+  expect(disabled.primingPrompts).toEqual(initial.primingPrompts)
+  expect(disabled.provisionedActions).toEqual(["read", "question"])
+  expect(disabled.offeredActions).toEqual([])
   expect(removed.actionEnvelopeDigest).not.toBe(initial.actionEnvelopeDigest)
-  expect(disabled.actionEnvelopeDigest).not.toBe(removed.actionEnvelopeDigest)
+  expect(disabled.actionEnvelopeDigest).toBe(initial.actionEnvelopeDigest)
 })
 
 test("single-flight identity includes startup, model, variant, and compaction", async () => {
