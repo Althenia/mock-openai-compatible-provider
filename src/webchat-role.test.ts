@@ -20,9 +20,9 @@ function expectChatOnlyRole(prompt: string) {
   expect(prompt).toContain("The client handles permissions, executes actions, and returns results; requests are not approval or success.")
   expect(prompt).toContain("Files, folders, shell, MCP: use exact offered names and schema-valid input; do not guess arguments.")
   expect(prompt).toContain("Claim success only from client results. Preserve site instructions, safety, privacy, and authorization.")
-  expect(prompt).toContain("Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.")
-  expect(prompt).toContain("FIRST line")
-  expect(prompt).toContain("Every envelope")
+  expect(prompt).toContain("reply with only <aipass-envelope>{...}</aipass-envelope> envelope(s) carrying the current turn key")
+  expect(prompt).toContain('Each submission starts with "TURN KEY: <key>"')
+  expect(prompt).toContain("Copy that key verbatim into every response envelope")
   expect(prompt).toContain('{"type":"chat","key":"<key>","id":"answer_1","text":"..."}')
   expect(prompt).toContain('{"type":"thinking","key":"<key>","id":"reason_1","text":"..."}')
 }
@@ -30,7 +30,8 @@ function expectChatOnlyRole(prompt: string) {
 function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = [], tools: readonly string[] = []) {
   expect(primingPrompts).toHaveLength(1)
   expectChatOnlyRole(primingPrompts[0]!)
-  expect(primingPrompts[0]!).toStartWith("You are a text-generation assistant working only as the backend.")
+  expect(primingPrompts[0]!).toStartWith("CLIENT INSTRUCTIONS")
+  expect(primingPrompts[0]!).toContain("HARNESS INSTRUCTIONS")
   for (const [index, instruction] of instructions.entries()) {
     const prompt = primingPrompts[0]!
     expect(prompt).toContain(instruction)

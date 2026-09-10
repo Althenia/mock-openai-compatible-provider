@@ -155,7 +155,7 @@ describe("envelope-chain upgrade", () => {
     const filled = withTurnKey("BODY", "key-1");
     expect(filled.split("\n")[0]).toBe("TURN KEY: key-1");
     expect(filled).toContain("BODY");
-    expect(filled).toContain(EVERY_TURN_ENVELOPE_GUARD);
+    expect(filled.split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2);
   });
 
   test("envelopeKeys extracts every tagged and bare key", () => {
@@ -180,8 +180,8 @@ describe("envelope-chain upgrade", () => {
     expect(contract).toContain("never a final answer");
     expect(contract).toContain("thinking*");
     expect(contract).toContain("nothing else");
-    expect(contract).toContain("FIRST line");
-    expect(contract).toContain("Every envelope");
+    expect(contract).toContain('Each submission starts with "TURN KEY: <key>"');
+    expect(contract).toContain('Copy that key verbatim into every response envelope');
     expect(contract).toContain('Do not emit legacy <aipass-action> wrappers');
     expect(contract).not.toContain('emitting exactly <aipass-action>');
     expect(contract).toContain('<aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>');
@@ -259,20 +259,20 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(24);
+    expect(PROMPT_CONTRACT_VERSION).toBe(25);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(24);
+    expect(parsed.turn.promptContractVersion).toBe(25);
   });
 
-  test("submit-time fill carries the guard on every turn", () => {
+  test("submit-time fill adds attribution and preserves a guard exactly once", () => {
     const filled = withTurnKey("BODY", "key-1");
     expect(filled.split("\n")[0]).toBe("TURN KEY: key-1");
-    expect(filled).toContain(EVERY_TURN_ENVELOPE_GUARD);
-    expect(filled.indexOf(EVERY_TURN_ENVELOPE_GUARD)).toBeLessThan(filled.indexOf("BODY"));
+    expect(filled).toBe(`TURN KEY: key-1\n\n${EVERY_TURN_ENVELOPE_GUARD}\n\nBODY`);
+    expect(filled.split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2);
     expect(withTurnKey(`${EVERY_TURN_ENVELOPE_GUARD}\n\nBODY`, "key-1").split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2);
-    expect(withTurnKey("BODY")).toContain(EVERY_TURN_ENVELOPE_GUARD);
+    expect(withTurnKey("BODY")).toBe("BODY");
   });
 });

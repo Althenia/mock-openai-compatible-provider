@@ -46,6 +46,9 @@ export interface ProjectedTurn {
   readonly attachments?: readonly RequestAttachment[]
   // Repo nonce submitted as TURN KEY; the response envelope must echo it.
   readonly promptKey?: string
+  // Key of the submission this derived turn descends from (retry/repair/
+  // provision chains); unset on the base projected turn.
+  readonly originPromptKey?: string
   // Full offered schemas and names supplied during startup.
   readonly offeredToolSchemas: readonly OfferedToolSchema[]
   readonly provisionedActions: readonly string[]
@@ -184,6 +187,57 @@ export function messageAttachments(messages: unknown): RequestAttachment[] {
 }
 
 type MessageProjection = "instructions" | "conversation"
+
+// Only complete instruction bodies and explicitly delimited catalogs are
+// shared. Do not deduplicate prose paragraphs: their surrounding conditions
+// and role boundaries can change their meaning.
+function projectClientInstructions(messages: readonly unknown[]) {
+  const bodies = new Map<string, number>()
+  const catalogs = new Map<string, number>()
+  const catalogPattern = /<(available_skills|mcp_instructions)>[\s\S]*?<\/\1>/g
+  const instructions: string[] = []
+  for (const [index, message] of messages.entries()) {
+    const item = record(message)
+    if (item?.role !== "system" && item?.role !== "developer") continue
+    const body = content(item.content, `messages[${index}]`)
+    if (!body.trim()) continue
+    const number = instructions.length + 1
+    const previous = bodies.get(body)
+    const projected = previous !== undefined
+      ? `[Content declared in harness instruction ${previous}.]`
+      : body.replace(catalogPattern, catalog => {
+          const owner = catalogs.get(catalog)
+          if (owner !== undefined) return `[Catalog declared in harness instruction ${owner}.]`
+          catalogs.set(catalog, number)
+          return catalog
+        })
+    if (previous === undefined) bodies.set(body, number)
+    instructions.push(`Harness instruction ${number}\n${String(item.role).toUpperCase()}: ${projected}`)
+  }
+  const removeRepeatedUpdates = (text: string) => text.replace(
+    /(?:^|\n)<system-update>\n([\s\S]*?)\n<\/system-update>(?=\n|$)/g,
+    (whole, body: string) => {
+      // Clients may XML-escape lowered system content. Decode only for an
+      // exact comparison; never unescape novel, lower-authority turn data.
+      const decoded = body.replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&")
+      if (bodies.has(body) || bodies.has(decoded)) return ""
+      const remaining = body.replace(catalogPattern, catalog => catalogs.has(catalog) ? "" : catalog)
+      if (remaining === body) return whole
+      return remaining.trim() ? `${whole.startsWith("\n") ? "\n" : ""}<system-update>\n${remaining}\n</system-update>` : ""
+    },
+  )
+  const conversationMessages = messages.map(message => {
+    const item = record(message)
+    if (item?.role !== "user") return message
+    if (typeof item.content === "string") return { ...item, content: removeRepeatedUpdates(item.content) }
+    if (!Array.isArray(item.content)) return message
+    return { ...item, content: item.content.map(part => {
+      const value = record(part)
+      return typeof value?.text === "string" ? { ...value, text: removeRepeatedUpdates(value.text) } : part
+    }) }
+  })
+  return { instructions, conversationMessages }
+}
 
 function stripLoweredSystemUpdates(value: string) {
   return value
@@ -421,12 +475,11 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   // Validate before projecting individual instruction messages so original
   // system/developer boundaries and ordering survive transport.
   serializeMessages(input.messages, "instructions")
-  const instructions = instructionMode === "action-only" ? [] : (input.messages as unknown[])
-    .filter(message => ["system", "developer"].includes(String(record(message)?.role)))
-    .map(message => serializeMessages([message], "instructions"))
+  const client = projectClientInstructions(input.messages as unknown[])
+  const instructions = instructionMode === "action-only" ? [] : client.instructions
   const omitLoweredSystemUpdates = instructionMode === "action-only"
-  const conversation = serializeMessages(input.messages, "conversation", omitLoweredSystemUpdates)
-  const incrementalTranscript = incrementalMessages(input.messages, conversation, omitLoweredSystemUpdates)
+  const conversation = serializeMessages(client.conversationMessages, "conversation", omitLoweredSystemUpdates)
+  const incrementalTranscript = incrementalMessages(client.conversationMessages, conversation, omitLoweredSystemUpdates)
   const catalogTools = tools(input.tools)
   const selection = toolSelection(catalogTools, input.tool_choice)
   const stream = input.stream === true
@@ -437,19 +490,21 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   // caller instruction boundaries, then the complete active tool catalog.
   // Ordinary task/result turns carry only their keyed conversation delta.
   const startupProtocol = [
+    "CLIENT INSTRUCTIONS (AIPass response protocol and working guidelines)",
     serializeToolDefinitions([], catalogTools.length > 0),
+    "Initialization submission only. Store this initialization for subsequent turns. Reply once with exactly one chat envelope carrying the current turn key and text READY; request no action. Subsequent submissions contain task data, client progress, or action results, not repeated protocol declarations.",
+    "HARNESS INSTRUCTIONS (caller-supplied agent/workspace rules, skills, MCP and tools; original roles and order retained)",
     ...instructions,
     `Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(catalogTools.map(tool => tool.name))}. Request only names in this list.`,
-    serializeToolDefinitions(catalogTools, catalogTools.length > 0, false, false),
-    "Initialization submission only. Store the client protocol, ordered harness instructions, and complete offered action catalog for subsequent turns. Reply once with exactly one chat envelope carrying the current turn key and text READY; request no action. Subsequent submissions are task or action-result turns.",
+    serializeToolDefinitions(catalogTools, catalogTools.length > 0, false),
   ].filter(Boolean).join("\n\n")
   const primingPrompts = [startupProtocol]
   const toolChoiceNotice = input.tool_choice === "none"
     ? "Do not request a client action on this turn; answer without actions."
     : selection.required && offeredTools.length > 0
-      ? `You must request one of these available actions before giving a final answer: ${offeredTools.map(tool => tool.name).join(", ")}.`
+      ? `You may request only these actions on this turn: ${offeredTools.map(tool => tool.name).join(", ")}. You must request one before giving a final answer.`
       : ""
-  // withTurnKey adds the per-turn envelope guard at submission time.
+  // Submission adds only the changing turn key; protocol lives in startup.
   const initialPrompt = [toolChoiceNotice, conversation].filter(Boolean).join("\n")
   const autoToolChoice = input.tool_choice === undefined || input.tool_choice === "auto"
   const toolRepairPrompt = autoToolChoice && offeredTools.length > 0

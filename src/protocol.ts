@@ -119,7 +119,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 24
+export const PROMPT_CONTRACT_VERSION = 25
 // Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
 export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
 const MAX_TOOL_FRAME = 64 * 1024
@@ -224,6 +224,18 @@ function envelopeID(value: unknown): string {
   return `call_${randomUUID()}`
 }
 
+// Some upstream turns omit only the required `type` from the documented
+// answer shape. Keep this deliberately narrower than generic JSON: a current
+// turn key, the documented answer_* ID, and free text must all be present;
+// action-bearing fields remain on the strict tool path below.
+function missingTypeAnswerText(item: Record<string, unknown>): string | undefined {
+  if (item.type !== undefined || typeof item.key !== "string" || !item.key) return undefined
+  if (typeof item.id !== "string" || !/^answer_[A-Za-z0-9_.:-]{1,121}$/.test(item.id)) return undefined
+  if (typeof item.text !== "string" || !item.text) return undefined
+  if (item.name !== undefined || item.input !== undefined || item.steps !== undefined) return undefined
+  return item.text
+}
+
 // Narrow repair for model-malformed chat/thinking envelopes whose free-prose
 // text contains unescaped quotes (live evidence: a rating answer containing
 // "Version 1" broke JSON.parse, so the raw envelope leaked to the client as
@@ -285,6 +297,11 @@ export function parseTypedEnvelope(value: unknown, offered: ReadonlySet<string>)
   if (!item) return undefined
   const rawType = item.type
   if (typeof rawType !== "string" || !ENVELOPE_TYPES.has(rawType)) {
+    const answer = missingTypeAnswerText(item)
+    if (answer !== undefined) {
+      console.error("aipass envelope type=chat missing-type")
+      return [{ type: "text", delta: answer }]
+    }
     // Live (terra): typeless tool envelope {"key":...,"id":...,"name":"read","input":{...}}
     // omits "type". Accept only confidently tool-shaped objects: valid name
     // plus id/key/input presence, validated against the offered set.
@@ -393,6 +410,11 @@ export function envelopeKeys(text: string): string[] {
     if (!item) continue
     const itemType = item.type
     if (typeof itemType !== "string" || !ENVELOPE_TYPES.has(itemType)) {
+      if (missingTypeAnswerText(item) !== undefined) {
+        const key = item.key
+        if (typeof key === "string" && key) keys.push(key)
+        continue
+      }
       // Typeless tool envelope: valid name plus id/key/input presence.
       if (typeof item.name !== "string" || !NAME.test(item.name)) continue
       if (item.id === undefined && item.key === undefined && item.input === undefined) continue
@@ -447,6 +469,7 @@ export function hasEnvelopeShape(text: string): boolean {
     if (!shaped) return false
     const type = shaped.type
     if (typeof type === "string" && ENVELOPE_TYPES.has(type)) return true
+    if (missingTypeAnswerText(shaped) !== undefined) return true
     // Typeless tool envelope (live terra omits "type").
     if (typeof shaped.name !== "string" || !NAME.test(shaped.name)) return false
     return shaped.id !== undefined || shaped.key !== undefined || shaped.input !== undefined
@@ -470,6 +493,7 @@ function completionEnvelopes(text: string): Record<string, unknown>[] {
   if (!values.length) return []
   if (!values.every((item) => item && (
     typeof item.type === "string" && ENVELOPE_TYPES.has(item.type) ||
+    missingTypeAnswerText(item) !== undefined ||
     typeof item.name === "string" && NAME.test(item.name) &&
       (item.id !== undefined || item.key !== undefined || item.input !== undefined)
   ))) return []
@@ -566,7 +590,8 @@ export function envelopesMatchTurnKey(text: string, expectedKey: string): boolea
     const item = record(value)
     if (!item) continue
     const typed = typeof item.type === "string" && ENVELOPE_TYPES.has(item.type)
-    const typeless = typeof item.name === "string" && NAME.test(item.name) &&
+    const typeless = missingTypeAnswerText(item) !== undefined ||
+      typeof item.name === "string" && NAME.test(item.name) &&
       (item.id !== undefined || item.key !== undefined || item.input !== undefined)
     if ((typed || typeless) && item.key !== expectedKey) return false
   }
@@ -805,18 +830,33 @@ export const WEBCHAT_ROLE_INSTRUCTION = [
   "Files, folders, shell, MCP: use exact offered names and schema-valid input; do not guess arguments.",
   "Claim success only from client results. Preserve site instructions, safety, privacy, and authorization.",
   "No offered actions: chat.",
-  'FIRST line: "TURN KEY: <key>". Every envelope: verbatim "key", unique "id".',
-  "Replies and refusals: only <aipass-envelope>{...}</aipass-envelope>, no outside prose, JSON, or fences.",
-  "Thinking is optional reasoning, never a final answer; chat ends the turn.",
-  'Shapes: {"type":"thinking","key":"<key>","id":"reason_1","text":"..."} | {"type":"chat","key":"<key>","id":"answer_1","text":"..."}.',
-  "Every response carries the current turn key: never emit text outside envelopes.",
-].join(" ")
+  'Each submission starts with "TURN KEY: <key>". Copy that key verbatim into every response envelope and assign each a unique "id".',
+  EVERY_TURN_ENVELOPE_GUARD,
+  `The "type" field is required. type enum: ${JSON.stringify([...ENVELOPE_TYPES])}. Do not omit it or invent another value.`,
+  "Response type matrix (common fields: type, key, id; examples use placeholders, not real action arguments):",
+  "| type | When to use | Payload example | Client handling |",
+  "| --- | --- | --- | --- |",
+  '| chat | Final answer or refusal | <aipass-envelope>{"type":"chat","key":"<key>","id":"answer_1","text":"..."}</aipass-envelope> | Ends the turn; text is the answer. |',
+  '| thinking | Optional reasoning, never a final answer | <aipass-envelope>{"type":"thinking","key":"<key>","id":"reason_1","text":"..."}</aipass-envelope> | Reasoning only; continue to chat or an action group. |',
+  '| tool | One offered action | <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope> | Request execution, then wait for its result. |',
+  '| plan | Multiple independent offered actions, not a prose plan | <aipass-envelope>{"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]}</aipass-envelope> | Request all steps; dependent actions need later result turns. |',
+  '| subagent | Delegate through an offered subagent action | <aipass-envelope>{"type":"subagent","key":"<key>","id":"call_1","input":{}}</aipass-envelope> | Client owns delegation and results. |',
+  '| skill | Load an offered skill through the client | <aipass-envelope>{"type":"skill","key":"<key>","id":"call_1","input":{}}</aipass-envelope> | Client returns the skill content; do not invent it. |',
+  '| question | Ask through an offered question action | <aipass-envelope>{"type":"question","key":"<key>","id":"call_1","input":{}}</aipass-envelope> | Wait for the client-supplied answer. |',
+  '| permission | Request authorization through an offered permission action | <aipass-envelope>{"type":"permission","key":"<key>","id":"call_1","input":{}}</aipass-envelope> | Wait for an actual decision; never infer approval. |',
+  "The last four action types default to the same-named offered tool; supply name only when the offered action uses a different exact name. They are not native webchat capabilities. Use the full schemas supplied during startup. Every action input must satisfy its schema, including all required fields.",
+  "Working flow:",
+  "1. Read the current task or result delta together with the initialized harness instructions and conversation context.",
+  "2. Decide whether context already supports an answer or an offered client action is needed. Per-turn action restrictions override catalog availability. Optional thinking may explain the decision.",
+  "3. Respond with thinking* followed by one final chat or one action group, and nothing else. Do not emit legacy <aipass-action> wrappers. Stop after requesting actions; do not fabricate their results or append a premature final answer.",
+  "4. Wait for actual client results or permission/question decisions. Continue on the next submission using its new turn key, including after a failure or denial.",
+  "5. When evidence supports completion, emit chat. Do not copy initialization declarations into task answers. Respond in English unless the user explicitly requests another language in their message.",
+].join("\n")
 
 export function serializeToolDefinitions(
   tools: readonly { readonly name: string; readonly description?: string; readonly inputSchema: unknown }[],
   actionsAvailable = tools.length > 0,
   includeRole = true,
-  includeActionProtocol = true,
 ) {
   const role = includeRole ? WEBCHAT_ROLE_INSTRUCTION : ""
   if (!actionsAvailable) return role
@@ -825,16 +865,7 @@ export function serializeToolDefinitions(
     ...(tool.description ? { description: tool.description } : {}),
     inputSchema: tool.inputSchema,
   }))
-  const actionProtocol = includeActionProtocol ? [
-    'When an offered action is needed, request the calling client by emitting exactly <aipass-envelope>{"type":"tool","key":"<key>","id":"call_unique","name":"offered_name","input":{}}</aipass-envelope>, with input matching that action\'s schema.',
-    "Use the full schemas supplied during startup. Every action input must satisfy its schema, including all required fields. Do not guess arguments.",
-    "Do not emit legacy <aipass-action> wrappers. Stop after an action envelope; the client will return the result so you can continue.",
-    "Respond in English unless the user explicitly requests another language in their message.",
-    "Responses are a chain of one or more typed envelopes and nothing else: thinking* then at most one action group (tool | plan | subagent | skill | question | permission) then thinking* then a final chat or action envelope.",
-    "Multi-step work uses plan with a steps array. A final action envelope means the client executes the requested actions and continues the loop with a new turn key until a chat envelope finalizes.",
-    'Action shapes: {"type":"tool","key":"<key>","id":"call_1","name":"offered_name","input":{}} | {"type":"plan","key":"<key>","id":"plan_1","steps":[{"id":"call_1","name":"offered_name","input":{}}]} | {"type":"subagent","key":"<key>","id":"call_1","input":{}} | {"type":"skill","key":"<key>","id":"call_1","input":{}} | {"type":"question","key":"<key>","id":"call_1","input":{}} | {"type":"permission","key":"<key>","id":"call_1","input":{}}.',
-  ].join(" ") : ""
-  return [role, actionProtocol, tools.length ? `Offered actions:\n${JSON.stringify(definitions)}` : ""].filter(Boolean).join("\n\n")
+  return [role, tools.length ? `Offered actions:\n${JSON.stringify(definitions)}` : ""].filter(Boolean).join("\n\n")
 }
 
 function chunk(

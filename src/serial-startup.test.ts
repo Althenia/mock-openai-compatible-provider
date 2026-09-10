@@ -16,7 +16,8 @@ test("one startup submission preserves ordered instruction boundaries separately
   ])
   expect(turn.primingPrompts).toHaveLength(1)
   const startup = turn.primingPrompts[0]!
-  expect(startup).toStartWith("You are a text-generation assistant working only as the backend.")
+  expect(startup).toStartWith("CLIENT INSTRUCTIONS")
+  expect(startup).toContain("HARNESS INSTRUCTIONS")
   let previous = 0
   for (const instruction of ["SYSTEM: HARNESS", "DEVELOPER: AGENT", "SYSTEM: WORKSPACE"]) {
     expect(startup.indexOf(instruction)).toBeGreaterThan(previous)
@@ -46,7 +47,7 @@ test("startup alone carries all schemas and one acknowledgement instruction", ()
   const startup = turn.primingPrompts.join("\n")
   expect(startup.match(/READY/g)).toHaveLength(1)
   expect(startup.match(/You are a text-generation assistant/g)).toHaveLength(1)
-  expect(startup.match(/Action shapes:/g)).toHaveLength(1)
+  expect(startup.match(/Response type matrix/g)).toHaveLength(1)
   for (const name of ["read", "question"]) expect(startup).toContain(`"name":"${name}"`)
   expect(turn.primingPrompts).toHaveLength(1)
   expect(turn.provisionedActions).toEqual(["read", "question"])

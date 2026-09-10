@@ -17,7 +17,7 @@ import {
   type BrowserProtocol,
 } from "./browser.ts"
 import { LOOPBACK_HOST, MODELS, model, persistRuntimeConfig, readRuntimeConfig, type Settings } from "./config.ts"
-import type { ProjectedTurn } from "./http.ts"
+import { randomTurnKey, type ProjectedTurn } from "./http.ts"
 import {
   collectOpenAIChatResult,
   ENVELOPE_CLOSE,
@@ -340,6 +340,24 @@ class KeyedThinkingParser {
   }
 }
 
+function withDerivedKey(base: ProjectedTurn): ProjectedTurn {
+  return { ...base, promptKey: randomTurnKey(), originPromptKey: base.promptKey }
+}
+
+function withRetryReference(failed: ProjectedTurn): ProjectedTurn {
+  if (!failed.promptKey) throw new NoResponseEvidenceError()
+  const body = `RETRY OF: ${failed.promptKey}`
+  return {
+    ...withDerivedKey(failed),
+    primingPrompts: [],
+    initialPrompt: body,
+    incrementalPrompt: body,
+    recoveryPrompt: body,
+    compactionDigest: undefined,
+    toolRepairPrompt: undefined,
+  }
+}
+
 function declaredFromEnvelopeValue(value: unknown): Array<{ readonly name: string; readonly input: unknown }> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return []
   const item = value as Record<string, unknown>
@@ -562,7 +580,8 @@ export class StandaloneBrowserService implements BrowserService {
     const adapter = this.adapter
     const adapterTurn = async function* (projected: ProjectedTurn, recovery: boolean): AsyncGenerator<BrowserFrame> {
       let safetyTail = ""
-      for await (const frame of adapter.turn({
+      const linked = projected as ProjectedTurn & { originPromptKey?: string }
+      const observed = {
         sessionMarker: projected.sessionMarker,
         ephemeral: false,
         primingPrompts: projected.primingPrompts,
@@ -577,7 +596,9 @@ export class StandaloneBrowserService implements BrowserService {
         toolContinuation: projected.toolContinuation,
         attachments: projected.attachments,
         promptKey: projected.promptKey,
-      }, signal, { forceReload: recovery })) {
+        ...(linked.originPromptKey === undefined ? {} : { originPromptKey: linked.originPromptKey }),
+      }
+      for await (const frame of adapter.turn(observed, signal, { forceReload: recovery })) {
         if (frame.type === "text") {
           const text = safetyTail + frame.delta
           if (isWebchatSafetyBlock(text)) throw new WebchatSafetyBlockError()
@@ -591,22 +612,6 @@ export class StandaloneBrowserService implements BrowserService {
         ?? (input.toolContinuation && (input.offeredToolSchemas ?? []).length > 0
           ? "Reconsider only a lack-of-client-action-access refusal using the actions and schemas supplied during startup. Do not override safety, privacy, authorization, or policy restrictions."
           : undefined)
-      const repair = repairPrompt
-        ? () => {
-            const prompt = [repairPrompt, input.incrementalPrompt].filter(Boolean).join("\n\n")
-            console.error(`aipass turn repair start promptChars=${prompt.length}`)
-            const repairInput: ProjectedTurn = {
-              ...input,
-              primingPrompts: [],
-              initialPrompt: prompt,
-              incrementalPrompt: prompt,
-              recoveryPrompt: prompt,
-              compactionDigest: undefined,
-              toolRepairPrompt: undefined,
-            }
-            return recoverNoResponseEvidence((recovery) => adapterTurn(repairInput, recovery), false)
-          }
-        : undefined
       const shown = this.shownFor(marker)
       for (const name of input.provisionedActions ?? []) shown.add(name)
       const collected: BrowserFrame[] = []
@@ -631,53 +636,81 @@ export class StandaloneBrowserService implements BrowserService {
         interface CollectedAttempt {
           readonly frames: BrowserFrame[]
           readonly progressiveParser?: KeyedThinkingParser
+          readonly submitted: ProjectedTurn
         }
-        const collectOne = async function* (projected: ProjectedTurn, progressive: boolean): AsyncGenerator<BrowserFrame, CollectedAttempt> {
-          const source = recoverNoResponseEvidence(
-            (recovery) => adapterTurn(projected, recovery),
-            projected.initialPrompt !== projected.incrementalPrompt,
-          )
-          const raw: BrowserFrame[] = []
-          const progressiveParser = progressive && projected.promptKey
-            ? new KeyedThinkingParser(projected.promptKey, new Set(projected.offeredActions))
-            : undefined
-          for await (const frame of source) {
-            if (signal?.aborted) throw new Error("browser turn was cancelled")
-            // Browser-attributed DOM reasoning and complete tagged thinking
-            // envelopes may cross early. Terminal chat/actions remain in raw
-            // until the entire response chain validates.
-            if (progressive && frame.type === "reasoning" && projected.promptKey && frame.domTurnKey === projected.promptKey) {
-              if (reasoningSource === undefined || reasoningSource === "dom") {
-                reasoningSource = "dom"
-                progressed = true
-                collected.push(frame)
-                yield frame
+        const collectOne = async function* (projected: ProjectedTurn, progressive: boolean, recoveryEnabled: boolean): AsyncGenerator<BrowserFrame, CollectedAttempt> {
+          let current = projected
+          let raw: BrowserFrame[] = []
+          let progressiveParser: KeyedThinkingParser | undefined
+          for (let attempt = 0; ; attempt++) {
+            raw = []
+            progressiveParser = progressive && current.promptKey
+              ? new KeyedThinkingParser(current.promptKey, new Set(current.offeredActions))
+              : undefined
+            let emitted = false
+            try {
+              for await (const frame of adapterTurn(current, attempt > 0)) {
+                emitted = true
+                if (signal?.aborted) throw new Error("browser turn was cancelled")
+                // Browser-attributed DOM reasoning and complete tagged thinking
+                // envelopes may cross early. Terminal chat/actions remain in raw
+                // until the entire response chain validates.
+                if (progressive && frame.type === "reasoning" && current.promptKey && frame.domTurnKey === current.promptKey) {
+                  if (reasoningSource === undefined || reasoningSource === "dom") {
+                    reasoningSource = "dom"
+                    progressed = true
+                    collected.push(frame)
+                    yield frame
+                  }
+                  continue
+                }
+                raw.push(frame)
+                if (frame.type !== "text" || !progressiveParser) continue
+                for (const envelope of progressiveParser.push(frame.delta)) {
+                  if (reasoningSource !== undefined && reasoningSource !== "typed") continue
+                  reasoningSource = "typed"
+                  progressed = true
+                  const published = { type: "text" as const, delta: envelope }
+                  collected.push(published)
+                  yield published
+                }
               }
+            } catch (error) {
+              if (!(error instanceof NoResponseEvidenceError) || emitted || !recoveryEnabled || attempt > 0) throw error
+              current = withRetryReference(current)
               continue
             }
-            raw.push(frame)
-            if (frame.type !== "text" || !progressiveParser) continue
-            for (const envelope of progressiveParser.push(frame.delta)) {
-              if (reasoningSource !== undefined && reasoningSource !== "typed") continue
-              reasoningSource = "typed"
-              progressed = true
-              const published = { type: "text" as const, delta: envelope }
-              collected.push(published)
-              yield published
-            }
+            break
           }
-          if (isEnvelopeKeyMismatch(raw, projected.promptKey)) return { frames: raw, progressiveParser }
+          if (isEnvelopeKeyMismatch(raw, current.promptKey)) return { frames: raw, progressiveParser, submitted: current }
           const frames: BrowserFrame[] = []
-          for await (const frame of repairToolRefusal(raw, repair, projected.offeredActions)) frames.push(frame)
-          return { frames, progressiveParser }
+          const repair = repairPrompt
+            ? () => {
+                const prompt = [repairPrompt, current.incrementalPrompt].filter(Boolean).join("\n\n")
+                console.error(`aipass turn repair start promptChars=${prompt.length}`)
+                current = withDerivedKey({
+                  ...current,
+                  primingPrompts: [],
+                  initialPrompt: prompt,
+                  incrementalPrompt: prompt,
+                  recoveryPrompt: prompt,
+                  compactionDigest: undefined,
+                  toolRepairPrompt: undefined,
+                })
+                return adapterTurn(current, false)
+              }
+            : undefined
+          for await (const frame of repairToolRefusal(raw, repair, current.offeredActions)) frames.push(frame)
+          return { frames, progressiveParser, submitted: current }
         }
         const collectValidated = async function* (projected: ProjectedTurn, progressive = false): AsyncGenerator<BrowserFrame, CollectedAttempt> {
-          let attempt = yield* collectOne(projected, progressive)
-          if (isEnvelopeKeyMismatch(attempt.frames, projected.promptKey) && !progressed) {
+          const recoveryEnabled = projected.initialPrompt !== projected.incrementalPrompt
+          let attempt = yield* collectOne(projected, progressive, recoveryEnabled)
+          if (isEnvelopeKeyMismatch(attempt.frames, attempt.submitted.promptKey) && !progressed) {
             console.error("aipass turn key mismatch retry=true")
-            attempt = yield* collectOne(projected, progressive)
+            attempt = yield* collectOne(withRetryReference(attempt.submitted), progressive, recoveryEnabled)
           }
-          await validate(attempt.frames, projected)
+          await validate(attempt.frames, attempt.submitted)
           return attempt
         }
         const initialAttempt = yield* collectValidated(input, true)
@@ -713,15 +746,15 @@ export class StandaloneBrowserService implements BrowserService {
           ].filter(Boolean).join("\n\n")
           console.error(`aipass turn provision start tools=${need.join(",")} promptChars=${provisionPrompt.length}`)
           for (const name of need) shown.add(name)
-          const provisionInput: ProjectedTurn = {
-            ...input,
+          const provisionInput = withDerivedKey({
+            ...initialAttempt.submitted,
             primingPrompts: [],
             initialPrompt: provisionPrompt,
             incrementalPrompt: provisionPrompt,
             recoveryPrompt: provisionPrompt,
             compactionDigest: undefined,
             toolRepairPrompt: undefined,
-          }
+          })
           const provisionAttempt = yield* collectValidated(provisionInput)
           console.error(`aipass turn provision done tools=${need.join(",")} frames=${provisionAttempt.frames.length}`)
           for (const frame of finalFrames(provisionAttempt)) {

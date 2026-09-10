@@ -233,7 +233,7 @@ describe("OpenAI stream and tool bridge", () => {
     ])
     expect(bridge).toContain('"description":"Read a local path"')
     expect(bridge).toContain("<aipass-action>")
-    expect(bridge).toContain("request the calling client")
+    expect(bridge).toContain("Request execution, then wait for its result.")
   })
 
   test("emits one terminal OpenAI finish and DONE marker", async () => {
@@ -332,7 +332,7 @@ describe("authenticated OpenAI request boundary", () => {
     expect(parsed.turn.incrementalPrompt).not.toContain("PRIVATE_SYSTEM")
     expect(parsed.turn.incrementalPrompt).not.toContain('"name":"read"')
     expect(parsed.turn.incrementalPrompt).not.toContain("<aipass-action>")
-    expect(parsed.turn.promptContractVersion).toBe(24)
+    expect(parsed.turn.promptContractVersion).toBe(25)
     expect(parsed.turn.actionEnvelopeDigest).toMatch(/^[a-f0-9]{64}$/)
     expect(parsed.turn.toolContinuation).toBe(false)
     expect(parsed.turn.recoveryPrompt).not.toContain("PRIVATE_SYSTEM")

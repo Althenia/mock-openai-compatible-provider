@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test"
-import { chromium, type Page } from "playwright-core"
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test"
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -71,18 +71,41 @@ async function fixture(page: Page, locale: "en" | "th", failure = "") {
   await page.setContent(fixtureHTML(locale, failure))
 }
 
-async function browser() {
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
-  if (command.type !== "serve") throw Error("expected browser settings")
-  return chromium.launch({ executablePath: command.settings.chromeExecutable, headless: true })
-}
+describe("Processing browser fixtures", () => {
+  let chrome: Browser | undefined
+  let context: BrowserContext | undefined
+  let page: Page
+  let transportPulse: ReturnType<typeof setInterval>
+
+  beforeAll(async () => {
+    // Keep Bun's Playwright pipe callbacks awake through setup and teardown.
+    transportPulse = setInterval(() => {}, 10).unref()
+    try {
+      const command = parseCommand(["start"], {}, { verifyChrome: false })
+      if (command.type !== "serve") throw Error("expected browser settings")
+      chrome = await chromium.launch({ executablePath: command.settings.chromeExecutable, headless: true })
+    } catch (error) {
+      clearInterval(transportPulse)
+      throw error
+    }
+  })
+
+  beforeEach(async () => {
+    context = await chrome!.newContext()
+    page = await context.newPage()
+  })
+
+  afterEach(async () => {
+    try { await context?.close() }
+    finally { context = undefined }
+  })
+
+  afterAll(async () => {
+    try { await chrome?.close() }
+    finally { clearInterval(transportPulse) }
+  })
 
 for (const locale of ["en", "th"] as const) test(`Processing ${locale}: named variants, verification and closure across same-session changes`, async () => {
-  // Keep Bun's Playwright transport awake during short-deadline fixture operations.
-  const transportPulse = setInterval(() => {}, 10).unref()
-  const chrome = await browser()
-  const page = await chrome.newPage()
-  try {
     await fixture(page, locale)
     const surface = new PlaywrightModelSelectionSurface(page, { modelLoader: "#model" })
     for (const [index, reasoning] of [[0, "low"], [0, "low"], [0, "high"], [0, "none"], [1, "max"], [1, "medium"], [2, "none"], [0, "low"]] as const) {
@@ -100,14 +123,9 @@ for (const locale of ["en", "th"] as const) test(`Processing ${locale}: named va
         ? [`confirm:${index}:${reasoning}`, "closed"]
         : [`processing:${index}`, `level:${choice}`, `confirm:${index}:${reasoning}`, "closed"])
     }
-  } finally { clearInterval(transportPulse); await chrome.close() }
 }, 25_000)
 
 test("Processing opens only after scrolling its full trigger into view", async () => {
-  const transportPulse = setInterval(() => {}, 10).unref()
-  const chrome = await browser()
-  const page = await chrome.newPage()
-  try {
     await fixture(page, "en")
     await page.addStyleTag({ content: '#picker { position:fixed; top:40px; height:300px; overflow:auto; width:600px } #card0 { margin-top:500px; padding-bottom:200px } [data-testid="thinking-level-trigger"] { display:flex; height:60px; width:500px; align-items:start } [data-slot="popover-content"][data-open] { position:fixed; top:100px; right:10px }' })
     await page.evaluate(() => {
@@ -130,14 +148,9 @@ test("Processing opens only after scrolling its full trigger into view", async (
     await selectModel(new PlaywrightModelSelectionSurface(page, { modelLoader: "#model" }), { ...models[0]!, reasoning: "low" }, { timeoutMs: 2500 })
     expect(await page.locator("body").getAttribute("data-selected")).toBe("0:low")
     expect(await page.locator("#picker").isVisible()).toBe(false)
-  } finally { clearInterval(transportPulse); await chrome.close() }
 }, 6000)
 
 test("Processing selects a named option without pointer-induced popup dismissal", async () => {
-  const transportPulse = setInterval(() => {}, 10).unref()
-  const chrome = await browser()
-  const page = await chrome.newPage()
-  try {
     await fixture(page, "en")
     await page.evaluate(() => {
       const popup = document.querySelector<HTMLElement>("#levels0")!
@@ -150,14 +163,9 @@ test("Processing selects a named option without pointer-induced popup dismissal"
     await selectModel(new PlaywrightModelSelectionSurface(page, { modelLoader: "#model" }), { ...models[0]!, reasoning: "low" }, { timeoutMs: 3000 })
     expect(await page.locator("body").getAttribute("data-pointer-dismissed")).toBeNull()
     expect(await page.locator("body").getAttribute("data-selected")).toBe("0:low")
-  } finally { clearInterval(transportPulse); await chrome.close() }
 }, 6000)
 
 for (const failure of ["missing", "missing-control", "missing-option", "disabled-option", "missing-link", "wrong-link", "unknown-value", "wrong-value", "stuck", "wrong-model"]) test(`Processing fails closed when ${failure}`, async () => {
-  const transportPulse = setInterval(() => {}, 10).unref()
-  const chrome = await browser()
-  const page = await chrome.newPage()
-  try {
     await fixture(page, "en", failure)
     await expect(selectModel(new PlaywrightModelSelectionSurface(page, { modelLoader: "#model" }),
       { ...models[1]!, reasoning: "low" }, { timeoutMs: 1800 })).rejects.toThrow()
@@ -166,8 +174,8 @@ for (const failure of ["missing", "missing-control", "missing-option", "disabled
     expect(await page.locator("textarea").inputValue()).toBe("")
     if (failure === "stuck" || failure === "wrong-model") expect(await page.locator("body").getAttribute("data-selected")).toBe("1:low")
     else expect(await page.locator("body").getAttribute("data-selected")).toBeNull()
-  } finally { clearInterval(transportPulse); await chrome.close() }
 }, 6000)
+})
 
 for (const failure of ["", "stuck"]) test(`adapter sends only after model/variant verification and closure${failure ? " (stuck picker)" : " across a retained session"}`, async () => {
   const transportPulse = setInterval(() => {}, 10).unref()

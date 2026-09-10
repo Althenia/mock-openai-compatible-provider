@@ -26,7 +26,7 @@ export async function runSerialStartup(options: SerialStartupOptions): Promise<n
   return estimate
 }
 export function withTurnKey(prompt: string, promptKey?: string): string {
-  const guarded = prompt.startsWith(EVERY_TURN_ENVELOPE_GUARD) ? prompt : `${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`
-  if (!promptKey) return guarded
-  return `TURN KEY: ${promptKey}\n\n${guarded}`
+  if (!promptKey) return prompt
+  if (prompt.includes(EVERY_TURN_ENVELOPE_GUARD)) return `TURN KEY: ${promptKey}\n\n${prompt}`
+  return `TURN KEY: ${promptKey}\n\n${EVERY_TURN_ENVELOPE_GUARD}\n\n${prompt}`
 }

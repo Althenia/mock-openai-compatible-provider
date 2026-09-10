@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 
-import { NoResponseEvidenceError, type BrowserTurnInput } from "./browser.ts"
+import { NoResponseEvidenceError, withTurnKey, type BrowserTurnInput } from "./browser.ts"
 import { parseOpenAIChatRequest } from "./http.ts"
 import {
   SingleFlightCompletionStore,
@@ -9,7 +9,7 @@ import {
   recoverNoResponseEvidence,
   repairToolRefusal,
 } from "./runtime.ts"
-import { collectOpenAIChatResult, envelopeKey, hasEnvelopeShape } from "./protocol.ts"
+import { collectOpenAIChatResult, envelopeKey, EVERY_TURN_ENVELOPE_GUARD, hasEnvelopeShape } from "./protocol.ts"
 import type { BrowserFrame } from "./protocol.ts"
 
 for (const tagged of [false, true]) test(`preserves ${tagged ? "tagged" : "bare"} attributed grouped calls through legacy action repair`, async () => {
@@ -106,10 +106,12 @@ describe("internal continuation request fidelity", () => {
         for await (const frame of service.turn(parsed.turn)) frames.push(frame)
         expect(submitted).toHaveLength(2)
         expect(JSON.stringify(frames)).toContain("alpha or beta?")
-        const next = submitted[1]!
+        const next = submitted[1]! as BrowserTurnInput & { originPromptKey?: string }
         expect(submitted[0]!.primingPrompts).toEqual(parsed.turn.primingPrompts)
         expect(next.primingPrompts).toEqual([])
-        expect(next.promptKey).toBe(parsed.turn.promptKey)
+        expect(next.promptKey).toBeTruthy()
+        expect(next.promptKey).not.toBe(parsed.turn.promptKey)
+        expect(next.originPromptKey).toBe(parsed.turn.promptKey)
         for (const prompt of [next.initialPrompt, next.incrementalPrompt, next.recoveryPrompt]) {
           expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
           expect(prompt).not.toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
@@ -132,6 +134,199 @@ describe("internal continuation request fidelity", () => {
       })
     }
   }
+})
+
+describe("sub-sequence keys and key-referenced retry", () => {
+  type Linked = BrowserTurnInput & { originPromptKey?: string }
+
+  function chatEnvelope(key: string | undefined, text: string) {
+    return { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "chat", key, id: "answer", text })}</aipass-envelope>` } as BrowserFrame
+  }
+
+  test("chain capture across initial + tool-continuation + repair + provision uses distinct keys", async () => {
+    const parsed = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite",
+      session_id: "chain-distinct-keys",
+      messages: [
+        { role: "assistant", content: "", tool_calls: [{ id: "call_prev", function: { name: "read", arguments: '{"path":"prev.txt"}' } }] },
+        { role: "tool", tool_call_id: "call_prev", content: "PREV_RESULT" },
+        { role: "user", content: "CHAIN_DELTA_TASK" },
+      ],
+      tools: [{ type: "function", function: { name: "question", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } }],
+    }, new Headers())
+    const seen: Linked[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      const attempt = seen.length + 1
+      seen.push(input as Linked)
+      if (attempt === 1) {
+        yield { type: "text", delta: JSON.stringify({ type: "question", key: input.promptKey, id: "q_first", input: { query: "Which fixture?" } }) } as BrowserFrame
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+        return
+      }
+      if (attempt === 2) {
+        yield { type: "text", delta: "I cannot access the question tool here." } as BrowserFrame
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+        return
+      }
+      if (attempt === 3) {
+        yield chatEnvelope(input.promptKey, "REPAIR-BEFORE-PROVISION") as BrowserFrame
+        yield { type: "text", delta: JSON.stringify({ type: "question", key: input.promptKey, id: "q_missing", input: {} }) } as BrowserFrame
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+        return
+      }
+      yield chatEnvelope(input.promptKey, "CHAIN-DONE") as BrowserFrame
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never, { waitMs: 50 })
+    const frames: BrowserFrame[] = []
+    for await (const frame of service.turn(parsed.turn)) frames.push(frame)
+    const continuation = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite", session_id: "chain-distinct-keys",
+      messages: [
+        { role: "user", content: "CHAIN_DELTA_TASK" },
+        { role: "assistant", content: "", tool_calls: [{ id: "q_first", function: { name: "question", arguments: '{"query":"Which fixture?"}' } }] },
+        { role: "tool", tool_call_id: "q_first", content: "Use alpha." },
+      ],
+      tools: [{ type: "function", function: { name: "question", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } }],
+    }, new Headers())
+    for await (const frame of service.turn(continuation.turn)) frames.push(frame)
+    expect(seen).toHaveLength(4)
+    for (const input of seen) expect(input.promptKey).toBeTruthy()
+    expect(new Set(seen.map((input) => input.promptKey)).size).toBe(seen.length)
+    expect(seen[0]!.promptKey).toBe(parsed.turn.promptKey)
+    expect(seen.map(input => input.toolContinuation)).toEqual([false, true, true, true])
+    expect(seen[2]!.originPromptKey).toBe(seen[1]!.promptKey)
+    expect(seen[3]!.originPromptKey).toBe(seen[2]!.promptKey)
+    expect(JSON.stringify(frames)).toContain("CHAIN-DONE")
+  })
+
+  test("key-mismatch retry submits the frozen retry reference with a fresh key", async () => {
+    const parsed = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite",
+      session_id: "retry-reference",
+      messages: [{ role: "user", content: "RETRY_ORIGINAL_DELTA_BODY" }],
+    }, new Headers())
+    const originalKey = parsed.turn.promptKey!
+    const seen: Linked[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      seen.push(input as Linked)
+      if (seen.length === 1) {
+        yield chatEnvelope("WRONG", "first") as BrowserFrame
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+        return
+      }
+      yield chatEnvelope(input.promptKey, "second") as BrowserFrame
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never, { waitMs: 50 })
+    const frames: BrowserFrame[] = []
+    for await (const frame of service.turn(parsed.turn)) frames.push(frame)
+    expect(seen).toHaveLength(2)
+    const retryKey = seen[1]!.promptKey
+    expect(retryKey).toBeTruthy()
+    expect(retryKey).not.toBe(originalKey)
+    expect((seen[1] as Linked).originPromptKey).toBe(originalKey)
+    const retryBody = `RETRY OF: ${originalKey}`
+    for (const prompt of [seen[1]!.initialPrompt, seen[1]!.incrementalPrompt, seen[1]!.recoveryPrompt]) {
+      expect(prompt).toBe(retryBody)
+      expect(withTurnKey(prompt, retryKey)).toBe(`TURN KEY: ${retryKey}\n\n${EVERY_TURN_ENVELOPE_GUARD}\n\n${retryBody}`)
+      expect(withTurnKey(prompt, retryKey).split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2)
+      expect(prompt).not.toContain("RETRY_ORIGINAL_DELTA_BODY")
+    }
+    expect(withTurnKey(retryBody, retryKey).split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2)
+    const text = frames.map((frame) => (frame.type === "text" ? frame.delta : "")).join("")
+    expect(text).toContain("second")
+    expect(envelopeKey(text)).toBe(retryKey)
+  })
+
+  test("NoResponseEvidence recovery re-submit uses the frozen retry reference with a fresh key", async () => {
+    const parsed = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite",
+      session_id: "recovery-reference",
+      messages: [
+        { role: "assistant", content: "", tool_calls: [{ id: "call_prev", function: { name: "read", arguments: '{"path":"prev.txt"}' } }] },
+        { role: "tool", tool_call_id: "call_prev", content: "PREV_RESULT" },
+        { role: "user", content: "RECOVERY_ORIGINAL_DELTA_BODY" },
+      ],
+    }, new Headers())
+    const originalKey = parsed.turn.promptKey!
+    const seen: Linked[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      seen.push(input as Linked)
+      if (seen.length === 1) throw new NoResponseEvidenceError()
+      yield chatEnvelope(input.promptKey, "recovered") as BrowserFrame
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never, { waitMs: 50 })
+    const frames: BrowserFrame[] = []
+    for await (const frame of service.turn(parsed.turn)) frames.push(frame)
+    expect(seen).toHaveLength(2)
+    const retryKey = seen[1]!.promptKey
+    expect(retryKey).toBeTruthy()
+    expect(retryKey).not.toBe(originalKey)
+    expect((seen[1] as Linked).originPromptKey).toBe(originalKey)
+    const retryBody = `RETRY OF: ${originalKey}`
+    for (const prompt of [seen[1]!.initialPrompt, seen[1]!.incrementalPrompt, seen[1]!.recoveryPrompt]) {
+      expect(prompt).toBe(retryBody)
+      expect(withTurnKey(prompt, retryKey)).toBe(`TURN KEY: ${retryKey}\n\n${EVERY_TURN_ENVELOPE_GUARD}\n\n${retryBody}`)
+      expect(withTurnKey(prompt, retryKey).split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2)
+      expect(prompt).not.toContain("RECOVERY_ORIGINAL_DELTA_BODY")
+    }
+    expect(withTurnKey(retryBody, retryKey).split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2)
+    expect(JSON.stringify(frames)).toContain("recovered")
+  })
+
+  for (const failure of ["recovery", "repair", "provision"] as const) test(`mismatch after ${failure} references the failed submitting key`, async () => {
+    const parsed = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite", session_id: `linked-${failure}`,
+      messages: [{ role: "user", content: "ORIGINAL_DELTA" }, { role: "assistant", content: "Working." }, { role: "user", content: "LATEST_DELTA" }],
+      tools: [{ type: "function", function: { name: "read", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }],
+    }, new Headers())
+    const seen: Linked[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      seen.push(input as Linked)
+      if (seen.length === 1) {
+        if (failure === "recovery") throw new NoResponseEvidenceError()
+        yield failure === "repair" ? chatEnvelope(input.promptKey, "I cannot access files here.")
+          : { type: "text", delta: JSON.stringify({ type: "tool", key: input.promptKey, id: "read", name: "read", input: {} }) } as BrowserFrame
+      } else yield chatEnvelope(seen.length === 2 ? "WRONG" : input.promptKey, "done")
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never)
+    const result = await collectOpenAIChatResult(service.turn(parsed.turn), parsed.offered)
+    expect(result.text).toBe("done")
+    expect(seen).toHaveLength(3)
+    expect(new Set(seen.map(input => input.promptKey)).size).toBe(3)
+    expect(seen[2]!.originPromptKey).toBe(seen[1]!.promptKey)
+    for (const prompt of [seen[2]!.initialPrompt, seen[2]!.incrementalPrompt, seen[2]!.recoveryPrompt]) {
+      expect(prompt).toBe(`RETRY OF: ${seen[1]!.promptKey}`)
+    }
+  })
+
+  for (const emitted of [false, true]) test(`mismatch retry no-response recovery preserves emission boundary (${emitted})`, async () => {
+    const parsed = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", session_id: `retry-emitted-${emitted}`,
+      messages: [{ role: "user", content: "FIRST" }, { role: "assistant", content: "Working." }, { role: "user", content: "DELTA" }],
+    }, new Headers())
+    const seen: Linked[] = []
+    const reloads: boolean[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput, _signal: AbortSignal, options: { forceReload: boolean }) {
+      seen.push(input as Linked)
+      reloads.push(options.forceReload)
+      if (seen.length === 1) yield chatEnvelope("WRONG", "stale")
+      else if (seen.length === 2) {
+        if (emitted) yield { type: "text", delta: "partial" } as BrowserFrame
+        throw new NoResponseEvidenceError()
+      } else yield chatEnvelope(input.promptKey, "recovered")
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never)
+    if (emitted) {
+      await expect(collectOpenAIChatResult(service.turn(parsed.turn), parsed.offered)).rejects.toThrow(NoResponseEvidenceError)
+      expect(seen).toHaveLength(2)
+    } else {
+      expect((await collectOpenAIChatResult(service.turn(parsed.turn), parsed.offered)).text).toBe("recovered")
+      expect(seen).toHaveLength(3)
+      expect(seen[2]!.originPromptKey).toBe(seen[1]!.promptKey)
+      expect(seen[2]!.initialPrompt).toBe(`RETRY OF: ${seen[1]!.promptKey}`)
+      expect(new Set(seen.map(input => input.promptKey)).size).toBe(3)
+      expect(reloads).toEqual([false, false, true])
+    }
+  })
 })
 
 describe("internal no-response recovery", () => {
@@ -631,14 +826,14 @@ describe("automatic tool-refusal repair", () => {
     }
     let adapterTurns = 0
     const adapter = {
-      async *turn() {
+      async *turn(input: BrowserTurnInput) {
         adapterTurns++
         if (adapterTurns === 1) {
           yield { type: "text", delta: "I cant access that specific question tool here" } as BrowserFrame
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q2","input":{"query":"which file?"}}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q2", key: input.promptKey, input: { query: "which file?" } })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -678,15 +873,15 @@ describe("automatic tool-refusal repair", () => {
     }
     let adapterTurns = 0
     const adapter = {
-      async *turn(input: { initialPrompt: string }) {
+      async *turn(input: { initialPrompt: string; promptKey?: string }) {
         adapterTurns++
         if (adapterTurns === 1) {
           yield { type: "text", delta: "Sure, " } as BrowserFrame
-          yield { type: "text", delta: JSON.stringify({ type: "question", id: "q1", input: {} }) } as BrowserFrame
+          yield { type: "text", delta: JSON.stringify({ type: "question", id: "q1", key: input.promptKey, input: {} }) } as BrowserFrame
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q2","input":{"query":"which file?"}}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q2", key: input.promptKey, input: { query: "which file?" } })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -910,15 +1105,15 @@ describe("duplicate-submit single-flight", () => {
     let adapterTurns = 0
     const seenPrompts: string[] = []
     const adapter = {
-      async *turn(input: { initialPrompt: string }) {
+      async *turn(input: { initialPrompt: string; promptKey?: string }) {
         adapterTurns++
         seenPrompts.push(input.initialPrompt)
         if (adapterTurns === 1) {
-          yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q1","input":{}}</aipass-envelope>' } as BrowserFrame
+          yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q1", key: input.promptKey, input: {} })}</aipass-envelope>` } as BrowserFrame
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q2","input":{"query":"which file?"}}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q2", key: input.promptKey, input: { query: "which file?" } })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -950,15 +1145,15 @@ describe("duplicate-submit single-flight", () => {
     let adapterTurns = 0
     const seenPrompts: string[] = []
     const adapter = {
-      async *turn(input: { initialPrompt: string }) {
+      async *turn(input: { initialPrompt: string; promptKey?: string }) {
         adapterTurns++
         seenPrompts.push(input.initialPrompt)
         if (adapterTurns === 1) {
-          yield { type: "text", delta: JSON.stringify({ type: "question", id: "q1", input: {} }) } as BrowserFrame
+          yield { type: "text", delta: JSON.stringify({ type: "question", id: "q1", key: input.promptKey, input: {} }) } as BrowserFrame
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q2","input":{"query":"which file?"}}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q2", key: input.promptKey, input: { query: "which file?" } })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -989,15 +1184,15 @@ describe("duplicate-submit single-flight", () => {
     let adapterTurns = 0
     const seenPrompts: string[] = []
     const adapter = {
-      async *turn(input: { initialPrompt: string }) {
+      async *turn(input: { initialPrompt: string; promptKey?: string }) {
         adapterTurns++
         seenPrompts.push(input.initialPrompt)
         if (adapterTurns === 1) {
-          yield { type: "text", delta: JSON.stringify({ id: "q1", name: "question", input: {} }) } as BrowserFrame
+          yield { type: "text", delta: JSON.stringify({ id: "q1", name: "question", key: input.promptKey, input: {} }) } as BrowserFrame
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q2","input":{"query":"which file?"}}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q2", key: input.promptKey, input: { query: "which file?" } })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -1086,15 +1281,15 @@ describe("duplicate-submit single-flight", () => {
     let adapterTurns = 0
     const seenPrompts: string[] = []
     const adapter = {
-      async *turn(input: { initialPrompt: string }) {
+      async *turn(input: { initialPrompt: string; promptKey?: string }) {
         adapterTurns++
         seenPrompts.push(input.initialPrompt)
         if (adapterTurns === 1) {
-          yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q1","input":{}}</aipass-envelope>' } as BrowserFrame
+          yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q1", key: input.promptKey, input: {} })}</aipass-envelope>` } as BrowserFrame
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"question","id":"q2","input":{"query":"which file?"}}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "question", id: "q2", key: input.promptKey, input: { query: "which file?" } })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -1152,7 +1347,7 @@ describe("duplicate-submit single-flight", () => {
           yield { type: "finish", reason: "stop" } as BrowserFrame
           return
         }
-        yield { type: "text", delta: '<aipass-envelope>{"type":"chat","id":"b","text":"second","key":"key-123"}</aipass-envelope>' } as BrowserFrame
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "chat", id: "b", text: "second", key: input.promptKey })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -1166,11 +1361,14 @@ describe("duplicate-submit single-flight", () => {
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
     expect(adapterTurns).toBe(2)
-    expect(seenKeys).toEqual(["key-123", "key-123"])
+    expect(seenKeys).toHaveLength(2)
+    expect(seenKeys[0]).toBe("key-123")
+    expect(seenKeys[1]).toBeTruthy()
+    expect(seenKeys[1]).not.toBe("key-123")
     const text = frames.map((frame) => (frame.type === "text" ? frame.delta : "")).join("")
     expect(text).toContain("second")
     expect(text).not.toContain("first")
-    expect(envelopeKey(text)).toBe("key-123")
+    expect(envelopeKey(text)).toBe(seenKeys[1])
 
     let persistentTurns = 0
     const persistent = {
@@ -1245,14 +1443,14 @@ describe("duplicate-submit single-flight", () => {
   test("turn-key rejects a complete keyed envelope followed by a truncated bare envelope", async () => {
     let turns = 0
     const adapter = {
-      async *turn(): AsyncGenerator<BrowserFrame> {
+      async *turn(input: BrowserTurnInput): AsyncGenerator<BrowserFrame> {
         turns++
         if (turns === 1) {
           yield { type: "text", delta: `${JSON.stringify({ type: "thinking", key: "current", id: "r", text: "reason" })}\n{\"type\":\"chat\",\"key\":\"current\"` }
           yield { type: "finish", reason: "stop" }
           return
         }
-        yield { type: "text", delta: JSON.stringify({ type: "chat", key: "current", id: "answer", text: "retry" }) }
+        yield { type: "text", delta: JSON.stringify({ type: "chat", key: input.promptKey, id: "answer", text: "retry" }) }
         yield { type: "finish", reason: "stop" }
       },
     }

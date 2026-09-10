@@ -70,6 +70,10 @@ single-envelope malformed-text recovery. After reasoning progress, strict
 runtime validation rejects invalid trailing actions rather than absorbing them
 into chat prose. Single chat/thinking envelopes with unescaped prose quotes
 retain narrow text recovery; non-strict fallback behavior is unchanged.
+An answer-shaped object that omits only `type` is decoded as chat text when it
+has a nonempty turn key, an `answer_*` ID, nonempty text, and no action fields.
+Turn-key validation still applies; arbitrary JSON is not treated as an answer
+envelope solely because it has a `text` field.
 
 ## Prompt contract
 
@@ -77,7 +81,17 @@ For both APIs, a new initialization submits one keyed webchat turn containing
 the AIPass role/action protocol and the complete offered tool catalog with full
 schemas. In preserve mode it also carries ordered caller system/developer or
 Responses instructions; action-only intentionally omits those caller
-instructions. Its internal `READY` reply is never emitted as a client answer or
+instructions. `CLIENT INSTRUCTIONS` contains the AIPass response protocol:
+the complete `type` enum, response matrix with payload examples, and working
+flow from task evaluation through client actions/results to the final answer.
+`HARNESS INSTRUCTIONS` separately contains caller-owned agent/workspace rules,
+skill/MCP catalogs, and tools. Identical complete instruction bodies and exact
+`available_skills`/`mcp_instructions` blocks are declared once, with references
+preserving their original role positions. Exact repeats in lowered
+`system-update` messages are omitted from task projection; distinct progress,
+ordinary user quotations, and tool-result bodies are preserved. This is exact
+deduplication, not semantic rewriting of similar rules.
+Its internal `READY` reply is never emitted as a client answer or
 action. Subsequent task and action-result turns send only the keyed latest
 delta. Per-turn `tool_choice` changes action availability for that turn but does
 not remove the retained initialization catalog. Explicit `tools: []` clears the
@@ -88,7 +102,8 @@ initialization/contracts, model or reasoning-variant switches, compaction, and
 newly opened pages require initialization again before the task. This relies on
 the webchat retaining initialization context; it is not a guarantee of model
 compliance. Each initialization, task, result, repair, and correction submission
-carries its current `TURN KEY` and the short every-turn envelope guard. Prompt
+carries its current `TURN KEY`. The envelope guard is declared in initialization
+only; submission wrapping never injects it into task or progress data. Prompt
 projection logs contain only action names and character counts, never prompt
 content.
 
