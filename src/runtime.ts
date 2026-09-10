@@ -9,23 +9,25 @@ import {
   loginWithSystemChrome,
   promptContractCurrent,
   sameOrigin,
-  shouldResetActionOnlyContext,
   turnPrompt,
   withTurnKey,
   type AttemptLifecycle,
   type BrowserAdapterConfig,
   type BrowserProtocol,
 } from "./browser.ts"
-import { LOOPBACK_HOST, MODELS, model, persistRuntimeConfig, readRuntimeConfig, type Settings } from "./config.ts"
+import { LOOPBACK_HOST, MODELS, model, persistRuntimeConfig, type Settings } from "./config.ts"
+import { estimateTokens } from "./context.ts"
 import { randomTurnKey, type ProjectedTurn } from "./http.ts"
 import {
   collectOpenAIChatResult,
   ENVELOPE_CLOSE,
   ENVELOPE_OPEN,
+  EnvelopeResponseFormatError,
   envelopesMatchTurnKey,
   isActionEnvelopeType,
   parseTypedEnvelope,
   StreamFrameParser,
+  validateStrictEnvelopeResponse,
   type BrowserFrame,
   type FinishReason,
 } from "./protocol.ts"
@@ -204,8 +206,6 @@ const protocol: BrowserProtocol<BrowserFrame> = {
   isTerminal: (frame) => frame.type === "finish",
 }
 
-const MAX_SHOWN_MARKERS = 100
-
 function requiredKeysForSchema(schema: unknown): string[] {
   if (typeof schema !== "object" || schema === null || Array.isArray(schema)) return []
   const required = (schema as Record<string, unknown>).required
@@ -358,6 +358,20 @@ function withRetryReference(failed: ProjectedTurn): ProjectedTurn {
   }
 }
 
+function withFormatRetryReference(failed: ProjectedTurn): ProjectedTurn {
+  if (!failed.promptKey) throw new NoResponseEvidenceError()
+  const body = `RETRY OF: ${failed.promptKey}\n\nFORMAT CORRECTION: Return only proper <aipass-envelope> JSON using the NEW current TURN KEY. Do not include prose outside the envelope.`
+  return {
+    ...withDerivedKey(failed),
+    primingPrompts: [],
+    initialPrompt: body,
+    incrementalPrompt: body,
+    recoveryPrompt: body,
+    compactionDigest: undefined,
+    toolRepairPrompt: undefined,
+  }
+}
+
 function declaredFromEnvelopeValue(value: unknown): Array<{ readonly name: string; readonly input: unknown }> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return []
   const item = value as Record<string, unknown>
@@ -396,6 +410,24 @@ function responseText(frames: readonly BrowserFrame[]): string {
 function isEnvelopeKeyMismatch(frames: readonly BrowserFrame[], expectedKey: string | undefined): boolean {
   if (!expectedKey) return false
   return !envelopesMatchTurnKey(responseText(frames), expectedKey)
+}
+
+function invalidEnvelopeResponse(
+  frames: readonly BrowserFrame[],
+  expectedKey: string | undefined,
+  offered: ReadonlySet<string>,
+): "key" | "format" | undefined {
+  if (!expectedKey) return undefined
+  if (!frames.some((frame) => frame.type === "finish") || frames.some((frame) => frame.type === "auth-required" || frame.type === "error"))
+    return undefined
+  const text = responseText(frames)
+  if (!envelopesMatchTurnKey(text, expectedKey)) return "key"
+  try {
+    validateStrictEnvelopeResponse(text, offered)
+    return undefined
+  } catch (error) {
+    return error instanceof EnvelopeResponseFormatError ? "format" : undefined
+  }
 }
 
 function extractJsonObjects(text: string): unknown[] {
@@ -463,7 +495,6 @@ export class StandaloneBrowserService implements BrowserService {
   private readonly sessions = new Map<string, Promise<void>>()
   private readonly completions: SingleFlightCompletionStore
   private readonly pending = new Map<string, { hash: string; settled: Promise<void>; resolve: () => void }>()
-  private readonly shownSchemas = new Map<string, Set<string>>()
   private readonly waitMs: number
   private readonly flightStore?: BindingStore
   private readonly chatURL?: string
@@ -491,19 +522,6 @@ export class StandaloneBrowserService implements BrowserService {
     }
   }
 
-  private shownFor(marker: string): Set<string> {
-    let shown = this.shownSchemas.get(marker)
-    if (!shown) {
-      if (this.shownSchemas.size >= MAX_SHOWN_MARKERS) {
-        const oldest = this.shownSchemas.keys().next().value as string | undefined
-        if (oldest !== undefined) this.shownSchemas.delete(oldest)
-      }
-      shown = new Set()
-      this.shownSchemas.set(marker, shown)
-    }
-    return shown
-  }
-
   private async flightHash(input: ProjectedTurn): Promise<string> {
     const hashPrompt = (prompt: string) =>
       promptHashForSingleFlight(JSON.stringify([
@@ -513,22 +531,9 @@ export class StandaloneBrowserService implements BrowserService {
     if (!this.flightStore) return hashPrompt(input.initialPrompt)
     const record = await this.flightStore.get(input.sessionMarker)
     const binding = record?.remoteChatID
-    let bound = binding !== undefined && (this.chatURL === undefined ? true : sameOrigin(binding, this.chatURL))
-    let currentVersion = record?.context?.promptContractVersion
-    let currentDigest = record?.context?.actionEnvelopeDigest
-    if (
-      shouldResetActionOnlyContext(
-        bound,
-        input.promptContractVersion,
-        input.actionEnvelopeDigest,
-        currentVersion,
-        currentDigest,
-      )
-    ) {
-      bound = false
-      currentVersion = undefined
-      currentDigest = undefined
-    }
+    const bound = binding !== undefined && (this.chatURL === undefined ? true : sameOrigin(binding, this.chatURL))
+    const currentVersion = record?.context?.promptContractVersion
+    const currentDigest = record?.context?.actionEnvelopeDigest
     const contractCurrent = promptContractCurrent(
       input.promptContractVersion,
       input.actionEnvelopeDigest,
@@ -614,19 +619,30 @@ export class StandaloneBrowserService implements BrowserService {
         ?? (input.toolContinuation && (input.offeredToolSchemas ?? []).length > 0
           ? "Reconsider only a lack-of-client-action-access refusal using the actions and schemas supplied during startup. Do not override safety, privacy, authorization, or policy restrictions."
           : undefined)
-      const shown = this.shownFor(marker)
-      for (const name of input.provisionedActions ?? []) shown.add(name)
       const collected: BrowserFrame[] = []
       try {
         let progressed = false
-        let reasoningSource: "dom" | "typed" | undefined
         const validate = async (frames: BrowserFrame[], projected: ProjectedTurn) => {
           try {
+            const failure = frames.find((frame) => frame.type === "auth-required" || frame.type === "error")
+            if (failure?.type === "auth-required") throw new Error("browser authentication is required")
+            if (failure?.type === "error") throw new Error(failure.message)
+            if (!frames.some((frame) => frame.type === "finish"))
+              throw new Error("browser stream ended without a terminal finish event")
             // Safety-filter blocks never enter the repair net: fail the turn
             // instead of re-submitting a prompt the filter already rejected.
             if (isWebchatSafetyBlock(responseText(frames))) throw new WebchatSafetyBlockError()
             if (isEnvelopeKeyMismatch(frames, projected.promptKey))
               throw new Error(`browser response TURN KEY mismatch${progressed ? " after reasoning progress" : ""}`)
+            if (projected.promptKey) {
+              try {
+                validateStrictEnvelopeResponse(responseText(frames), new Set(projected.offeredActions))
+              } catch (error) {
+                if (error instanceof EnvelopeResponseFormatError)
+                  throw new Error("browser response envelope format is invalid")
+                throw error
+              }
+            }
             // Validate a copy of the terminal chain, but publish the original
             // envelopes so quoted examples cannot be decoded a second time.
             await collectOpenAIChatResult(frames, new Set(projected.offeredActions), false, progressed)
@@ -638,15 +654,30 @@ export class StandaloneBrowserService implements BrowserService {
         interface CollectedAttempt {
           readonly frames: BrowserFrame[]
           readonly progressiveParser?: KeyedThinkingParser
+          readonly reasoningSource?: "dom" | "typed"
           readonly submitted: ProjectedTurn
+          readonly hiddenPromptTokens: number
+          readonly suppressedReasoningTokens: number
         }
-        const collectOne = async function* (projected: ProjectedTurn, progressive: boolean, recoveryEnabled: boolean): AsyncGenerator<BrowserFrame, CollectedAttempt> {
+        const collectOne = async function* (
+          projected: ProjectedTurn,
+          progressive: boolean,
+          recoveryEnabled: boolean,
+          suppressReasoning = false,
+          noEvidenceRetry: (failed: ProjectedTurn) => ProjectedTurn = withRetryReference,
+          accountNoEvidenceRetry = false,
+        ): AsyncGenerator<BrowserFrame, CollectedAttempt> {
           let current = projected
           let raw: BrowserFrame[] = []
           let progressiveParser: KeyedThinkingParser | undefined
+          let attemptReasoningSource: "dom" | "typed" | undefined
+          let hiddenPromptTokens = 0
+          let suppressedReasoning = ""
           for (let attempt = 0; ; attempt++) {
             raw = []
-            progressiveParser = progressive && current.promptKey
+            attemptReasoningSource = undefined
+            suppressedReasoning = ""
+            progressiveParser = (progressive || suppressReasoning) && current.promptKey
               ? new KeyedThinkingParser(current.promptKey, new Set(current.offeredActions))
               : undefined
             let emitted = false
@@ -657,34 +688,59 @@ export class StandaloneBrowserService implements BrowserService {
                 // Browser-attributed DOM reasoning and complete tagged thinking
                 // envelopes may cross early. Terminal chat/actions remain in raw
                 // until the entire response chain validates.
-                if (progressive && frame.type === "reasoning" && current.promptKey && frame.domTurnKey === current.promptKey) {
-                  if (reasoningSource === undefined || reasoningSource === "dom") {
-                    reasoningSource = "dom"
-                    progressed = true
-                    collected.push(frame)
-                    yield frame
+                if ((progressive || suppressReasoning) && frame.type === "reasoning" && current.promptKey && frame.domTurnKey === current.promptKey) {
+                  if (attemptReasoningSource === undefined || attemptReasoningSource === "dom") {
+                    attemptReasoningSource = "dom"
+                    if (progressive) {
+                      progressed = true
+                      // The physical key is validated above. Remove it at this
+                      // boundary so fresh keys remain one logical response.
+                      const published: BrowserFrame = { type: "reasoning", delta: frame.delta }
+                      collected.push(published)
+                      yield published
+                    } else suppressedReasoning += frame.delta
                   }
                   continue
                 }
                 raw.push(frame)
                 if (frame.type !== "text" || !progressiveParser) continue
                 for (const envelope of progressiveParser.push(frame.delta)) {
-                  if (reasoningSource !== undefined && reasoningSource !== "typed") continue
-                  reasoningSource = "typed"
-                  progressed = true
-                  const published = { type: "text" as const, delta: envelope }
-                  collected.push(published)
-                  yield published
+                  if (attemptReasoningSource !== undefined && attemptReasoningSource !== "typed") continue
+                  attemptReasoningSource = "typed"
+                  if (progressive) {
+                    progressed = true
+                    const published = { type: "text" as const, delta: envelope }
+                    collected.push(published)
+                    yield published
+                  } else {
+                    const open = envelope.indexOf(ENVELOPE_OPEN)
+                    const close = envelope.indexOf(ENVELOPE_CLOSE, open + ENVELOPE_OPEN.length)
+                    if (open >= 0 && close >= 0) {
+                      const parsed = JSON.parse(envelope.slice(open + ENVELOPE_OPEN.length, close))
+                      for (const item of parseTypedEnvelope(parsed, new Set(current.offeredActions)) ?? [])
+                        if (item.type === "reasoning") suppressedReasoning += item.delta
+                    }
+                  }
                 }
               }
             } catch (error) {
               if (!(error instanceof NoResponseEvidenceError) || emitted || !recoveryEnabled || attempt > 0) throw error
-              current = withRetryReference(current)
+              current = noEvidenceRetry(current)
+              if (accountNoEvidenceRetry)
+                hiddenPromptTokens += estimateTokens(withTurnKey(current.initialPrompt, current.promptKey))
               continue
             }
             break
           }
-          if (isEnvelopeKeyMismatch(raw, current.promptKey)) return { frames: raw, progressiveParser, submitted: current }
+          const collectedAttempt = (frames: BrowserFrame[]): CollectedAttempt => ({
+            frames,
+            progressiveParser,
+            reasoningSource: attemptReasoningSource,
+            submitted: current,
+            hiddenPromptTokens,
+            suppressedReasoningTokens: estimateTokens(suppressedReasoning),
+          })
+          if (invalidEnvelopeResponse(raw, current.promptKey, new Set(current.offeredActions))) return collectedAttempt(raw)
           const frames: BrowserFrame[] = []
           const repair = repairPrompt
             ? () => {
@@ -703,53 +759,80 @@ export class StandaloneBrowserService implements BrowserService {
               }
             : undefined
           for await (const frame of repairToolRefusal(raw, repair, current.offeredActions)) frames.push(frame)
-          return { frames, progressiveParser, submitted: current }
+          return collectedAttempt(frames)
         }
-        const collectValidated = async function* (projected: ProjectedTurn, progressive = false): AsyncGenerator<BrowserFrame, CollectedAttempt> {
-          const recoveryEnabled = projected.initialPrompt !== projected.incrementalPrompt
-          let attempt = yield* collectOne(projected, progressive, recoveryEnabled)
-          if (isEnvelopeKeyMismatch(attempt.frames, attempt.submitted.promptKey) && !progressed) {
-            console.error("aipass turn key mismatch retry=true")
-            attempt = yield* collectOne(withRetryReference(attempt.submitted), progressive, recoveryEnabled)
+        let hiddenPromptTokens = 0
+        let hiddenCompletionTokens = 0
+        let formatRetries = 0
+        const hiddenAttemptCompletion = (attempt: CollectedAttempt) => {
+          const frames = attempt.progressiveParser?.withoutPublished(attempt.frames) ?? attempt.frames
+          let output = ""
+          for (const frame of frames) {
+            if (frame.type === "text" || frame.type === "reasoning") output += frame.delta
+            else if (frame.type === "tool-call") output += `${frame.name}${JSON.stringify(frame.input)}`
           }
+          return estimateTokens(output)
+        }
+        const collectValidated = async function* (
+          projected: ProjectedTurn,
+          progressive = false,
+          suppressReasoning = false,
+        ): AsyncGenerator<BrowserFrame, CollectedAttempt> {
+          const recoveryEnabled = projected.initialPrompt !== projected.incrementalPrompt
+          let attempt = yield* collectOne(projected, progressive, recoveryEnabled, suppressReasoning)
+          hiddenPromptTokens += attempt.hiddenPromptTokens
+          const invalid = invalidEnvelopeResponse(attempt.frames, attempt.submitted.promptKey, new Set(attempt.submitted.offeredActions))
+          if (invalid && formatRetries === 0 && (invalid === "format" || !progressed)) {
+            if (isWebchatSafetyBlock(responseText(attempt.frames))) throw new WebchatSafetyBlockError()
+            if (signal?.aborted) throw new Error("browser turn was cancelled")
+            formatRetries++
+            hiddenCompletionTokens += hiddenAttemptCompletion(attempt)
+            const retry = withFormatRetryReference(attempt.submitted)
+            hiddenPromptTokens += estimateTokens(withTurnKey(retry.initialPrompt, retry.promptKey))
+            console.error(`aipass turn envelope correction=${invalid} retry=true`)
+            attempt = yield* collectOne(
+              retry,
+              progressive && !progressed,
+              recoveryEnabled,
+              progressed || suppressReasoning,
+              withFormatRetryReference,
+              true,
+            )
+            hiddenPromptTokens += attempt.hiddenPromptTokens
+          }
+          hiddenCompletionTokens += attempt.suppressedReasoningTokens
           await validate(attempt.frames, attempt.submitted)
           return attempt
         }
-        const initialAttempt = yield* collectValidated(input, true)
-        const initialCollected = initialAttempt.frames
-        // Leave envelopes intact for the serializer: decoding here would
-        // let quoted envelope examples in chat text be interpreted twice.
-        const finalFrames = (attempt: CollectedAttempt) => {
-          const frames = attempt.progressiveParser?.withoutPublished(attempt.frames) ?? attempt.frames
-          return reasoningSource ? frames.filter(frame => frame.type !== "reasoning") : frames
-        }
-        const schemasByName = new Map((input.offeredToolSchemas ?? []).map((schema) => [schema.name, schema]))
-        const seen = new Set<string>()
-        const need: string[] = []
-        for (const declared of collectDeclaredTools(initialCollected)) {
-          if (seen.has(declared.name)) continue
-          seen.add(declared.name)
-          const schema = schemasByName.get(declared.name)
-          if (!schema) continue
-          if (hasAllRequiredKeys(declared.input, requiredKeysForSchema(schema.inputSchema))) continue
-          need.push(declared.name)
-        }
-        if (need.length === 0) {
-          for (const frame of finalFrames(initialAttempt)) {
-            collected.push(frame)
-            yield frame
+        let finalAttempt = yield* collectValidated(input, true)
+        const missingRequired = (attempt: CollectedAttempt) => {
+          const schemasByName = new Map((input.offeredToolSchemas ?? []).map((schema) => [schema.name, schema]))
+          const seen = new Set<string>()
+          const names: string[] = []
+          for (const declared of collectDeclaredTools(attempt.frames)) {
+            if (seen.has(declared.name)) continue
+            seen.add(declared.name)
+            const schema = schemasByName.get(declared.name)
+            if (!schema || hasAllRequiredKeys(declared.input, requiredKeysForSchema(schema.inputSchema))) continue
+            names.push(declared.name)
           }
-        } else {
-          const provisionSchemas = need.map((name) => schemasByName.get(name)!).filter(Boolean)
+          return { names, schemasByName }
+        }
+        let missing = missingRequired(finalAttempt)
+        if (missing.names.length > 0) {
+          hiddenCompletionTokens += estimateTokens(
+            collectDeclaredTools(finalAttempt.frames).map((call) => `${call.name}${JSON.stringify(call.input)}`).join(""),
+          )
+          const provisionSchemas = missing.names.map((name) => missing.schemasByName.get(name)!).filter(Boolean)
           const provisionPrompt = [
             "Correct the previous action request using its startup schema. Missing required input fields:",
             JSON.stringify(provisionSchemas.map(schema => ({ name: schema.name, required: requiredKeysForSchema(schema.inputSchema) }))),
             input.incrementalPrompt,
           ].filter(Boolean).join("\n\n")
-          console.error(`aipass turn provision start tools=${need.join(",")} promptChars=${provisionPrompt.length}`)
-          for (const name of need) shown.add(name)
+          hiddenPromptTokens += estimateTokens(provisionPrompt)
+          console.error(`aipass turn provision start tools=${missing.names.join(",")} promptChars=${provisionPrompt.length}`)
           const provisionInput = withDerivedKey({
-            ...initialAttempt.submitted,
+            ...finalAttempt.submitted,
             primingPrompts: [],
             initialPrompt: provisionPrompt,
             incrementalPrompt: provisionPrompt,
@@ -757,12 +840,29 @@ export class StandaloneBrowserService implements BrowserService {
             compactionDigest: undefined,
             toolRepairPrompt: undefined,
           })
-          const provisionAttempt = yield* collectValidated(provisionInput)
-          console.error(`aipass turn provision done tools=${need.join(",")} frames=${provisionAttempt.frames.length}`)
-          for (const frame of finalFrames(provisionAttempt)) {
-            collected.push(frame)
-            yield frame
-          }
+          // A corrective provision is a replacement attempt, not a
+          // continuation of reasoning already shown to the caller.
+          finalAttempt = yield* collectValidated(provisionInput, false, progressed)
+          console.error(`aipass turn provision done tools=${missing.names.join(",")} frames=${finalAttempt.frames.length}`)
+          missing = missingRequired(finalAttempt)
+          if (missing.names.length > 0)
+            throw new Error(`corrected action is still missing required input fields for ${missing.names.join(",")}`)
+        }
+        // Leave envelopes intact for the serializer: decoding here would
+        // let quoted envelope examples in chat text be interpreted twice.
+        const finalFrames = (attempt: CollectedAttempt) => {
+          const frames = attempt.progressiveParser?.withoutPublished(attempt.frames) ?? attempt.frames
+          return frames.filter((frame) => frame.type !== "reasoning"
+            || (!attempt.reasoningSource && (frame.domTurnKey === undefined || frame.domTurnKey === attempt.submitted.promptKey)))
+        }
+        if (hiddenPromptTokens || hiddenCompletionTokens) {
+          const usage: BrowserFrame = { type: "usage", promptTokens: hiddenPromptTokens, completionTokens: hiddenCompletionTokens }
+          collected.push(usage)
+          yield usage
+        }
+        for (const frame of finalFrames(finalAttempt)) {
+          collected.push(frame)
+          yield frame
         }
         this.completions.set(marker, hash, collected)
       } finally {
@@ -1045,8 +1145,7 @@ export async function serveProvider(settings: Settings) {
     throw error
   })
   const browser = new StandaloneBrowserService(adapter, { store, chatURL: config.chatURL })
-  const persisted = await readRuntimeConfig(settings.configPath)
-  const target = settings.requestedPort ?? persisted?.port ?? 0
+  const target = settings.requestedPort ?? settings.config.port ?? 0
   let server: ReturnType<typeof Bun.serve> | undefined
   let stopped = false
   let resolveStopped!: () => void
@@ -1071,7 +1170,7 @@ export async function serveProvider(settings: Settings) {
     const selectedPort = server.port
     if (typeof selectedPort !== "number" || !Number.isSafeInteger(selectedPort) || selectedPort < 1)
       throw new Error("provider server did not bind a valid loopback port")
-    await persistRuntimeConfig(settings.configPath, { version: 1, host: LOOPBACK_HOST, port: selectedPort })
+    await persistRuntimeConfig(settings.configPath, { ...settings.config, version: 1, host: LOOPBACK_HOST, port: selectedPort })
     console.log(`OpenAI-compatible endpoint: http://${LOOPBACK_HOST}:${selectedPort}/v1`)
     const signal = () => void stop()
     process.once("SIGINT", signal)

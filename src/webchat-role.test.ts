@@ -12,6 +12,14 @@ const fileTool = {
   },
 }
 
+function forwardedToolContent(turn: ReturnType<typeof parseOpenAIChatRequest>["turn"], name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name)
+  expect(schema).toBeDefined()
+  const content = JSON.stringify(schema)
+  expect(turn.primingPrompts.join("\n")).toContain(content)
+  return content
+}
+
 function expectChatOnlyRole(prompt: string) {
   expect(prompt).toContain("You are a text-generation assistant working only as the backend.")
   expect(prompt).toContain("Generate text to assist the client, which does the actual work")
@@ -27,7 +35,8 @@ function expectChatOnlyRole(prompt: string) {
   expect(prompt).toContain('{"type":"thinking","key":"<key>","id":"reason_1","text":"..."}')
 }
 
-function expectStartup(primingPrompts: readonly string[], instructions: readonly string[] = [], tools: readonly string[] = []) {
+function expectStartup(turn: ReturnType<typeof parseOpenAIChatRequest>["turn"], instructions: readonly string[] = [], tools: readonly string[] = []) {
+  const primingPrompts = turn.primingPrompts
   expect(primingPrompts).toHaveLength(1)
   expectChatOnlyRole(primingPrompts[0]!)
   expect(primingPrompts[0]!).toStartWith("CLIENT INSTRUCTIONS")
@@ -40,12 +49,9 @@ function expectStartup(primingPrompts: readonly string[], instructions: readonly
   expect(primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
   expect(primingPrompts[0]).toContain("Initialization submission only.")
   expect(primingPrompts[0]!.match(/You are a text-generation assistant/g)).toHaveLength(1)
-  for (const name of tools) {
-    const prompt = primingPrompts[0]!
-    expect(prompt).toContain(`"name":"${name}"`)
-    expect(prompt).toContain('"inputSchema"')
-    for (const instruction of instructions) expect(prompt.indexOf(instruction)).toBeLessThan(prompt.indexOf(`"name":"${name}"`))
-  }
+  if (tools.length) expect(primingPrompts[0]).toContain('"inputSchema"')
+  else expect(primingPrompts[0]).not.toContain('"inputSchema"')
+  expect(tools.map((name) => JSON.parse(forwardedToolContent(turn, name)).name)).toEqual([...tools])
 }
 
 function expectTaskPromptsExcludeStartup(parsed: { turn: { primingPrompts: readonly string[], initialPrompt: string, incrementalPrompt: string, recoveryPrompt: string } }, instructions: readonly string[] = []) {
@@ -79,7 +85,7 @@ describe("webchat role at the request boundary", () => {
               { type: "function_call", call_id: "call_directory", name: "read", arguments: '{"path":"fixture-root-37"}' },
               { type: "function_call_output", call_id: "call_directory", output: "fixture-folder-alpha\nfixture-folder-beta" },
             ] : [])], tools: [{ type: "function", ...tool }] }, new Headers({ "x-session-affinity": "startup-fixture" }))
-        expectStartup(parsed.turn.primingPrompts, startup.map(instruction => `${instruction.role.toUpperCase()}: ${instruction.content}`), ["read"])
+        expectStartup(parsed.turn, startup.map(instruction => `${instruction.role.toUpperCase()}: ${instruction.content}`), ["read"])
         expectTaskPromptsExcludeStartup(parsed, startup.map(instruction => instruction.content))
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
           for (const instruction of startup) {
@@ -111,7 +117,7 @@ describe("webchat role at the request boundary", () => {
               ...(scenario === "no tools" ? {} : { tools: [{ type: "function", ...fileTool }] }),
             }, new Headers())
 
-        expectStartup(parsed.turn.primingPrompts, [], scenario === "no tools" ? [] : ["write"])
+        expectStartup(parsed.turn, [], scenario === "no tools" ? [] : scenario === "disabled tools" ? [] : ["write"])
         expectTaskPromptsExcludeStartup(parsed)
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
           expect(prompt).toContain(request)
@@ -125,6 +131,7 @@ describe("webchat role at the request boundary", () => {
         }
         if (scenario === "startup schemas") {
           expect(parsed.turn.primingPrompts.join("\n")).toContain('"description":"Write a file"')
+          expect(JSON.parse(forwardedToolContent(parsed.turn, "write"))).toEqual({ name: "write", description: "Write a file", inputSchema: fileTool.parameters })
           expect(parsed.offered).toEqual(new Set(["write"]))
           expect(parsed.turn.initialPrompt.length).toBeLessThan(4_000)
         }
@@ -147,11 +154,12 @@ describe("webchat role at the request boundary", () => {
           : parseOpenAIResponsesRequest({ model: "gpt-5.6-terra", input: request, tools: tools.map(tool => ({ type: "function", ...tool })) }, new Headers())
         expect(parsed.projectedActions).toEqual(["read", "execute"])
         expect([...parsed.offered]).toEqual(["read", "execute"])
-        expectStartup(parsed.turn.primingPrompts, [], ["read", "execute"])
+        expectStartup(parsed.turn, [], ["read", "execute"])
         expectTaskPromptsExcludeStartup(parsed)
         const startup = parsed.turn.primingPrompts.join("\n")
         expect(startup).toContain('"description":"Read a file or list a directory"')
         expect(startup).toContain('"description":"Discover and call MCP tools"')
+        for (const tool of tools) expect(JSON.parse(forwardedToolContent(parsed.turn, tool.name))).toEqual({ name: tool.name, description: tool.description, inputSchema: tool.parameters })
         expect(startup).toContain("Use the full schemas supplied during startup. Every action input must satisfy its schema, including all required fields.")
         expect(startup).not.toContain("If a listed action has no supplied schema")
         for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
@@ -161,25 +169,25 @@ describe("webchat role at the request boundary", () => {
       })
     }
 
-    test(`${endpoint} retains the role on action-only follow-ups without restoring omitted instructions`, () => {
+    test(`${endpoint} retains startup instructions without replaying them in follow-up tasks`, () => {
       const messages = [
         { role: "user", content: "OLD_REQUEST" },
         { role: "assistant", content: "Previous reply" },
         { role: "user", content: "Continue" },
       ]
-      const common = { model: "gpt-5.6-terra", instruction_mode: "action-only" }
+      const common = { model: "gpt-5.6-terra" }
       const parsed = endpoint === "chat"
         ? parseOpenAIChatRequest({
             ...common,
-            messages: [{ role: "system", content: "OMITTED_CLIENT_INSTRUCTIONS" }, ...messages],
+            messages: [{ role: "system", content: "CLIENT_INSTRUCTIONS_FIXTURE" }, ...messages],
           }, new Headers({ "x-session-id": "role-follow-up" }))
         : parseOpenAIResponsesRequest({
-            ...common, instructions: "OMITTED_CLIENT_INSTRUCTIONS", input: messages,
+            ...common, instructions: "CLIENT_INSTRUCTIONS_FIXTURE", input: messages,
           }, new Headers())
-      expectStartup(parsed.turn.primingPrompts)
+      expectStartup(parsed.turn, ["CLIENT_INSTRUCTIONS_FIXTURE"])
       expectTaskPromptsExcludeStartup(parsed)
       for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
-        expect(prompt).not.toContain("OMITTED_CLIENT_INSTRUCTIONS")
+        expect(prompt).not.toContain("CLIENT_INSTRUCTIONS_FIXTURE")
       }
       expect(parsed.turn.incrementalPrompt).toContain("Continue")
       expect(parsed.turn.incrementalPrompt).not.toContain("OLD_REQUEST")
@@ -196,9 +204,10 @@ describe("webchat role at the request boundary", () => {
         ? parseOpenAIChatRequest({ ...common, messages: [{ role: "user", content: request }], tools: [{ type: "function", function: tool }] }, new Headers())
         : parseOpenAIResponsesRequest({ ...common, input: request, tools: [{ type: "function", ...tool }] }, new Headers())
       expect(parsed.projectedActions).toEqual([tool.name])
-      expectStartup(parsed.turn.primingPrompts, [], [tool.name])
+      expectStartup(parsed.turn, [], [tool.name])
       expectTaskPromptsExcludeStartup(parsed)
       expect(parsed.turn.primingPrompts.join("\n")).toContain(JSON.stringify({ name: tool.name, inputSchema: tool.parameters }))
+      expect(JSON.parse(forwardedToolContent(parsed.turn, tool.name))).toEqual({ name: tool.name, inputSchema: tool.parameters })
       for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
         expect(prompt).toBe(`USER: ${request}`)
       }
@@ -218,7 +227,7 @@ describe("webchat role at the request boundary", () => {
       ? parseOpenAIChatRequest({ model: "gpt-5.6-terra", messages }, new Headers())
       : parseOpenAIResponsesRequest({ model: "gpt-5.6-terra", input: messages }, new Headers())
     expect(parsed.turn.compactionDigest).toMatch(/^[a-f0-9]{64}$/)
-    expectStartup(parsed.turn.primingPrompts, ["SYSTEM: HARNESS_RULE", "DEVELOPER: CURRENT_AGENT_AND_WORKSPACE_RULE"])
+    expectStartup(parsed.turn, ["SYSTEM: HARNESS_RULE", "DEVELOPER: CURRENT_AGENT_AND_WORKSPACE_RULE"])
     expectTaskPromptsExcludeStartup(parsed, ["HARNESS_RULE", "CURRENT_AGENT_AND_WORKSPACE_RULE"])
     for (const prompt of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
       const sections = [`USER: ${checkpoint}`, "USER: CURRENT_USER_RULE", "USER: Continue with the next fixture."]

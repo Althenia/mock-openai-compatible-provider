@@ -21,6 +21,14 @@ function service(turn: BrowserService["turn"]): BrowserService {
   return { turn, async login() {}, async close() {} }
 }
 
+function forwardedToolContent(turn: ProjectedTurn, name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name)
+  expect(schema).toBeDefined()
+  const content = JSON.stringify(schema)
+  expect(turn.primingPrompts.join("\n")).toContain(content)
+  return content
+}
+
 describe("process-memory Responses continuation", () => {
   for (const stream of [false, true]) {
     test(`replays input, emitted reasoning/call, results, and effective top-level initialization (${stream ? "SSE" : "JSON"})`, async () => {
@@ -46,8 +54,8 @@ describe("process-memory Responses continuation", () => {
       expect(turns[1]!.primingPrompts).toHaveLength(1)
       expect(turns[1]!.primingPrompts[0]).toContain("NEW_TOP_LEVEL_RULE")
       expect(turns[1]!.primingPrompts[0]).toContain("RETAINED_MESSAGE_RULE")
-      expect(turns[1]!.primingPrompts[0]).toContain('"name":"lookup"')
-      expect(turns[1]!.primingPrompts[0]).toContain('"inputSchema"')
+      expect(turns[1]!.primingPrompts[0]).toContain("Use the full schemas supplied during startup")
+      expect(JSON.parse(forwardedToolContent(turns[1]!, "lookup"))).toEqual({ name: "lookup", inputSchema: tool.parameters })
       expect(turns[1]!.primingPrompts.join("\n")).not.toContain("OLD_TOP_LEVEL_RULE")
       // First-turn shape replays the full chain; bound routing is delta-only
       // with the earlier chain living in remote history instead.

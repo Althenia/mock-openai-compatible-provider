@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 
 import { NoResponseEvidenceError, withTurnKey, type BrowserTurnInput } from "./browser.ts"
+import { estimateTokens } from "./context.ts"
 import { parseOpenAIChatRequest } from "./http.ts"
 import {
   SingleFlightCompletionStore,
@@ -11,6 +12,18 @@ import {
 } from "./runtime.ts"
 import { collectOpenAIChatResult, envelopeKey, EVERY_TURN_ENVELOPE_GUARD, hasEnvelopeShape } from "./protocol.ts"
 import type { BrowserFrame } from "./protocol.ts"
+
+function forwardedToolContent(turn: ReturnType<typeof parseOpenAIChatRequest>["turn"], name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name)
+  expect(schema).toBeDefined()
+  const content = JSON.stringify(schema)
+  expect(turn.primingPrompts.join("\n")).toContain(content)
+  return content
+}
+
+function formatRetryBody(key: string | undefined) {
+  return `RETRY OF: ${key}\n\nFORMAT CORRECTION: Return only proper <aipass-envelope> JSON using the NEW current TURN KEY. Do not include prose outside the envelope.`
+}
 
 for (const tagged of [false, true]) test(`preserves ${tagged ? "tagged" : "bare"} attributed grouped calls through legacy action repair`, async () => {
   const parsed = parseOpenAIChatRequest({
@@ -70,11 +83,10 @@ for (const type of ["tool", "skill"] as const) test(`preserves direct typed ${ty
 })
 
 describe("internal continuation request fidelity", () => {
-  for (const mode of ["preserve", "action-only"] as const) {
     for (const trigger of ["repair", "provision"] as const) {
-      test(`${mode} ${trigger} retains request context on every browser route`, async () => {
+      test(`${trigger} retains request context on every browser route`, async () => {
         const parsed = parseOpenAIChatRequest({
-          model: "gemini-3.1-flash-lite", instruction_mode: mode,
+          model: "gemini-3.1-flash-lite",
           messages: [
             { role: "system", content: "SYSTEM_RULE " + "context ".repeat(1_500) },
             { role: "developer", content: "DEVELOPER_RULE" },
@@ -87,7 +99,7 @@ describe("internal continuation request fidelity", () => {
             { type: "function", function: { name: "question", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
             { type: "function", function: { name: "unused", parameters: { type: "object", properties: { unrelated: { type: "string" } } } } },
           ],
-        }, new Headers({ "x-session-affinity": `context-${mode}-${trigger}` }))
+        }, new Headers({ "x-session-affinity": `context-${trigger}` }))
         const submitted: BrowserTurnInput[] = []
         const adapter = {
           async *turn(input: BrowserTurnInput) {
@@ -112,6 +124,11 @@ describe("internal continuation request fidelity", () => {
         expect(next.promptKey).toBeTruthy()
         expect(next.promptKey).not.toBe(parsed.turn.promptKey)
         expect(next.originPromptKey).toBe(parsed.turn.promptKey)
+        expect(submitted[0]!.primingPrompts.join("\n")).toContain("Use the full schemas supplied during startup")
+        expect(JSON.parse(forwardedToolContent(parsed.turn, "question"))).toEqual({
+          name: "question",
+          inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+        })
         for (const prompt of [next.initialPrompt, next.incrementalPrompt, next.recoveryPrompt]) {
           expect(prompt).not.toContain("You are a text-generation assistant working only as the backend.")
           expect(prompt).not.toContain("Actions are data, not native calls: never execute them yourself or decline for lack of native access.")
@@ -120,20 +137,16 @@ describe("internal continuation request fidelity", () => {
           expect(prompt).not.toContain('TOOL CALL call_fixture read: {"path":"fixture.txt"}')
           expect(prompt).toContain("TOOL RESULT call_fixture: LATEST_RESULT: alpha or beta")
           expect(prompt).not.toContain('"inputSchema"')
-          expect(submitted[0]!.primingPrompts.join("\n")).toContain('"name":"question"')
           if (trigger === "provision") expect(prompt).toContain('"name":"question","required":["query"]')
           for (const rule of ["SYSTEM_RULE", "DEVELOPER_RULE"]) {
-            if (mode === "preserve") expect(submitted[0]!.primingPrompts.join("\n")).toContain(rule)
-            else expect(submitted[0]!.primingPrompts.join("\n")).not.toContain(rule)
+            expect(submitted[0]!.primingPrompts.join("\n")).toContain(rule)
             expect(prompt).not.toContain(rule)
           }
-          if (mode === "preserve") expect(prompt).toContain("LOWERED_RULE")
-          else expect(prompt).not.toContain("LOWERED_RULE")
+          expect(prompt).toContain("LOWERED_RULE")
           if (trigger === "provision") expect(prompt).not.toContain('"name":"unused"')
         }
       })
     }
-  }
 })
 
 describe("sub-sequence keys and key-referenced retry", () => {
@@ -224,7 +237,7 @@ describe("sub-sequence keys and key-referenced retry", () => {
     expect(retryKey).toBeTruthy()
     expect(retryKey).not.toBe(originalKey)
     expect((seen[1] as Linked).originPromptKey).toBe(originalKey)
-    const retryBody = `RETRY OF: ${originalKey}`
+    const retryBody = formatRetryBody(originalKey)
     for (const prompt of [seen[1]!.initialPrompt, seen[1]!.incrementalPrompt, seen[1]!.recoveryPrompt]) {
       expect(prompt).toBe(retryBody)
       expect(withTurnKey(prompt, retryKey)).toBe(`TURN KEY: ${retryKey}\n\n${EVERY_TURN_ENVELOPE_GUARD}\n\n${retryBody}`)
@@ -295,7 +308,7 @@ describe("sub-sequence keys and key-referenced retry", () => {
     expect(new Set(seen.map(input => input.promptKey)).size).toBe(3)
     expect(seen[2]!.originPromptKey).toBe(seen[1]!.promptKey)
     for (const prompt of [seen[2]!.initialPrompt, seen[2]!.incrementalPrompt, seen[2]!.recoveryPrompt]) {
-      expect(prompt).toBe(`RETRY OF: ${seen[1]!.promptKey}`)
+      expect(prompt).toBe(formatRetryBody(seen[1]!.promptKey))
     }
   })
 
@@ -322,7 +335,7 @@ describe("sub-sequence keys and key-referenced retry", () => {
       expect((await collectOpenAIChatResult(service.turn(parsed.turn), parsed.offered)).text).toBe("recovered")
       expect(seen).toHaveLength(3)
       expect(seen[2]!.originPromptKey).toBe(seen[1]!.promptKey)
-      expect(seen[2]!.initialPrompt).toBe(`RETRY OF: ${seen[1]!.promptKey}`)
+      expect(seen[2]!.initialPrompt).toBe(formatRetryBody(seen[1]!.promptKey))
       expect(new Set(seen.map(input => input.promptKey)).size).toBe(3)
       expect(reloads).toEqual([false, false, true])
     }
@@ -857,7 +870,6 @@ describe("automatic tool-refusal repair", () => {
       attachments: [] as readonly { readonly kind: "image" | "file" }[],
       promptKey: undefined as string | undefined,
       offeredToolSchemas: [questionSchema] as readonly { readonly name: string; readonly inputSchema: unknown }[],
-      provisionedActions: [] as readonly string[],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(base)) frames.push(frame)
@@ -905,7 +917,6 @@ describe("automatic tool-refusal repair", () => {
       attachments: [] as readonly { readonly kind: "image" | "file" }[],
       promptKey: undefined as string | undefined,
       offeredToolSchemas: [questionSchema, { name: "read", inputSchema: { type: "object" } }] as readonly { readonly name: string; readonly inputSchema: unknown }[],
-      provisionedActions: [] as readonly string[],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -933,7 +944,6 @@ describe("duplicate-submit single-flight", () => {
       attachments: [] as readonly { readonly kind: "image" | "file" }[],
       promptKey: undefined as string | undefined,
       offeredToolSchemas: [] as readonly { readonly name: string; readonly inputSchema: unknown }[],
-      provisionedActions: [] as readonly string[],
     }
   }
 
@@ -1019,7 +1029,7 @@ describe("duplicate-submit single-flight", () => {
     expect(followerFrames).toContainEqual({ type: "text", delta: "leader-done" })
   })
 
-  test("flight hash follows the attempt path for cross-origin and reset contexts", async () => {
+  test("flight hash follows the attempt path for cross-origin and changed contracts", async () => {
     const { mkdtemp, rm } = await import("node:fs/promises")
     const { tmpdir } = await import("node:os")
     const { join } = await import("node:path")
@@ -1067,9 +1077,9 @@ describe("duplicate-submit single-flight", () => {
           { ...base, initialPrompt: "A", incrementalPrompt: "DIFFERENT", recoveryPrompt: "OTHER" },
         ),
       ).toBe(1)
-      const resetStore = fresh()
-      await resetStore.bind(base.sessionMarker, chatURL)
-      await resetStore.complete(
+      const changedStore = fresh()
+      await changedStore.bind(base.sessionMarker, chatURL)
+      await changedStore.complete(
         base.sessionMarker,
         { id: "a4", promptHash: "h", status: "complete" as const, updatedAt: Date.now() },
         chatURL,
@@ -1077,9 +1087,10 @@ describe("duplicate-submit single-flight", () => {
         7,
         "old-digest",
       )
-      const resetFirst = { ...base, initialPrompt: "A", incrementalPrompt: "B", recoveryPrompt: "C", actionEnvelopeDigest: "a0-new" }
-      const resetSecond = { ...base, initialPrompt: "A", incrementalPrompt: "B2", recoveryPrompt: "C2", actionEnvelopeDigest: "a0-new" }
-      expect(await runTwo(resetStore, resetFirst, resetSecond)).toBe(1)
+      const changedFirst = { ...base, initialPrompt: "A", incrementalPrompt: "B", recoveryPrompt: "C", actionEnvelopeDigest: "new-digest" }
+      const changedSecond = { ...base, initialPrompt: "A", incrementalPrompt: "B2", recoveryPrompt: "C2", actionEnvelopeDigest: "new-digest" }
+      expect(await runTwo(changedStore, changedFirst, changedSecond)).toBe(2)
+      expect(await runTwo(changedStore, changedFirst, { ...changedSecond, initialPrompt: "OTHER", recoveryPrompt: "C" })).toBe(1)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -1124,7 +1135,6 @@ describe("duplicate-submit single-flight", () => {
       ...turnInput("marker-provision", "ask-me-which-file using the question tool"),
       offeredActions: ["question", "read"],
       offeredToolSchemas: [questionSchema, { name: "read", inputSchema: { type: "object" } }],
-      provisionedActions: [],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -1164,7 +1174,6 @@ describe("duplicate-submit single-flight", () => {
       ...turnInput("marker-provision-bare", "ask-me-which-file using the question tool"),
       offeredActions: ["question", "read"],
       offeredToolSchemas: [questionSchema, { name: "read", inputSchema: { type: "object" } }],
-      provisionedActions: [],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -1203,7 +1212,6 @@ describe("duplicate-submit single-flight", () => {
       ...turnInput("marker-provision-typeless-bare", "ask-me-which-file using the question tool"),
       offeredActions: ["question", "read"],
       offeredToolSchemas: [questionSchema, { name: "read", inputSchema: { type: "object" } }],
-      provisionedActions: [],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -1235,7 +1243,6 @@ describe("duplicate-submit single-flight", () => {
       ...turnInput("marker-provision-shown", "ask-me-which-file using the question tool"),
       offeredActions: ["question", "read"],
       offeredToolSchemas: [questionSchema, { name: "read", inputSchema: { type: "object" } }],
-      provisionedActions: ["question"],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -1264,7 +1271,6 @@ describe("duplicate-submit single-flight", () => {
       ...turnInput("marker-provision-fast", "ask-me-which-file using the question tool"),
       offeredActions: ["question"],
       offeredToolSchemas: [questionSchema],
-      provisionedActions: [],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -1300,7 +1306,6 @@ describe("duplicate-submit single-flight", () => {
       ...turnInput("marker-provision-shown-missing", "hello"),
       offeredActions: ["question"],
       offeredToolSchemas: [questionSchema],
-      provisionedActions: ["question"],
     } as never
     const frames: BrowserFrame[] = []
     for await (const frame of service.turn(input)) frames.push(frame)
@@ -1463,7 +1468,7 @@ describe("duplicate-submit single-flight", () => {
     expect(JSON.stringify(frames)).not.toContain('"text":"reason"')
   })
 
-  test("turn-key rejects a truncated typeless envelope but preserves ordinary JSON and quoted JSON in chat text", async () => {
+  test("turn-key rejects a truncated typeless envelope but preserves quoted JSON in chat text", async () => {
     let malformedTurns = 0
     const malformed = {
       async *turn(): AsyncGenerator<BrowserFrame> {
@@ -1481,7 +1486,6 @@ describe("duplicate-submit single-flight", () => {
     expect(malformedTurns).toBe(2)
 
     for (const [marker, text] of [
-      ["key-ordinary-json", '{"answer":"ok"}'],
       ["key-quoted-json", `<aipass-envelope>${JSON.stringify({ type: "chat", key: "current", id: "answer", text: 'Example: {"type":"chat","key":"old"' })}</aipass-envelope>`],
     ] as const) {
       let turns = 0
@@ -1526,12 +1530,23 @@ describe("duplicate-submit single-flight", () => {
     expect(frames).toEqual([])
   })
 
-  test("envelope-key preserves legacy non-envelope text without re-request", async () => {
-    let adapterTurns = 0
+  for (const [name, invalid] of [
+    ["prose", "plain legacy answer"],
+    ["arbitrary JSON", '{"answer":"not an envelope"}'],
+    ["malformed envelope", '<aipass-envelope>{"type":"chat","key":"key-123","text":"unfinished"'],
+    ["literal text between envelopes", [
+      `<aipass-envelope>${JSON.stringify({ type: "chat", key: "key-123", id: "one", text: "one" })}</aipass-envelope>`,
+      " OUTSIDE ",
+      `<aipass-envelope>${JSON.stringify({ type: "chat", key: "key-123", id: "two", text: "two" })}</aipass-envelope>`,
+    ].join("")],
+    ["invalid chat payload", `<aipass-envelope>${JSON.stringify({ type: "chat", key: "key-123", id: "answer", text: 42 })}</aipass-envelope>`],
+  ] as const) test(`envelope-key repairs ${name} once using only a short keyed format reminder`, async () => {
+    const submitted: Array<BrowserTurnInput & { originPromptKey?: string }> = []
     const adapter = {
-      async *turn() {
-        adapterTurns++
-        yield { type: "text", delta: "plain legacy answer" } as BrowserFrame
+      async *turn(input: BrowserTurnInput) {
+        submitted.push(input as BrowserTurnInput & { originPromptKey?: string })
+        if (submitted.length === 1) yield { type: "text", delta: invalid } as BrowserFrame
+        else yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "chat", key: input.promptKey, id: "answer", text: "corrected" })}</aipass-envelope>` } as BrowserFrame
         yield { type: "finish", reason: "stop" } as BrowserFrame
       },
       async login() {},
@@ -1539,16 +1554,153 @@ describe("duplicate-submit single-flight", () => {
     }
     const service = new StandaloneBrowserService(adapter as never, { waitMs: 50 })
     const input = {
-      ...turnInput("marker-envelope-key-legacy", "hello"),
+      ...turnInput(`marker-envelope-format-${name}`, "ORIGINAL_TASK_AND_HISTORY"),
+      primingPrompts: ["SYNTHETIC_INSTRUCTION SKILL_SCHEMA_MARKER"],
       promptKey: "key-123",
     } as never
+    const result = await collectOpenAIChatResult(service.turn(input), new Set())
+    expect(submitted).toHaveLength(2)
+    expect(submitted[1]!.primingPrompts).toEqual([])
+    expect(submitted[1]!.originPromptKey).toBe("key-123")
+    expect(submitted[1]!.promptKey).not.toBe("key-123")
+    const retryBody = formatRetryBody("key-123")
+    for (const prompt of [submitted[1]!.initialPrompt, submitted[1]!.incrementalPrompt, submitted[1]!.recoveryPrompt]) {
+      expect(prompt).toBe(retryBody)
+      expect(prompt).not.toContain("ORIGINAL_TASK_AND_HISTORY")
+      expect(prompt).not.toContain("SYNTHETIC_INSTRUCTION")
+      expect(prompt).not.toContain("SKILL_SCHEMA_MARKER")
+      expect(prompt).not.toContain(invalid)
+    }
+    expect(result.text).toBe("corrected")
+    expect(result.reasoning).toBe("")
+    expect(result.promptTokens).toBe(estimateTokens(withTurnKey(retryBody, submitted[1]!.promptKey)))
+    expect(result.completionTokens).toBe(estimateTokens(invalid) + estimateTokens("corrected"))
+    expect(hasEnvelopeShape(invalid)).toBe(name !== "prose" && name !== "arbitrary JSON")
+  })
+
+  for (const [name, invalid] of [
+    ["ordinary malformed output", "first malformed draft"],
+    ["outside prose", [
+      `<aipass-envelope>${JSON.stringify({ type: "chat", key: "current", id: "one", text: "one" })}</aipass-envelope>`,
+      " OUTSIDE ",
+      `<aipass-envelope>${JSON.stringify({ type: "chat", key: "current", id: "two", text: "two" })}</aipass-envelope>`,
+    ].join("")],
+    ["invalid chat payload", `<aipass-envelope>${JSON.stringify({ type: "chat", key: "current", id: "answer", text: 42 })}</aipass-envelope>`],
+  ] as const) test(`envelope-format correction fails closed after repeated ${name}`, async () => {
+    let submissions = 0
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      submissions++
+      yield { type: "text", delta: invalid.replaceAll("current", input.promptKey ?? "") } as BrowserFrame
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never, { waitMs: 50 })
     const frames: BrowserFrame[] = []
-    for await (const frame of service.turn(input)) frames.push(frame)
-    expect(adapterTurns).toBe(1)
-    expect(frames).toEqual([
-      { type: "text", delta: "plain legacy answer" },
-      { type: "finish", reason: "stop" },
-    ])
-    expect(hasEnvelopeShape("plain legacy answer")).toBe(false)
+    await expect(async () => {
+      for await (const frame of service.turn({ ...turnInput(`format-fails-closed-${name}`, "request"), promptKey: "current" } as never)) frames.push(frame)
+    }).toThrow(/envelope format|chat text/)
+    expect(submissions).toBe(2)
+    expect(frames).toEqual([])
+  })
+
+  for (const [name, frames, message] of [
+    ["authentication", [{ type: "auth-required" }], "authentication is required"],
+    ["upstream error", [{ type: "error", message: "fixture transport failure" }], "fixture transport failure"],
+    ["missing terminal", [{ type: "text", delta: "partial transport output" }], "without a terminal finish"],
+  ] as const) test(`${name} is not misclassified as an envelope-format failure`, async () => {
+    let submissions = 0
+    const service = new StandaloneBrowserService({ async *turn() {
+      submissions++
+      for (const frame of frames) yield frame as BrowserFrame
+    } } as never, { waitMs: 50 })
+    await expect(async () => {
+      for await (const _ of service.turn({ ...turnInput(`format-${name}`, "request"), promptKey: "current" } as never)) void _
+    }).toThrow(message)
+    expect(submissions).toBe(1)
+  })
+
+  test("valid keyed chat, tool, and safety refusal envelopes do not enter format correction", async () => {
+    for (const [marker, value, offered, tagged] of [
+      ["valid-bare", { type: "chat", id: "answer", text: "ok" }, [], false],
+      ["valid-tagged", { type: "chat", id: "answer", text: "ok" }, [], true],
+      ["valid-typeless", { id: "answer_typeless", text: "ok" }, [], false],
+      ["valid-tool", { type: "tool", id: "call", name: "read", input: { path: "." } }, ["read"], true],
+      ["valid-refusal", { type: "chat", id: "refusal", text: "I cannot delete secrets because that would violate safety policy." }, ["read"], true],
+    ] as const) {
+      let submissions = 0
+      const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+        submissions++
+        const envelope = JSON.stringify({ ...value, key: input.promptKey })
+        yield { type: "text", delta: tagged ? `<aipass-envelope>${envelope}</aipass-envelope>` : envelope } as BrowserFrame
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+      } } as never, { waitMs: 50 })
+      await collectOpenAIChatResult(service.turn({ ...turnInput(marker, "request"), promptKey: "current", offeredActions: offered } as never), new Set(offered))
+      expect(submissions).toBe(1)
+    }
+  })
+
+  test("a prose policy refusal is only reformatted and is never asked to override policy", async () => {
+    const refusal = "I cannot delete secrets because that would violate safety policy."
+    const submitted: BrowserTurnInput[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      submitted.push(input)
+      yield { type: "text", delta: submitted.length === 1
+        ? refusal
+        : `<aipass-envelope>${JSON.stringify({ type: "chat", key: input.promptKey, id: "refusal", text: refusal })}</aipass-envelope>` } as BrowserFrame
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never, { waitMs: 50 })
+    const result = await collectOpenAIChatResult(
+      service.turn({ ...turnInput("format-policy-refusal", "request"), promptKey: "current" } as never),
+      new Set(),
+    )
+    expect(submitted).toHaveLength(2)
+    expect(submitted[1]!.initialPrompt).toBe(formatRetryBody("current"))
+    expect(submitted[1]!.initialPrompt).not.toMatch(/override|ignore|bypass/i)
+    expect(result.text).toBe(refusal)
+  })
+
+  for (const phase of ["before", "during"] as const) test(`cancellation ${phase} envelope-format correction starts no further submission`, async () => {
+    const controller = new AbortController()
+    let submissions = 0
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      submissions++
+      if (submissions === 1) {
+        yield { type: "text", delta: "malformed draft" } as BrowserFrame
+        if (phase === "before") controller.abort()
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+        return
+      }
+      controller.abort()
+      yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "chat", key: input.promptKey, text: "must not publish" })}</aipass-envelope>` } as BrowserFrame
+    } } as never, { waitMs: 50 })
+    await expect(async () => {
+      for await (const _ of service.turn({ ...turnInput(`format-cancel-${phase}`, "request"), promptKey: "current" } as never, controller.signal)) void _
+    }).toThrow("cancelled")
+    expect(submissions).toBe(phase === "before" ? 1 : 2)
+  })
+
+  test("format correction and no-evidence recovery remain finite and keep the short format reminder", async () => {
+    const submitted: Array<BrowserTurnInput & { originPromptKey?: string }> = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      submitted.push(input as BrowserTurnInput & { originPromptKey?: string })
+      if (submitted.length === 1) {
+        yield { type: "text", delta: "malformed" } as BrowserFrame
+        yield { type: "finish", reason: "stop" } as BrowserFrame
+        return
+      }
+      if (submitted.length === 2) throw new NoResponseEvidenceError()
+      yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "chat", key: input.promptKey, text: "recovered" })}</aipass-envelope>` } as BrowserFrame
+      yield { type: "finish", reason: "stop" } as BrowserFrame
+    } } as never, { waitMs: 50 })
+    const input = {
+      ...turnInput("format-no-evidence", "initial task"),
+      incrementalPrompt: "incremental task",
+      promptKey: "original",
+    } as never
+    expect((await collectOpenAIChatResult(service.turn(input), new Set())).text).toBe("recovered")
+    expect(submitted).toHaveLength(3)
+    expect(submitted[1]!.initialPrompt).toBe(formatRetryBody("original"))
+    expect(submitted[2]!.initialPrompt).toBe(formatRetryBody(submitted[1]!.promptKey))
+    expect(submitted[2]!.initialPrompt).not.toContain("initial task")
+    expect(submitted[2]!.initialPrompt).not.toContain("incremental task")
+    expect(submitted[2]!.originPromptKey).toBe(submitted[1]!.promptKey)
   })
 })

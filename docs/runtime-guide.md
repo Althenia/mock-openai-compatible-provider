@@ -4,6 +4,15 @@ This guide retains the provider runtime contract that was previously expanded in
 the repository README. It is a behavior reference, not evidence of live-model
 reliability.
 
+## Runtime configuration boundary
+
+Stateful commands load one selected version-one JSON file. Without `--config`,
+the file and state defaults are rooted in the current UID's validated native
+macOS account home; `HOME`, XDG variables, and former provider `AIPASS_*`
+variables do not redirect them. Supported explicit CLI values override the
+selected file. Existing files under former environment-selected paths are not
+migrated automatically. See the [configuration reference](configuration.md).
+
 ## Request and session contract
 
 - Authenticated endpoints include `GET /health`, `GET /v1/models`,
@@ -65,11 +74,28 @@ invents results. The recognized Thai webchat guardrail notice takes precedence
 over these paths and over turn-key mismatch recovery, including when its text
 arrives across multiple stream chunks.
 
+A completed keyed task turn receives at most one shared format/key correction
+unless its entire non-whitespace response is a semantically valid envelope chain
+ending in a terminal answer or action. Prose, arbitrary JSON, incomplete or invalid
+envelopes, literal text between otherwise valid envelopes, and missing terminals
+all qualify. That submission has a fresh physical turn key and empty priming;
+its body contains only `RETRY OF: <failed-key>` plus a short instruction to return
+proper `<aipass-envelope>` JSON with the new key. It does not repeat startup
+instructions, skills, schemas, task/history text, or the rejected draft. A second
+invalid result fails closed. Authentication, cancellation, transport failures,
+and recognized webchat safety blocks do not enter this correction path. The
+format reminder asks only for compliant representation and never asks the
+backend to override a refusal or upstream policy.
+
 Complete bare and `TURN KEY`-prefixed envelope chains are validated before
 single-envelope malformed-text recovery. After reasoning progress, strict
 runtime validation rejects invalid trailing actions rather than absorbing them
 into chat prose. Single chat/thinking envelopes with unescaped prose quotes
-retain narrow text recovery; non-strict fallback behavior is unchanged.
+retain narrow low-level text recovery for compatibility; keyed production task
+turns use opt-in whole-response validation before publication. Unkeyed serializer
+consumers retain their permissive text behavior, and JSON or envelope examples
+inside a validated chat envelope remain literal chat text rather than being
+parsed a second time.
 Tool names are supplied by the calling harness, not a provider-maintained list.
 The canonical action shape remains `type: "tool"`, `name`, and object-valued
 `input`. A model response may also use an exact offered tool name as `type`,
@@ -93,24 +119,22 @@ envelope solely because it has a `text` field.
 ## Prompt contract
 
 For both APIs, a new initialization submits one keyed webchat turn containing
-the AIPass role/action protocol and the complete offered tool catalog with full
-schemas. In preserve mode it also carries ordered caller system/developer or
-Responses instructions; action-only intentionally omits those caller
-instructions. `CLIENT INSTRUCTIONS` contains the AIPass response protocol:
+the AIPass role/action protocol, ordered caller system/developer or Responses
+instructions, and every complete effective offered-tool schema. `CLIENT
+INSTRUCTIONS` contains the AIPass response protocol:
 the complete `type` enum, response matrix with payload examples, and working
 flow from task evaluation through client actions/results to the final answer.
 `HARNESS INSTRUCTIONS` separately contains caller-owned agent/workspace rules,
-skill/MCP catalogs, and tools. Identical complete instruction bodies and exact
-`available_skills`/`mcp_instructions` blocks are declared once, with references
-preserving their original role positions. Exact repeats in lowered
+skill/MCP descriptions, and offered tool schemas. Identical complete instruction
+bodies and exact `available_skills`/`mcp_instructions` blocks are declared once,
+with references preserving their original role positions. Exact repeats in lowered
 `system-update` messages are omitted from task projection; distinct progress,
 ordinary user quotations, and tool-result bodies are preserved. This is exact
 deduplication, not semantic rewriting of similar rules.
-Its internal `READY` reply is never emitted as a client answer or
-action. Subsequent task and action-result turns send only the keyed latest
-delta. Per-turn `tool_choice` changes action availability for that turn but does
-not remove the retained initialization catalog. Explicit `tools: []` clears the
-active catalog; omitted tools retain it.
+Its internal `READY` reply is never emitted as a client answer or action.
+Subsequent task and action-result turns send only the keyed latest delta.
+Per-turn `tool_choice` determines the effective schema set for that turn.
+Explicit `tools: []` clears the active offered set; omitted tools retain it.
 
 Unchanged bound turns send only the latest task/result delta; recovery, changed
 initialization/contracts, model or reasoning-variant switches, compaction, and
@@ -118,9 +142,15 @@ newly opened pages require initialization again before the task. This relies on
 the webchat retaining initialization context; it is not a guarantee of model
 compliance. Each initialization, task, result, repair, and correction submission
 carries its current `TURN KEY` and the short every-turn envelope guard. Submission
-wrapping adds the guard when absent without repeating the full initialization. Prompt
-projection logs contain only action names and character counts, never prompt
-content.
+wrapping adds the guard when absent without repeating the full initialization.
+Prompt projection logs contain only action names and character counts, never
+prompt content.
+
+Session affinity controls routing, not instruction omission. Caller instructions
+are projected consistently with and without affinity; tool results and distinct
+client instruction updates remain in the task history. The former
+`instruction_mode` request extension is no longer supported. Like other unknown
+request fields, it is ignored rather than interpreted as a forwarding policy.
 
 Streaming clients first receive the standard Chat Completions assistant-role
 chunk or Responses `response.created` and `response.in_progress` events. The
@@ -135,7 +165,12 @@ backend turn is still open. Answers and tool calls wait for the entire response
 to pass validation. A later error can terminate already-visible reasoning, but
 it must not publish an invalid answer/action or a successful completion. Raw,
 unattributed reasoning and incomplete or mismatched envelopes are not trusted
-as progressive output.
+as progressive output. Safely attributed reasoning may remain visible while a
+malformed terminal answer receives the one format correction; reasoning from
+that replacement is suppressed so drafts are not mixed or duplicated. Foreign
+or mixed keys after visible progress still fail without correction. Estimated
+usage includes the hidden correction prompt, rejected completion, and suppressed
+replacement reasoning without charging already-published reasoning twice.
 
 The webchat backend owns reasoning, planning, action selection, and answers.
 AIPass owns transport and structured-response validation. The calling client
@@ -145,8 +180,10 @@ instructions/input messages); AIPass does not infer them or load caller
 workspace files. These are ordinary webchat submissions, not native system-role
 messages; upstream rules remain authoritative. Chat bound initialization and
 Responses continuation state are bounded and process-local; after restart or
-eviction callers must supply initialization again. Each initialization adds
-latency and consumes provider quota.
+eviction callers must supply initialization again. Each initialization and
+provider-owned repair submission adds latency and consumes provider quota. Usage
+remains explicitly estimated and includes provider-known hidden repair prompt
+and completion work; it is not an upstream billing measurement.
 
 ## Compaction and recovery
 
@@ -174,23 +211,6 @@ Without a checkpoint, the provider does not guess a context limit or silently
 discard canonical history. Stored Responses continuations append to retained
 history; to replace history with a compacted form, start a new Responses request
 without `previous_response_id`.
-
-## Explicit action-only opt-out
-
-Requests default to `instruction_mode: "preserve"`, including requests with
-`x-session-affinity`; affinity controls session routing, not instruction
-omission. The non-standard `instruction_mode: "action-only"` explicitly omits
-system/developer text and lowered system updates, while retaining
-incremental-suffix routing for bound turns. An explicit `instruction_mode`
-always wins.
-
-Action-only mode is for orchestration clients that enforce their own instruction
-layer and need the browser model only to select projected actions. Switching an
-existing affinity from preserve to action-only begins a fresh remote conversation
-so previously projected instructions cannot remain active. The omission includes
-installed-skill catalogs carried in system/developer messages: a generic
-`skill` tool with only `id: string` does not identify available IDs. Clients must
-supply required IDs through request/tool data or keep preserve mode.
 
 ## Diagnostics and reliability boundary
 

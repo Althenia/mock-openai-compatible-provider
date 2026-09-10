@@ -1,6 +1,6 @@
 # Interface
 
-* [Configuration and state](config-state.md) - XDG-based config and state roots, environment overrides, loopback binding, and private credential handling.
+* [Configuration and state](config-state.md) - File-owned runtime configuration, native macOS account defaults, loopback binding, and private state handling.
 
 # Repository Preference
 
@@ -8,4 +8,4 @@
 
 # Runbook
 
-* [CLI lifecycle](cli-lifecycle.md) - Foreground provider commands, authenticated shutdown, and locked atomic update with checksum verification.
+* [CLI lifecycle](cli-lifecycle.md) - File-configured foreground commands, authenticated shutdown, and locked atomic update with checksum verification.

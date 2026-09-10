@@ -90,7 +90,7 @@ describe("logical-session initialization retention", () => {
     }
   })
 
-  test("Responses continuation inherits omitted top-level instructions and full tool catalog", async () => {
+  test("Responses continuation inherits omitted top-level instructions and full tool set", async () => {
     const fixture = handlerWith((_input, index) => index === 0
       ? [{ type: "tool-call", id: "call_lookup", name: "lookup", input: { key: "alpha" } }, { type: "finish", reason: "tool-calls" }]
       : [{ type: "text", delta: "DONE" }, { type: "finish", reason: "stop" }])
@@ -113,7 +113,7 @@ describe("logical-session initialization retention", () => {
     expect(fixture.turns[1]!.incrementalPrompt).not.toContain('"inputSchema"')
   })
 
-  test("tool_choice constrains one Chat turn without replacing the retained full catalog", async () => {
+  test("tool_choice constrains one Chat turn without replacing retained initialization", async () => {
     const fixture = handlerWith(() => [{ type: "text", delta: "OK" }, { type: "finish", reason: "stop" }])
     const sessionID = "chat-tool-choice"
     expect((await fixture.handler(request("/v1/chat/completions", {
@@ -127,21 +127,21 @@ describe("logical-session initialization retention", () => {
     }, sessionID))).status).toBe(200)
 
     expect(fixture.turns.map(turn => turn.offeredActions)).toEqual([["lookup"], [], ["lookup"]])
-    expect(fixture.turns[1]!.primingPrompts).toEqual(fixture.turns[0]!.primingPrompts)
+    expect(fixture.turns[1]!.primingPrompts.join("\n")).not.toContain('"name":"lookup"')
     expect(fixture.turns[2]!.primingPrompts).toEqual(fixture.turns[0]!.primingPrompts)
-    expect(fixture.turns[1]!.actionEnvelopeDigest).toBe(fixture.turns[0]!.actionEnvelopeDigest)
+    expect(fixture.turns[1]!.actionEnvelopeDigest).not.toBe(fixture.turns[0]!.actionEnvelopeDigest)
     expect(fixture.turns[1]!.incrementalPrompt).toStartWith("Do not request a client action on this turn")
     expect(fixture.turns[2]!.incrementalPrompt).toBe("USER: AUTO_AGAIN")
   })
 
-  test("explicit Chat initialization replaces or clears retained fields and action-only never projects retained text", async () => {
+  test("explicit Chat initialization replaces retained instructions and clears tools independently", async () => {
     const fixture = handlerWith(() => [{ type: "text", delta: "OK" }, { type: "finish", reason: "stop" }])
     const sessionID = "chat-explicit-update"
     for (const body of [
       { messages: [{ role: "system", content: "OLD_RULE" }, { role: "user", content: "INITIAL" }], tools: [chatTool] },
       { messages: [{ role: "system", content: "NEW_RULE" }, { role: "user", content: "UPDATE" }], tools: [alternateChatTool] },
-      { messages: [{ role: "user", content: "ACTION_ONLY" }], instruction_mode: "action-only" },
-      { messages: [{ role: "user", content: "ACTION_ONLY_AGAIN" }] },
+      { messages: [{ role: "user", content: "FOLLOW_UP" }] },
+      { messages: [{ role: "user", content: "FOLLOW_UP_AGAIN" }] },
       { messages: [{ role: "user", content: "CLEAR_TOOLS" }], tools: [] },
       { messages: [{ role: "user", content: "CLEARED_AGAIN" }] },
     ]) expect((await fixture.handler(request("/v1/chat/completions", body, sessionID))).status).toBe(200)
@@ -150,7 +150,7 @@ describe("logical-session initialization retention", () => {
     expect(fixture.turns[1]!.primingPrompts.join("\n")).not.toContain("OLD_RULE")
     expect(fixture.turns[1]!.offeredActions).toEqual(["other"])
     for (const turn of fixture.turns.slice(2, 4)) {
-      expect(turn.primingPrompts.join("\n")).not.toContain("NEW_RULE")
+      expect(turn.primingPrompts.join("\n")).toContain("NEW_RULE")
       expect(turn.incrementalPrompt).not.toContain("NEW_RULE")
       expect(turn.offeredActions).toEqual(["other"])
     }
@@ -280,25 +280,26 @@ describe("logical-session initialization retention", () => {
     expect(fixture.turns[3]!.actionEnvelopeDigest).toBe(fixture.turns[2]!.actionEnvelopeDigest)
   })
 
-  test("Responses retains instruction mode and catalog while tool_choice remains per-turn", async () => {
+  test("Responses retains instructions and tools while tool_choice remains per-turn", async () => {
     const fixture = handlerWith(() => [{ type: "text", delta: "OK" }, { type: "finish", reason: "stop" }])
     const first = await responseID(await fixture.handler(request("/v1/responses", {
-      instructions: "MODE_RULE", tools: [responsesTool], input: "INITIAL",
+      instructions: "CLIENT_RULE", tools: [responsesTool], input: "INITIAL",
     })))
     const second = await responseID(await fixture.handler(request("/v1/responses", {
-      previous_response_id: first, input: "NO_ACTION", tool_choice: "none", instruction_mode: "action-only",
+      previous_response_id: first, input: "NO_ACTION", tool_choice: "none",
     })))
     await responseID(await fixture.handler(request("/v1/responses", {
-      previous_response_id: second, input: "ACTION_ONLY_AGAIN",
+      previous_response_id: second, input: "ACTIONS_AGAIN",
     })))
 
     expect(fixture.turns.map(turn => turn.offeredActions)).toEqual([["lookup"], [], ["lookup"]])
     for (const turn of fixture.turns.slice(1)) {
-      expect(turn.primingPrompts.join("\n")).not.toContain("MODE_RULE")
-      expect(turn.incrementalPrompt).not.toContain("MODE_RULE")
+      expect(turn.primingPrompts.join("\n")).toContain("CLIENT_RULE")
+      expect(turn.incrementalPrompt).not.toContain("CLIENT_RULE")
     }
-    expect(fixture.turns[2]!.actionEnvelopeDigest).toBe(fixture.turns[1]!.actionEnvelopeDigest)
-    expect(fixture.turns[2]!.primingPrompts).toEqual(fixture.turns[1]!.primingPrompts)
+    expect(fixture.turns[1]!.actionEnvelopeDigest).not.toBe(fixture.turns[0]!.actionEnvelopeDigest)
+    expect(fixture.turns[2]!.actionEnvelopeDigest).toBe(fixture.turns[0]!.actionEnvelopeDigest)
+    expect(fixture.turns[2]!.primingPrompts).toEqual(fixture.turns[0]!.primingPrompts)
   })
 
   test("Chat initialization count capacity fails before submission without evicting retained sessions", async () => {

@@ -2,11 +2,13 @@
 set -eu
 umask 077
 
-repository_url=${AIPASS_REPOSITORY_URL:-https://github.com/Althenia/mock-openai-compatible-provider}
-repository_url=${repository_url%/}
+repository_url=https://github.com/Althenia/mock-openai-compatible-provider
+repository=Althenia/mock-openai-compatible-provider
 binary_name=aipass-browser-provider
 requested_version=
-install_dir=${AIPASS_INSTALL_DIR:-}
+install_dir=
+config_path=
+config_explicit=0
 source_dir=
 stage=
 
@@ -17,13 +19,14 @@ fail() {
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--version VERSION] [--install-dir DIRECTORY] [--from-dir DIRECTORY]
+usage: install.sh [--version VERSION] [--install-dir DIRECTORY] [--config PATH] [--from-dir DIRECTORY]
 
 Installs the latest AIPass browser provider release by default.
 
 options:
   --version VERSION       install a release such as 0.1.0 or v0.1.0
   --install-dir DIRECTORY install into DIRECTORY instead of ~/.local/bin
+  --config PATH           read installDir from the selected runtime configuration file
   --from-dir DIRECTORY    use downloaded assets and checksums (requires --version)
   -h, --help              print this help
 EOF
@@ -39,6 +42,13 @@ while [ "$#" -gt 0 ]; do
     --install-dir)
       [ "$#" -ge 2 ] || fail "--install-dir requires a value"
       install_dir=$2
+      shift 2
+      ;;
+    --config)
+      [ "$#" -ge 2 ] || fail "--config requires a value"
+      [ -n "$2" ] || fail "--config requires a non-empty path"
+      config_path=$2
+      config_explicit=1
       shift 2
       ;;
     --from-dir)
@@ -68,14 +78,82 @@ machine=$(uname -m)
 os=darwin
 arch=arm64
 
+native_account_home() {
+  command -v id >/dev/null 2>&1 || fail "id is required to determine the native account home"
+  command -v dscacheutil >/dev/null 2>&1 || fail "macOS dscacheutil is required to determine the native account home"
+  uid=$(id -u) || fail "could not determine the current account UID"
+  printf '%s\n' "$uid" | grep -Eq '^[0-9]+$' || fail "current account UID is invalid"
+  account_record=$(dscacheutil -q user -a uid "$uid" 2>/dev/null) \
+    || fail "could not determine the native account home"
+  home=$(printf '%s\n' "$account_record" | awk '/^dir: / { print substr($0, 6); exit }')
+  case "$home" in
+    /*) printf '%s\n' "$home" ;;
+    *) fail "native account home is missing or invalid" ;;
+  esac
+}
+
+configured_install_dir=
+read_config_install_dir() {
+  [ -x /usr/bin/osascript ] || fail "macOS osascript is required to read runtime configuration JSON"
+  config_result=$(/usr/bin/osascript -l JavaScript - "$config_path" <<'JXA'
+ObjC.import("Foundation")
+function run(argv) {
+  if (argv.length !== 1) return "unreadable";
+  const text = $.NSString.stringWithContentsOfFileEncodingError($(argv[0]), $.NSUTF8StringEncoding, null);
+  if (text === null) return "unreadable";
+  let config;
+  try { config = JSON.parse(ObjC.unwrap(text)); } catch (_) { return "invalid-json"; }
+  if (typeof config !== "object" || config === null || Array.isArray(config)) return "invalid-object";
+  if (!Object.prototype.hasOwnProperty.call(config, "installDir")) return "valid";
+  if (typeof config.installDir !== "string" || !config.installDir.trim() || config.installDir.includes("\u0000")) return "invalid-install-dir";
+  const data = $.NSString.stringWithString(config.installDir).dataUsingEncoding($.NSUTF8StringEncoding);
+  return "install-dir:" + ObjC.unwrap(data.base64EncodedStringWithOptions(0));
+}
+JXA
+  ) || fail "could not read runtime configuration JSON: $config_path"
+  case "$config_result" in
+    valid) ;;
+    install-dir:*)
+      encoded_install_dir=${config_result#install-dir:}
+      [ -n "$encoded_install_dir" ] || fail "config installDir must be a non-empty string"
+      decode_sentinel=$(printf '\001')
+      decoded_install_dir=$(printf '%s' "$encoded_install_dir" | /usr/bin/base64 -D || exit 1
+        printf '\001') \
+        || fail "could not read config installDir"
+      case "$decoded_install_dir" in
+        *"$decode_sentinel") configured_install_dir=${decoded_install_dir%"$decode_sentinel"} ;;
+        *) fail "could not read config installDir" ;;
+      esac
+      ;;
+    invalid-json) fail "invalid runtime configuration JSON: $config_path" ;;
+    invalid-object) fail "runtime configuration JSON must be an object: $config_path" ;;
+    invalid-install-dir) fail "config installDir must be a non-empty string" ;;
+    *) fail "could not read runtime configuration JSON: $config_path" ;;
+  esac
+}
+
+if [ "$config_explicit" = 1 ]; then
+  [ -e "$config_path" ] || [ -L "$config_path" ] || fail "--config file does not exist: $config_path"
+  read_config_install_dir
+elif [ -z "$install_dir" ]; then
+  native_home=$(native_account_home)
+  config_path=$native_home/.config/aipass-browser-provider/config.json
+  if [ -e "$config_path" ] || [ -L "$config_path" ]; then
+    read_config_install_dir
+  fi
+fi
+
+if [ -z "$install_dir" ]; then
+  if [ -n "$configured_install_dir" ]; then
+    install_dir=$configured_install_dir
+  else
+    [ -n "${native_home:-}" ] || native_home=$(native_account_home)
+    install_dir=$native_home/.local/bin
+  fi
+fi
+
 if [ -z "$source_dir" ]; then
   command -v plutil >/dev/null 2>&1 || fail "macOS plutil is required"
-  case "$repository_url" in
-    https://github.com/*) repository=${repository_url#https://github.com/} ;;
-    *) fail "repository URL must be https://github.com/OWNER/REPOSITORY" ;;
-  esac
-  printf '%s\n' "$repository" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
-    || fail "invalid GitHub repository URL"
 fi
 
 if [ -z "$requested_version" ]; then
@@ -91,11 +169,6 @@ esac
 version_number=${version#v}
 printf '%s\n' "$version_number" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
   || fail "invalid release version: $requested_version"
-
-if [ -z "$install_dir" ]; then
-  [ -n "${HOME:-}" ] || fail "HOME is not set; use --install-dir"
-  install_dir=$HOME/.local/bin
-fi
 
 asset=$binary_name-$os-$arch
 release_url=$repository_url/releases/download/$version

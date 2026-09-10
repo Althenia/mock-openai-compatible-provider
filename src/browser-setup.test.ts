@@ -10,7 +10,7 @@ import { parseOpenAIChatRequest } from "./http.ts"
 import { StreamFrameParser, type BrowserFrame } from "./protocol.ts"
 
 function executable() {
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected fixture browser settings")
   return command.settings.chromeExecutable
 }

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { BrowserResponse, type BrowserProtocol, type BrowserTurnInput } from "./browser.ts"
 import { estimateTokens } from "./context.ts"
 import { parseOpenAIChatRequest } from "./http.ts"
-import { collectOpenAIChatResult, envelopesMatchTurnKey, hasTerminalEnvelope, hasThinkingOnlyEnvelope, repairMalformedTextEnvelope, StreamFrameParser, TypedEnvelopeShim, type BrowserFrame } from "./protocol.ts"
+import { collectOpenAIChatResult, envelopesMatchTurnKey, hasTerminalEnvelope, hasThinkingOnlyEnvelope, repairMalformedTextEnvelope, StreamFrameParser, TypedEnvelopeShim, validateStrictEnvelopeResponse, type BrowserFrame } from "./protocol.ts"
 import { StandaloneBrowserService } from "./runtime.ts"
 import { createRequestHandler } from "./server.ts"
 
@@ -26,6 +26,19 @@ const wrap = (value: object, tagged: boolean) => tagged ? `<aipass-envelope>${JS
 const prefixed = (value: object, tagged = false) => `TURN KEY: ${key}\n\n${wrap({ key, id: "envelope_1", ...value }, tagged)}`
 
 describe("echoed turn-key response routing", () => {
+  test("whole-response coverage is strict only for keyed runtime validation", () => {
+    const first = wrap({ type: "chat", key, id: "one", text: "one" }, true)
+    const second = wrap({ type: "chat", key, id: "two", text: "two" }, true)
+    const source = `${first} OUTSIDE ${second}`
+    const permissive = new TypedEnvelopeShim(offered)
+    expect([...permissive.push(source), ...permissive.finish()]).toEqual([
+      { type: "text", delta: "one" },
+      { type: "text", delta: " OUTSIDE " },
+      { type: "text", delta: "two" },
+    ])
+    expect(() => validateStrictEnvelopeResponse(source, offered)).toThrow("outside envelopes")
+  })
+
   for (const tagged of [false, true])
   for (const split of [false, true])
   for (const fixture of cases) test(`${tagged ? "tagged" : "bare"} ${fixture.name}, ${split ? "split at every character" : "one chunk"}`, () => {

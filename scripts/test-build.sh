@@ -13,14 +13,17 @@ fi
 cd "$work"
 test "$("$@" ./provider --version)" = "$version"
 "$@" ./provider help >/dev/null
-if AIPASS_INSTALL_DIR= "$@" ./provider update > renamed.log 2>&1; then
+mkdir -p state
+CONFIG_PATH="$work/provider.json" CONFIG_STATE_ROOT="$work/state" bun -e \
+  'await Bun.write(process.env.CONFIG_PATH, JSON.stringify({version:1,host:"127.0.0.1",stateRoot:process.env.CONFIG_STATE_ROOT}))'
+if "$@" ./provider update --config "$work/provider.json" > renamed.log 2>&1; then
   echo 'renamed executable update unexpectedly succeeded' >&2
   exit 1
 fi
 grep -q 'renamed executable: use update --install-dir' renamed.log
 
 # Exercise the embedded updater without repository access or network access.
-mkdir -p bin installed state
+mkdir -p bin installed
 cp provider installed/aipass-browser-provider
 printf '#!/bin/sh\nprintf "updated-fixture\\n"\n' > fixture
 digest=$(shasum -a 256 fixture | awk '{print $1}')
@@ -28,7 +31,7 @@ printf '{"tag_name":"v0.0.1","assets":[{"name":"aipass-browser-provider-darwin-a
 cat > bin/curl <<'EOF'
 #!/bin/sh
 set -eu
-test -s "$AIPASS_STATE_ROOT/profile.lock"
+test -s "$UPDATE_FIXTURE_STATE_ROOT/profile.lock"
 output=
 url=
 while [ "$#" -gt 0 ]; do
@@ -45,8 +48,8 @@ esac
 EOF
 chmod 700 bin/curl
 PATH="$work/bin:/usr/bin:/bin:/usr/sbin:/sbin" UPDATE_FIXTURE="$work" \
-  AIPASS_INSTALL_DIR= AIPASS_STATE_ROOT="$work/state" \
-  "$@" ./installed/aipass-browser-provider update --version 0.0.1 > update.log
+  UPDATE_FIXTURE_STATE_ROOT="$work/state" \
+  "$@" ./installed/aipass-browser-provider update --version 0.0.1 --config "$work/provider.json" > update.log
 cmp fixture installed/aipass-browser-provider
 test "$(./installed/aipass-browser-provider --version)" = updated-fixture
 test ! -e state/profile.lock

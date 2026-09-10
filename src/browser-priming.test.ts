@@ -12,9 +12,9 @@ const messages = [
   { role: "user", content: "Reply ready." },
 ]
 
-function turn(mode: "preserve" | "action-only", nextMessages = messages) {
+function turn() {
   return parseOpenAIChatRequest({
-    model: "gemini-3.1-flash-lite", session_id: "priming-fixture", instruction_mode: mode, messages: nextMessages,
+    model: "gemini-3.1-flash-lite", session_id: "priming-fixture", messages,
   }, new Headers()).turn
 }
 
@@ -23,20 +23,15 @@ function keyedSubmission(body: string) {
   return expect.stringMatching(new RegExp(`^TURN KEY: [^\\n]+${suffix}$`))
 }
 
-for (const mode of ["preserve", "action-only"] as const) test(`${mode} projects serial startup separately from full caller history`, () => {
-  const input = turn(mode)
+test("projects serial startup separately from full caller history", () => {
+  const input = turn()
   expect(input.primingPrompts).toHaveLength(1)
   expect(input.primingPrompts[0]).toStartWith("CLIENT INSTRUCTIONS")
   expect(input.primingPrompts[0]!.split(EVERY_TURN_ENVELOPE_GUARD)).toHaveLength(2)
   expect(input.primingPrompts.join("\n").match(/READY/g)).toHaveLength(1)
-  if (mode === "preserve") {
-    expect(input.primingPrompts[0]).toContain("SYSTEM: " + "Synthetic preserved client instruction.\n".repeat(220))
-    expect(input.primingPrompts[0]).toContain("DEVELOPER: AGENT_RULE")
-    expect(input.primingPrompts[0]!.indexOf("SYSTEM:")).toBeLessThan(input.primingPrompts[0]!.indexOf("DEVELOPER:"))
-  } else {
-    expect(input.primingPrompts[0]).not.toContain("Synthetic preserved client instruction.")
-    expect(input.primingPrompts[0]).not.toContain("DEVELOPER: AGENT_RULE")
-  }
+  expect(input.primingPrompts[0]).toContain("SYSTEM: " + "Synthetic preserved client instruction.\n".repeat(220))
+  expect(input.primingPrompts[0]).toContain("DEVELOPER: AGENT_RULE")
+  expect(input.primingPrompts[0]!.indexOf("SYSTEM:")).toBeLessThan(input.primingPrompts[0]!.indexOf("DEVELOPER:"))
   for (const prompt of [input.initialPrompt, input.recoveryPrompt]) {
     expect(prompt).toContain("USER: Earlier fixture task.\n\nASSISTANT: Earlier fixture answer.\n\nUSER: Reply ready.")
     expect(prompt).not.toContain("Synthetic preserved client instruction.")

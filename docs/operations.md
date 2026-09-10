@@ -1,6 +1,6 @@
 # Operations and client setup
 
-See [runtime behavior](runtime-guide.md) for prompt fidelity, continuation, and compaction. The provider binds only to loopback; this is not a public hosted inference service.
+See [runtime configuration](configuration.md) and [runtime behavior](runtime-guide.md) for file settings, prompt fidelity, continuation, and compaction. The provider binds only to loopback; this is not a public hosted inference service.
 
 ## Authenticate and connect
 
@@ -27,24 +27,11 @@ Configure an OpenAI-compatible client with that base URL, bearer token, and an I
 | `version` / `--version` | Print the executable version |
 | `help` | List supported options |
 
-Runtime commands accept `--config PATH`, `--state-root PATH`, and `--chrome PATH`. `start`, `serve`, and `endpoint` also accept `--port PORT`. Use a consistent environment for login, start, endpoint, and stop.
+Runtime commands accept `--config PATH`, `--state-root PATH`, and `--chrome PATH`. `start`, `serve`, and `endpoint` also accept `--port PORT`. Use the same configuration file for login, start, endpoint, stop, and update.
 
-## Paths and environment
+## Paths and configuration
 
-Runtime config defaults to `$XDG_CONFIG_HOME/aipass-browser-provider/config.json` (otherwise `~/.config/aipass-browser-provider/config.json`). State defaults to `$XDG_STATE_HOME/aipass-browser-provider` (otherwise `~/.local/state/aipass-browser-provider`). Credentials and files are private; Chrome profile data is sensitive.
-
-| Variable | Purpose |
-| --- | --- |
-| `AIPASS_CONFIG_PATH` | Runtime configuration file |
-| `AIPASS_STATE_ROOT` | Credential, bindings, lock, and browser profile root |
-| `AIPASS_PORT` | Explicit loopback port |
-| `AIPASS_BROWSER_EXECUTABLE` | Installed Chrome executable |
-| `AIPASS_CHAT_URL` | Webchat URL |
-| `AIPASS_STREAM_URL_PATTERN` | Optional extra stream URL substring |
-| `AIPASS_NAVIGATION_TIMEOUT_MS` | Navigation safety deadline; default `90000` |
-| `AIPASS_STREAM_IDLE_TIMEOUT_MS` | Stream inactivity deadline; default `120000` |
-| `AIPASS_BROWSER_HEADED` | Show Chrome when set to `1` |
-| `AIPASS_SCREENSHOT_DIR` | Optional diagnostic screenshot destination; keep private |
+Runtime config defaults to `<native-account-home>/.config/aipass-browser-provider/config.json`, and state defaults to `<native-account-home>/.local/state/aipass-browser-provider`. The native home is resolved from the current process UID through the macOS account database; `HOME`, XDG variables, and former provider `AIPASS_*` variables do not redirect either path. No existing files are moved from former environment-selected paths. Credentials and files are private; Chrome profile data is sensitive. Runtime settings, defaults, and precedence are defined in the [configuration reference](configuration.md).
 
 ## Update and restore
 
@@ -66,12 +53,14 @@ atomic replacement. Download, metadata, checksum, or executable-check failures
 leave the existing binary unchanged.
 
 The standard-named compiled executable updates its own directory. Override it
-with `--install-dir DIRECTORY` or `AIPASS_INSTALL_DIR`. A renamed executable
-requires that explicit destination. When run from source with Bun, the default
-is `~/.local/bin`, as with the standalone installer; Bun itself is never replaced.
+with `--install-dir DIRECTORY` or the file's `installDir`. The provider updater
+passes a fully resolved destination to the embedded installer. A renamed
+executable requires an explicit destination. When run from source with Bun, the default is
+`<native-account-home>/.local/bin`, as with the standalone installer; Bun itself
+is never replaced.
 The installed filename remains `aipass-browser-provider`.
 
-Use the same `--state-root PATH` or state environment as the running provider.
+Use the same configuration file or `--state-root PATH` as the running provider.
 The updater holds that profile's lock throughout installation and refuses while
 the provider or login owns it. `stop` may return before shutdown finishes; if the
 lock is still held, wait for the provider to exit and retry. The guard covers only
@@ -79,7 +68,7 @@ the selected state root: stop other instances and disable automatic supervisor
 restarts before updating a shared executable. There is no automatic stop/restart.
 Versions before v0.1.3 need the README's installer command once to gain `update`.
 
-The installer accepts `--version VERSION`, `--install-dir DIRECTORY` (or `AIPASS_INSTALL_DIR`), and `--from-dir DIRECTORY` for verified offline artifacts. For a downloaded release directory containing the binary, checksums, and installer:
+The installer accepts `--version VERSION`, `--install-dir DIRECTORY`, `--config PATH`, and `--from-dir DIRECTORY` for verified offline artifacts. For a downloaded release directory containing the binary, checksums, and installer:
 
 ```sh
 shasum -a 256 -c checksums.txt
@@ -93,8 +82,8 @@ For a source build, install `dist/aipass-browser-provider` to the desired execut
 - `bun run build` compiles and signs the executable on macOS; `bun run test:build` checks an isolated copy.
 - `bun run test:install` validates installer behavior with local fixtures.
 - `bun run test:release` validates release preflight and binary-only packaging; it does not download upstream sources.
-- `bun scripts/live-smoke.ts --case startup-context gpt-5.6-terra` checks synthetic startup instructions through both APIs. `lookup`, `chain`, `catalog`, and `instruction-update` cover other bounded diagnostics. These consume authenticated provider quota, use an in-memory dispatcher, and are not real-client execution proof. Stop a running provider before starting these scripts.
-- `bun scripts/live-catalog-trace.ts --self-test` checks the metadata observer locally. Its `--run` and `--provider` modes require explicit `AIPASS_LIVE_SMOKE=1` and `AIPASS_LIVE_FIXTURE` pointing to a directory containing `notes.txt`. `--run` also requires the `yce2e` tmux session and a configured YCoding route; `--provider` leaves client launch to the operator. Native context capture and skill-input matching are separate from successful task execution.
+- `bun scripts/live-smoke.ts --config PATH --case startup-context gpt-5.6-terra` checks synthetic startup instructions through both APIs. `lookup`, `chain`, `catalog`, and `instruction-update` cover other bounded diagnostics. These consume authenticated provider quota, use an in-memory dispatcher, and are not real-client execution proof. Stop a running provider before starting these scripts.
+- `bun scripts/live-catalog-trace.ts --self-test` checks the metadata observer locally. Its live modes require explicit `--allow-live`, `--fixture PATH`, `--config PATH`, and `--client-config-dir PATH`. `--run` also requires the `yce2e` tmux session and a configured YCoding route; `--provider` leaves client launch to the operator. `YCODING_CONFIG_CONTENT` is injected only into that isolated external-client test process; it is not an AIPass setting or provider configuration path. Native context capture and skill-input matching are separate from successful task execution.
 - `bun scripts/docs-site.ts` serves the allowlisted documentation and redacted review files on `127.0.0.1:8787`; `--port PORT` selects another port. It does not expose raw output, credentials, or arbitrary repository files.
 - Public documentation and the installer are hosted on [GitHub Pages](https://althenia.github.io/mock-openai-compatible-provider/). The manually dispatched Pages workflow builds only the public allowlist with `scripts/build-docs-site.ts`; it never uploads the local review shell or recordings.
 

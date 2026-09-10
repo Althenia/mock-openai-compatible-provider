@@ -27,6 +27,7 @@ async function fixture() {
     writeFile(join(root, "LICENSE"), "License text\n"),
     writeFile(join(root, "THIRD_PARTY_NOTICES"), "Notices\n"),
     writeFile(join(root, "docs", "runtime-guide.md"), "# Runtime\n\n[Operations](operations.md)\n\n<script>alert(1)</script>"),
+    writeFile(join(root, "docs", "configuration.md"), "# Configuration\n\nFile-owned settings."),
     writeFile(join(root, "docs", "operations.md"), "# Operations\n\nSafe operations."),
     writeFile(join(root, "docs", "model-matrix.md"), "# Models\n\nSafe models."),
     writeFile(join(root, "docs", "releases", "v0.1.2.md"), "# 0.1.2\n"),
@@ -47,6 +48,7 @@ test("builds a safe static site with project-subpath navigation and readable scr
 
   const index = await readFile(join(output, "index.html"), "utf8")
   expect(index).toContain('href="/AIPass/docs/runtime-guide/"')
+  expect(index).toContain('href="/AIPass/docs/configuration/"')
   expect(index).toContain('href="/AIPass/docs/releases/v0.1.3/"')
   expect(index).toContain('href="/AIPass/scripts/live-smoke/"')
   expect(index).not.toContain("/review/")
@@ -56,6 +58,7 @@ test("builds a safe static site with project-subpath navigation and readable scr
   expect(guide).toContain('href="/AIPass/docs/operations/"')
   expect(guide).toContain("&lt;script&gt;")
   expect(guide).not.toContain("<script>alert")
+  expect(await readFile(join(output, "docs", "configuration", "index.html"), "utf8")).toContain("File-owned settings")
 
   const script = await readFile(join(output, "scripts", "live-smoke", "index.html"), "utf8")
   expect(script).toContain("const safe = &#39;&lt;script&gt;&#39;")

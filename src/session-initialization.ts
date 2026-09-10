@@ -4,7 +4,6 @@ export const SESSION_INITIALIZATION_MAX_BYTES = 16 * 1024 * 1024
 export interface SessionInitialization {
   readonly instructions?: readonly unknown[] | string
   readonly tools?: readonly unknown[]
-  readonly instructionMode?: "preserve" | "action-only"
 }
 
 export class SessionInitializationCapacityError extends Error {

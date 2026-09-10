@@ -99,7 +99,7 @@ for (const scenario of ["selected", "unselected", "cancel", "late-dom", "late-do
     decoder: () => new StreamFrameParser(), text: delta => ({ type: "text", delta }),
     reasoning: delta => ({ type: "reasoning", delta }), finish: reason => ({ type: "finish", reason }), isTerminal: frame => frame.type === "finish",
   }
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected serve settings")
   const adapter = await PlaywrightBrowserAdapter.launch({
     profilePath, executablePath: command.settings.chromeExecutable, chatURL: `${server.url}chat?temporary-chat=true`,
@@ -265,7 +265,7 @@ test("a completed thinking-only webchat message waits for the later tool reply",
     reasoning: delta => ({ type: "reasoning", delta }), finish: reason => ({ type: "finish", reason }),
     isTerminal: frame => frame.type === "finish",
   }
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected serve settings")
   const adapter = await PlaywrightBrowserAdapter.launch({
     profilePath, executablePath: command.settings.chromeExecutable, chatURL: `${server.url}chat?temporary-chat=true`,

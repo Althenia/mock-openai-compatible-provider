@@ -17,6 +17,7 @@ async function staticPages(root: string): Promise<readonly StaticPage[]> {
   return [
     { route: "/docs/readme", file: "README.md", label: "README" },
     { route: "/docs/runtime-guide", file: "docs/runtime-guide.md", label: "Runtime guide" },
+    { route: "/docs/configuration", file: "docs/configuration.md", label: "Configuration" },
     { route: "/docs/operations", file: "docs/operations.md", label: "Operations" },
     { route: "/docs/model-matrix", file: "docs/model-matrix.md", label: "Model matrix" },
     ...releases.map((name): StaticPage => {

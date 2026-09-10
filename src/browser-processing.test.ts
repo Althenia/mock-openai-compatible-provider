@@ -81,7 +81,7 @@ describe("Processing browser fixtures", () => {
     // Keep Bun's Playwright pipe callbacks awake through setup and teardown.
     transportPulse = setInterval(() => {}, 10).unref()
     try {
-      const command = parseCommand(["start"], {}, { verifyChrome: false })
+      const command = parseCommand(["start"], { verifyChrome: false })
       if (command.type !== "serve") throw Error("expected browser settings")
       chrome = await chromium.launch({ executablePath: command.settings.chromeExecutable, headless: true })
     } catch (error) {
@@ -211,7 +211,7 @@ for (const failure of ["", "stuck"]) test(`adapter sends only after model/varian
         };
       </script></body>`), { headers: { "content-type": "text/html" } })
   } })
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected browser settings")
   const profilePath = await mkdtemp(join(tmpdir(), "aipass-processing-fixture-"))
   const protocol: BrowserProtocol<BrowserFrame> = {

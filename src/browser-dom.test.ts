@@ -15,7 +15,7 @@ let transportPulse: ReturnType<typeof setInterval>
 beforeAll(async () => {
   // Keep Bun's Playwright pipe callbacks awake through browser teardown too.
   transportPulse = setInterval(() => {}, 10).unref()
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw new Error("expected serve command settings")
   browser = await chromium.launch({ headless: true, executablePath: command.settings.chromeExecutable })
   page = await browser.newPage()

@@ -20,14 +20,14 @@ bun run test:install     # installer fixtures
 bun run test:release     # release preflight + binary-only packaging, no upstream downloads
 ```
 
-- `bun scripts/live-smoke.ts --case <case> <model>` consumes authenticated provider quota, uses an in-memory dispatcher (no real filesystem/skill execution), and requires the provider stopped first. Same for `live-catalog-trace.ts --run/--provider` (needs `AIPASS_LIVE_SMOKE=1`, fixture dir, `yce2e` tmux session).
+- `bun scripts/live-smoke.ts --config PATH --case <case> <model>` consumes authenticated provider quota, uses an in-memory dispatcher (no real filesystem/skill execution), and requires the provider stopped first. `live-catalog-trace.ts --run/--provider` additionally requires `--allow-live`, `--fixture PATH`, `--config PATH`, `--client-config-dir PATH`, and the `yce2e` tmux session for managed-client mode.
 - `bun scripts/docs-site.ts` serves only the allowlisted docs on loopback; never expose raw output, credentials, or arbitrary repo files.
 
 ## Working conventions
 
 - Keep the ownership boundary: webchat backend owns reasoning/answers; AIPass owns transport + structured-response validation; the calling client owns permissions, dispatch, and results. AIPass never loads another application's agent/workspace files — callers supply instructions per request.
 - Model data: `src/model-catalog.ts` (`MODELS`) is master; `docs/model-matrix.md` is a review table and `src/model-catalog.test.ts` enforces ID/name/order/variant parity. Change the TS first, then the table.
-- Config/state: XDG-based defaults (`aipass-browser-provider/config.json`, state root); env overrides `AIPASS_*`. Keep tokens, credentials, Chrome profiles, and screenshot output private. Server binds loopback only.
+- Config/state: the selected JSON file owns runtime settings; defaults come from the current UID's validated macOS account home, never `HOME`, XDG, or `AIPASS_*`. Supported explicit CLI options override file values. Keep tokens, credentials, Chrome profiles, and screenshot output private. Server binds loopback only.
 - Releases: `package.json` version, tag `v<version>`, and `docs/releases/v<version>.md` must agree (CI checks this). Record changed behavior, the validation actually run, and known limitations in the release note. Binaries are ad-hoc signed, not notarized.
 - Public surface (`site/`, Pages docs built by `scripts/build-docs-site.ts` allowlist) excludes local recordings and private diagnostics.
 

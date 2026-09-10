@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
-import type { BrowserTurnInput } from "./browser.ts"
+import { withTurnKey, type BrowserTurnInput } from "./browser.ts"
 import { estimateTokens } from "./context.ts"
-import { parseOpenAIChatRequest } from "./http.ts"
+import { parseOpenAIChatRequest, parseOpenAIResponsesRequest } from "./http.ts"
 import { collectOpenAIChatResult, StreamFrameParser, type BrowserFrame } from "./protocol.ts"
 import { StandaloneBrowserService } from "./runtime.ts"
 import { createRequestHandler } from "./server.ts"
@@ -121,6 +121,82 @@ describe("progressive DOM reasoning through runtime and public streams", () => {
     expect(result.finishReason).toBe("tool-calls")
   })
 
+  test("provision does not mix in a second attempt's typed reasoning", async () => {
+    const parsed = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", session_id: "progress-provision-typed",
+      messages: [{ role: "user", content: "read fixture.txt" }],
+      tools: [{ type: "function", function: { name: "read", parameters: { type: "object", required: ["path"] } } }],
+    }, new Headers())
+    let submissions = 0
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      const initial = ++submissions === 1
+      if (initial) yield { type: "reasoning", delta: "Visible.", domTurnKey: input.promptKey }
+      else yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "thinking", key: input.promptKey, text: "SECOND TYPED ATTEMPT" })}</aipass-envelope>` }
+      yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({
+        type: "tool", key: input.promptKey, name: "read", id: "read_1", input: initial ? {} : { path: "fixture.txt" },
+      })}</aipass-envelope>` }
+      yield { type: "finish", reason: "stop" }
+    } } as never)
+    const result = await collectOpenAIChatResult(service.turn(parsed.turn), parsed.offered)
+    expect(result.reasoning).toBe("Visible.")
+    expect(result.toolCalls).toEqual([{ id: "read_1", name: "read", input: { path: "fixture.txt" } }])
+    expect(submissions).toBe(2)
+  })
+
+  for (const source of ["dom", "typed"] as const) test(`repairs prose after attributed ${source} reasoning without publishing correction reasoning`, async () => {
+    const parsed = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite", session_id: `progress-format-${source}`,
+      messages: [{ role: "user", content: "Explain." }],
+    }, new Headers())
+    let submissions = 0
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      const first = ++submissions === 1
+      if (first && source === "dom") yield { type: "reasoning", delta: "Visible.", domTurnKey: input.promptKey }
+      if (first && source === "typed") yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "thinking", key: input.promptKey, text: "Visible." })}</aipass-envelope>` }
+      if (first) yield { type: "text", delta: "malformed terminal prose" }
+      else {
+        yield { type: "reasoning", delta: "SECOND DOM", domTurnKey: input.promptKey }
+        yield { type: "text", delta: `<aipass-envelope>${JSON.stringify({ type: "thinking", key: input.promptKey, text: "SECOND TYPED" })}</aipass-envelope>` }
+        yield { type: "text", delta: envelope(input.promptKey) }
+      }
+      yield { type: "finish", reason: "stop" }
+    } } as never)
+    const result = await collectOpenAIChatResult(service.turn(parsed.turn), parsed.offered)
+    expect(submissions).toBe(2)
+    expect(result.reasoning).toBe("Visible.")
+    expect(result.text).toBe("Answer.")
+    expect(result.text).not.toContain("malformed")
+    expect(result.reasoning).not.toContain("SECOND")
+    expect(result.promptTokens).toBeGreaterThan(0)
+    expect(result.completionTokens).toBe(
+      estimateTokens("Visible.Answer.") + estimateTokens("malformed terminal prose") + estimateTokens("SECOND DOM"),
+    )
+  })
+
+  test("repeated outside prose fails closed after streamed attributed reasoning", async () => {
+    const parsed = parseOpenAIChatRequest({
+      model: "gemini-3.1-flash-lite", session_id: "progress-format-outside-repeated",
+      messages: [{ role: "user", content: "Explain." }],
+    }, new Headers())
+    let submissions = 0, discarded = 0
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      submissions++
+      yield { type: "reasoning", delta: submissions === 1 ? "Visible." : "SECOND ATTEMPT", domTurnKey: input.promptKey }
+      const first = envelope(input.promptKey, "one")
+      const second = envelope(input.promptKey, "two")
+      yield { type: "text", delta: `${first} OUTSIDE ${second}` }
+      yield { type: "finish", reason: "stop" }
+    }, async discard() { discarded++ } } as never)
+    const stream = service.turn(parsed.turn)
+    const published: BrowserFrame[] = []
+    published.push((await stream.next()).value!)
+    await expect(stream.next()).rejects.toThrow("envelope format")
+    expect(submissions).toBe(2)
+    expect(discarded).toBe(1)
+    expect(published).toEqual([{ type: "reasoning", delta: "Visible." }])
+    expect(JSON.stringify(published)).not.toContain("OUTSIDE")
+    expect(JSON.stringify(published)).not.toContain("SECOND ATTEMPT")
+  })
+
   test("invalidates a retried turn if its first visible progress is followed by another key mismatch", async () => {
     const parsed = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", session_id: "retry-progress", messages: [{ role: "user", content: "Explain." }] }, new Headers())
     let submissions = 0, discarded = 0
@@ -206,6 +282,51 @@ describe("progressive DOM reasoning through runtime and public streams", () => {
   })
 
   for (const endpoint of ["chat/completions", "responses"] as const) {
+    test(`${endpoint} usage includes the hidden format correction`, async () => {
+      const token = "a".repeat(64)
+      const submitted: BrowserTurnInput[] = []
+      const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+        submitted.push(input)
+        if (submitted.length === 1) yield { type: "text", delta: "hidden malformed draft" }
+        else yield { type: "text", delta: envelope(input.promptKey) }
+        yield { type: "finish", reason: "stop" }
+      }, async discard() {} } as never)
+      const handler = createRequestHandler({ token, browser: service, shutdown: async () => undefined })
+      const requestBody = endpoint === "responses"
+        ? { model: "gemini-3.1-flash-lite", input: "Explain.", stream: true }
+        : { model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Explain." }] }
+      const response = await handler(new Request(`http://127.0.0.1/v1/${endpoint}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+        body: JSON.stringify(requestBody),
+      }))
+      const responseText = await response.text()
+      expect({ status: response.status, body: response.status === 200 ? "ok" : responseText }).toEqual({ status: 200, body: "ok" })
+      expect(submitted).toHaveLength(2)
+      const publicPromptTokens = endpoint === "responses"
+        ? parseOpenAIResponsesRequest(requestBody, new Headers()).promptTokens
+        : parseOpenAIChatRequest(requestBody, new Headers()).promptTokens
+      const hiddenPromptTokens = estimateTokens(withTurnKey(submitted[1]!.initialPrompt, submitted[1]!.promptKey))
+      const expectedCompletion = estimateTokens("hidden malformed draft") + estimateTokens("Answer.")
+      if (endpoint === "responses") {
+        const completed = responseText.split("\n").filter(line => line.startsWith("data: ")).map(line => line.slice(6)).filter(line => line !== "[DONE]").map(line => JSON.parse(line)).find(event => event.type === "response.completed")
+        expect(completed.response.usage).toEqual({
+          input_tokens: publicPromptTokens + hiddenPromptTokens,
+          output_tokens: expectedCompletion,
+          total_tokens: publicPromptTokens + hiddenPromptTokens + expectedCompletion,
+          estimated: true,
+        })
+      } else {
+        const output = JSON.parse(responseText) as { usage: unknown }
+        expect(output.usage).toEqual({
+          prompt_tokens: publicPromptTokens + hiddenPromptTokens,
+          completion_tokens: expectedCompletion,
+          total_tokens: publicPromptTokens + hiddenPromptTokens + expectedCompletion,
+          estimated: true,
+        })
+      }
+    })
+
     test(`${endpoint} reader cancellation aborts a pending browser read after visible progress`, async () => {
       const waiting = gate(), requestAbort = new AbortController()
       let closed = 0
@@ -324,4 +445,31 @@ describe("progressive DOM reasoning through runtime and public streams", () => {
       }
     })
   }
+
+  for (const issue of ["outside-prose", "invalid-chat-payload"] as const) test(`chat/completions corrects ${issue} before publishing`, async () => {
+    const token = "a".repeat(64)
+    const submitted: BrowserTurnInput[] = []
+    const service = new StandaloneBrowserService({ async *turn(input: BrowserTurnInput) {
+      submitted.push(input)
+      if (submitted.length === 1) {
+        const value = issue === "outside-prose"
+          ? `${envelope(input.promptKey, "one")} OUTSIDE ${envelope(input.promptKey, "two")}`
+          : `<aipass-envelope>${JSON.stringify({ type: "chat", key: input.promptKey, id: "answer", text: 42 })}</aipass-envelope>`
+        yield { type: "text", delta: value }
+      } else yield { type: "text", delta: envelope(input.promptKey) }
+      yield { type: "finish", reason: "stop" }
+    }, async discard() {} } as never)
+    const handler = createRequestHandler({ token, browser: service, shutdown: async () => undefined })
+    const response = await handler(new Request("http://127.0.0.1/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "gemini-3.1-flash-lite", messages: [{ role: "user", content: "Explain." }] }),
+    }))
+    const output = await response.json() as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } }
+    expect(response.status).toBe(200)
+    expect(submitted).toHaveLength(2)
+    expect(output.choices?.[0]?.message?.content).toBe("Answer.")
+    expect(JSON.stringify(output)).not.toContain("OUTSIDE")
+    expect(output.error).toBeUndefined()
+  })
 })

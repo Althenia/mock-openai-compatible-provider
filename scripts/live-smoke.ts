@@ -1,5 +1,5 @@
 // Opt-in, quota-consuming checks against the authenticated webchat profile.
-// Build first, then run: bun scripts/live-smoke.ts [--case lookup|chain|catalog|instruction-update|startup-context] [--instruction-mode action-only|preserve] [model-id ...]
+// Build first, then run: bun scripts/live-smoke.ts --config PATH [--case lookup|chain|catalog|instruction-update|startup-context] [model-id ...]
 import { MODELS } from "../src/config.ts"
 
 type CaseName = "lookup" | "chain" | "catalog" | "instruction-update" | "startup-context"
@@ -9,14 +9,15 @@ type ChainStep = { readonly name: string; readonly input: Record<string, string>
 const supportedModels = ["claude-sonnet-5@default", "gpt-5.6-terra", "gemini-3.1-flash-lite"]
 const args = process.argv.slice(2)
 let caseName: CaseName = "lookup"
-let catalogMode: "action-only" | "preserve" | undefined
+let configPath: string | undefined
 const selected: string[] = []
 for (let index = 0; index < args.length; index++) {
   const value = args[index]!
-  if (value === "--instruction-mode") {
+  if (value === "--config") {
     const next = args[++index]
-    if (next !== "action-only" && next !== "preserve") throw new Error("--instruction-mode must be action-only or preserve")
-    catalogMode = next
+    if (!next) throw new Error("--config requires a path")
+    if (configPath) throw new Error("--config may be supplied only once")
+    configPath = next
     continue
   }
   if (value === "--case") {
@@ -33,8 +34,8 @@ for (let index = 0; index < args.length; index++) {
   }
   selected.push(value)
 }
+if (!configPath) throw new Error("--config PATH is required")
 if (selected.some((id) => !supportedModels.includes(id))) throw new Error("unsupported live-check model")
-if (catalogMode && caseName !== "catalog") throw new Error("--instruction-mode is only supported for the catalog comparison")
 const models = selected.length ? selected : caseName === "catalog" || caseName === "instruction-update" ? ["gemini-3.1-flash-lite"] : supportedModels
 const binary = new URL("../dist/aipass-browser-provider", import.meta.url).pathname
 const REQUEST_TIMEOUT_MS = 100_000
@@ -235,13 +236,15 @@ async function runStartupContext(endpoint: string, token: string, model: string,
   else responsesStream(text, `${prefix}:${folder}`)
 }
 
-async function runChatChain(endpoint: string, token: string, model: string, effort: string | undefined, instructionMode?: "action-only" | "preserve", updateInstructions = false) {
+async function runChatChain(endpoint: string, token: string, model: string, effort: string | undefined, scenario: "chain" | "catalog" | "instruction-update" = "chain") {
+  const withCatalog = scenario !== "chain"
+  const updateInstructions = scenario === "instruction-update"
   const session = `chain-chat-${crypto.randomUUID()}`
   // Catalog IDs are unpredictable and appear only in system context, not in
   // the user request or tool schema. This isolates instruction projection.
   const skillID = `fixture-doc-${crypto.randomUUID()}`
   const finalPath = `fixture-final-${crypto.randomUUID()}.txt`
-  const catalogSteps = instructionMode
+  const catalogSteps = withCatalog
     ? chainSteps.map((step) => step.name === "skill" ? { name: "skill", input: { id: skillID } } : step)
     : chainSteps
   const steps = updateInstructions
@@ -250,7 +253,7 @@ async function runChatChain(endpoint: string, token: string, model: string, effo
   const userRequest = updateInstructions
     ? chainRequest.replace("read fixture-beta.txt", "read the final fixture path supplied in a subsequent client instruction update")
     : chainRequest
-  const messages: unknown[] = instructionMode
+  const messages: unknown[] = withCatalog
     ? [
         { role: "system", content: `Available client skills:\n<available_skills>\n<skill><id>${skillID}</id><description>Review documentation in plain text fixtures.</description></skill>\n<skill><id>fixture-data-${crypto.randomUUID()}</id><description>Analyze numerical datasets; not documentation.</description></skill>\n</available_skills>` },
         { role: "user", content: userRequest.replace("skill fixture-skill", "load a suitable documentation skill from the available client skills") },
@@ -259,17 +262,17 @@ async function runChatChain(endpoint: string, token: string, model: string, effo
   const finalToken = `FINAL_${crypto.randomUUID()}`
   for (let index = 0; index < MAX_TURNS - 1; index++) {
     if (updateInstructions && index === 3) messages.push({ role: "developer", content: `Client instruction update: the final fixture path is ${finalPath}. Continue the pending read using this path, then return only its result as requested.` })
-    const body = { model, reasoning: effort ? { effort } : undefined, messages, tools: chatTools, stream: false, session_id: session, instruction_mode: instructionMode }
+    const body = { model, reasoning: effort ? { effort } : undefined, messages, tools: chatTools, stream: false, session_id: session }
     const value = await (await request(endpoint, token, "/chat/completions", body)).json()
     const call = chatCall(value, index + 1)
     const result = executeChainStep(index, call, finalToken, steps)
-    if (instructionMode) console.log(JSON.stringify({ model, effort, check: updateInstructions ? "instruction-update" : `catalog-${instructionMode}`, step: index + 1, tool: call.name, inputMatches: true }))
+    if (withCatalog) console.log(JSON.stringify({ model, effort, check: scenario, step: index + 1, tool: call.name, inputMatches: true }))
     const assistant = record(firstChoice(value)?.message)
     if (!assistant) throw new Error("chain assistant message is missing")
     messages.push(assistant, { role: "tool", tool_call_id: call.id, content: result })
   }
   const final = await request(endpoint, token, "/chat/completions", {
-    model, reasoning: effort ? { effort } : undefined, messages, tools: chatTools, stream: true, session_id: session, instruction_mode: instructionMode,
+    model, reasoning: effort ? { effort } : undefined, messages, tools: chatTools, stream: true, session_id: session,
   })
   chatStream(await final.text(), finalToken)
 }
@@ -297,10 +300,10 @@ async function runResponsesChain(endpoint: string, token: string, model: string,
   responsesStream(await final.text(), finalToken)
 }
 
-const credentials = Bun.spawn([binary, "print-token"], { stdout: "pipe", stderr: "ignore" })
+const credentials = Bun.spawn([binary, "print-token", "--config", configPath], { stdout: "pipe", stderr: "ignore" })
 const token = (await new Response(credentials.stdout).text()).trim()
 if (await credentials.exited !== 0 || !token) throw new Error("provider credential lookup failed")
-const provider = Bun.spawn([binary, "start"], { env: { ...process.env, AIPASS_BROWSER_HEADED: "1" }, stdout: "pipe", stderr: "ignore" })
+const provider = Bun.spawn([binary, "start", "--config", configPath], { env: process.env, stdout: "pipe", stderr: "ignore" })
 let startupTimer: ReturnType<typeof setTimeout> | undefined
 let failures = 0
 try {
@@ -327,10 +330,9 @@ try {
       : caseName === "lookup"
       ? [["lookup", () => runLookup(endpoint, token, model, effort)]] as const
       : caseName === "catalog"
-        ? (catalogMode ? [catalogMode] : ["action-only", "preserve"] as const)
-            .map((mode) => [`catalog-${mode}`, () => runChatChain(endpoint, token, model, effort, mode)] as const)
+        ? [["catalog", () => runChatChain(endpoint, token, model, effort, "catalog")]]
         : caseName === "instruction-update"
-          ? [["instruction-update", () => runChatChain(endpoint, token, model, effort, "preserve", true)]]
+          ? [["instruction-update", () => runChatChain(endpoint, token, model, effort, "instruction-update")]]
         : [
           ["chain-chat", () => runChatChain(endpoint, token, model, effort)],
           ["chain-responses", () => runResponsesChain(endpoint, token, model, effort)],

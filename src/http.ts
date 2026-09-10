@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { model, type Reasoning } from "./config.ts"
-import { INSTRUCTION_DIGEST_PREFIX_LENGTH, PROMPT_CONTRACT_VERSION, serializeToolDefinitions, validName } from "./protocol.ts"
+import { PROMPT_CONTRACT_VERSION, serializeToolDefinitions, validName } from "./protocol.ts"
 import { compactionDigest, estimateTokens } from "./context.ts"
 
 export interface OfferedToolSchema {
@@ -49,9 +49,8 @@ export interface ProjectedTurn {
   // Key of the submission this derived turn descends from (retry/repair/
   // provision chains); unset on the base projected turn.
   readonly originPromptKey?: string
-  // Full offered schemas and names supplied during startup.
+  // Full offered schemas retained locally for action validation and repair.
   readonly offeredToolSchemas: readonly OfferedToolSchema[]
-  readonly provisionedActions: readonly string[]
 }
 
 export interface ParsedChatRequest {
@@ -245,7 +244,7 @@ function stripLoweredSystemUpdates(value: string) {
     .trim()
 }
 
-function serializeMessages(value: unknown, projection: MessageProjection, omitLoweredSystemUpdates = false) {
+function serializeMessages(value: unknown, projection: MessageProjection) {
   if (!Array.isArray(value) || value.length === 0) throw new Error("messages must be a non-empty array")
   return value
     .flatMap((message, index) => {
@@ -256,10 +255,7 @@ function serializeMessages(value: unknown, projection: MessageProjection, omitLo
         throw new Error(`messages[${index}].role is invalid`)
       const instruction = role === "system" || role === "developer"
       if ((projection === "instructions") !== instruction) return []
-      const rawValue = content(item.content, `messages[${index}]`)
-      const value =
-        omitLoweredSystemUpdates && role === "user" ? stripLoweredSystemUpdates(rawValue) : rawValue
-      if (omitLoweredSystemUpdates && role === "user" && rawValue && !value) return []
+      const value = content(item.content, `messages[${index}]`)
       if (role === "tool") {
         if (typeof item.tool_call_id !== "string" || !item.tool_call_id)
           throw new Error(`messages[${index}].tool_call_id is required`)
@@ -288,7 +284,7 @@ function serializeMessages(value: unknown, projection: MessageProjection, omitLo
     .join("\n\n")
 }
 
-function incrementalMessages(value: unknown, conversation: string, omitLoweredSystemUpdates = false) {
+function incrementalMessages(value: unknown, conversation: string) {
   if (!Array.isArray(value)) return conversation
   let latestAssistant = -1
   for (let index = 0; index < value.length; index++) {
@@ -296,7 +292,7 @@ function incrementalMessages(value: unknown, conversation: string, omitLoweredSy
   }
   if (latestAssistant < 0) return conversation
   const suffix = value.slice(latestAssistant + 1)
-  return suffix.length ? serializeMessages(suffix, "conversation", omitLoweredSystemUpdates) : conversation
+  return suffix.length ? serializeMessages(suffix, "conversation") : conversation
 }
 
 function toolContinuation(value: unknown) {
@@ -458,7 +454,11 @@ export function parseOpenAIResponsesRequest(
   return { ...parsed, responseID, store }
 }
 
-export function parseOpenAIChatRequest(value: unknown, headers: Headers, sessionOverride?: string | null): ParsedChatRequest {
+export function parseOpenAIChatRequest(
+  value: unknown,
+  headers: Headers,
+  sessionOverride?: string | null,
+): ParsedChatRequest {
   const input = record(value)
   if (!input || typeof input.model !== "string" || !input.model) throw new Error("model is required")
   if (input.n !== undefined && input.n !== 1) throw new Error("n must be 1")
@@ -469,34 +469,30 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
   model(input.model)
   const sessionValue = requestSession(headers, input, sessionOverride)
   const sessionMarker = sessionValue.marker
-  const instructionMode = input.instruction_mode ?? "preserve"
-  if (instructionMode !== "preserve" && instructionMode !== "action-only")
-    throw new Error("instruction_mode must be preserve or action-only")
   // Validate before projecting individual instruction messages so original
   // system/developer boundaries and ordering survive transport.
   serializeMessages(input.messages, "instructions")
   const client = projectClientInstructions(input.messages as unknown[])
-  const instructions = instructionMode === "action-only" ? [] : client.instructions
-  const omitLoweredSystemUpdates = instructionMode === "action-only"
-  const conversation = serializeMessages(client.conversationMessages, "conversation", omitLoweredSystemUpdates)
-  const incrementalTranscript = incrementalMessages(client.conversationMessages, conversation, omitLoweredSystemUpdates)
-  const catalogTools = tools(input.tools)
-  const selection = toolSelection(catalogTools, input.tool_choice)
+  const instructions = client.instructions
+  const conversation = serializeMessages(client.conversationMessages, "conversation")
+  const incrementalTranscript = incrementalMessages(client.conversationMessages, conversation)
+  const suppliedTools = tools(input.tools)
+  const selection = toolSelection(suppliedTools, input.tool_choice)
   const stream = input.stream === true
   if (stream && selection.required) throw new Error("streaming with required tool_choice is not supported")
   const offeredTools = selection.definitions
   const continuingTool = toolContinuation(input.messages)
   // Initialization is one ordered webchat submission: client protocol,
-  // caller instruction boundaries, then the complete active tool catalog.
+  // caller instruction boundaries, then every effective offered schema.
   // Ordinary task/result turns carry only their keyed conversation delta.
   const startupProtocol = [
     "CLIENT INSTRUCTIONS (AIPass response protocol and working guidelines)",
-    serializeToolDefinitions([], catalogTools.length > 0),
+    serializeToolDefinitions([], offeredTools.length > 0),
     "Initialization submission only. Store this initialization for subsequent turns. Reply once with exactly one chat envelope carrying the current turn key and text READY; request no action. Subsequent submissions contain task data, client progress, or action results, not repeated protocol declarations.",
     "HARNESS INSTRUCTIONS (caller-supplied agent/workspace rules, skills, MCP and tools; original roles and order retained)",
     ...instructions,
-    `Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(catalogTools.map(tool => tool.name))}. Request only names in this list.`,
-    serializeToolDefinitions(catalogTools, catalogTools.length > 0, false),
+    `Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(offeredTools.map(tool => tool.name))}. Request only names in this list.`,
+    serializeToolDefinitions(offeredTools, offeredTools.length > 0, false),
   ].filter(Boolean).join("\n\n")
   const primingPrompts = [startupProtocol]
   const toolChoiceNotice = input.tool_choice === "none"
@@ -504,7 +500,7 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
     : selection.required && offeredTools.length > 0
       ? `You may request only these actions on this turn: ${offeredTools.map(tool => tool.name).join(", ")}. You must request one before giving a final answer.`
       : ""
-  // Submission adds only the changing turn key; protocol lives in startup.
+  // Submission adds the changing turn key and short guard, not full startup.
   const initialPrompt = [toolChoiceNotice, conversation].filter(Boolean).join("\n")
   const autoToolChoice = input.tool_choice === undefined || input.tool_choice === "auto"
   const toolRepairPrompt = autoToolChoice && offeredTools.length > 0
@@ -515,17 +511,9 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
         "Otherwise preserve the prior refusal or answer normally.",
       ].join("\n")
     : undefined
-  const rawActionEnvelopeDigest = createHash("sha256")
+  const actionEnvelopeDigest = createHash("sha256")
     .update(JSON.stringify([PROMPT_CONTRACT_VERSION, primingPrompts]))
     .digest("hex")
-  // Preserve instruction-boundary identity in the existing digest layout;
-  // complete startup identity also includes every offered tool schema.
-  const instructionDigest = createHash("sha256").update(JSON.stringify(instructions)).digest("hex")
-  const actionEnvelopeDigest = [
-    instructionMode === "action-only" ? "a0" : "b0",
-    instructionDigest.slice(0, INSTRUCTION_DIGEST_PREFIX_LENGTH - 2),
-    rawActionEnvelopeDigest.slice(INSTRUCTION_DIGEST_PREFIX_LENGTH),
-  ].join("")
   const incrementalPrompt = [toolChoiceNotice, incrementalTranscript].filter(Boolean).join("\n")
   // A fresh/recovery session re-primes startup before chronological history.
   const recoveryPrompt = initialPrompt
@@ -562,7 +550,6 @@ export function parseOpenAIChatRequest(value: unknown, headers: Headers, session
         ...(tool.description ? { description: tool.description } : {}),
         inputSchema: tool.inputSchema,
       })),
-      provisionedActions: catalogTools.map((tool) => tool.name),
     },
     offered: new Set(offeredTools.map((tool) => tool.name)),
     projectedActions: offeredTools.map((tool) => tool.name),

@@ -1,10 +1,10 @@
 // Opt-in metadata-only observer for one isolated, serial YCoding workflow.
-// --self-test is local-only; --run requires AIPASS_LIVE_SMOKE=1 and AIPASS_LIVE_FIXTURE.
+// --self-test is local-only; live modes require explicit consent and paths.
 import { strict as assert } from "node:assert"
 import { createHash } from "node:crypto"
 import { join } from "node:path"
 import { chromium, type Request as NativeRequest } from "playwright-core"
-import { parseCommand } from "../src/config.ts"
+import { loadCommandConfiguration, parseCommand } from "../src/config.ts"
 import { parseOpenAIChatRequest } from "../src/http.ts"
 import { serveProvider } from "../src/runtime.ts"
 import { readExistingToken } from "../src/state.ts"
@@ -13,7 +13,44 @@ type StartupTrace = { prompts: readonly string[]; seen: number; mismatches: numb
 type Trace = { index: number; prompt: string; seen: number; internal: number; mismatches: number; native: Promise<NativeReply>[]; startup?: StartupTrace; wire?: InputTrace[]; comparison?: ReturnType<typeof compareSkillInputs> }
 type InputTrace = { digest: string; bytes: number; keyCount: number }
 type NativeReply = { complete: boolean; attributable: boolean; inputs: InputTrace[] }
+type DiagnosticCommand =
+  | { readonly type: "self-test" }
+  | { readonly type: "run" | "provider"; readonly configPath: string; readonly clientConfigDir: string; readonly fixture: string }
 const report = (value: object) => process.stdout.write(`${JSON.stringify(value)}\n`)
+
+function parseDiagnosticCommand(arguments_: readonly string[]): DiagnosticCommand {
+  const [mode, ...rest] = arguments_
+  if (mode === "--self-test") {
+    if (rest.length) throw new Error("--self-test does not accept options")
+    return { type: "self-test" }
+  }
+  if (mode !== "--run" && mode !== "--provider")
+    throw new Error("use --self-test, --run, or --provider")
+  let configPath: string | undefined
+  let clientConfigDir: string | undefined
+  let fixture: string | undefined
+  let allowLive = false
+  for (let index = 0; index < rest.length;) {
+    const option = rest[index]
+    if (option === "--allow-live" && !allowLive) {
+      allowLive = true
+      index++
+      continue
+    }
+    const value = rest[index + 1]
+    if (!value) throw new Error(`missing value for ${option}`)
+    if (option === "--config" && configPath === undefined) configPath = value
+    else if (option === "--client-config-dir" && clientConfigDir === undefined) clientConfigDir = value
+    else if (option === "--fixture" && fixture === undefined) fixture = value
+    else throw new Error(`unknown or repeated option ${option}`)
+    index += 2
+  }
+  if (!allowLive) throw new Error("live modes require --allow-live")
+  if (!configPath) throw new Error("live modes require --config PATH")
+  if (!clientConfigDir) throw new Error("live modes require --client-config-dir PATH")
+  if (!fixture) throw new Error("live modes require --fixture PATH")
+  return { type: mode === "--run" ? "run" : "provider", configPath, clientConfigDir, fixture }
+}
 
 function inputTrace(input: unknown): InputTrace {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("skill input must be an object")
@@ -162,6 +199,11 @@ function responseSummary(text: string, expected: string) {
 }
 
 async function selfTest() {
+  assert.deepEqual(
+    parseDiagnosticCommand(["--run", "--allow-live", "--fixture", "/fixture", "--config", "/provider.json", "--client-config-dir", "/client"]),
+    { type: "run", configPath: "/provider.json", clientConfigDir: "/client", fixture: "/fixture" },
+  )
+  assert.throws(() => parseDiagnosticCommand(["--provider", "--config", "/provider.json"]), /--allow-live/)
   assert.equal(captureSummary([], 0, false, true).captureComplete, false, "empty observations must fail")
   const partial: Trace = { index: 1, prompt: "SYSTEM: context\n\nUSER: request", seen: 0, internal: 0, mismatches: 0, native: [] }
   assert.equal(captureSummary([partial], 1, false, true).captureComplete, false, "missing current-request submission must fail")
@@ -210,16 +252,19 @@ async function selfTest() {
   assert.equal(nativeSubmission(nativeBody("repair instruction"), repaired)?.fullContext, false)
   assert.equal(captureSummary([repaired], 2, false, true).captureComplete, false, "contextless internal turns must fail")
   assert.equal(nativeSubmission(JSON.stringify({ messages: [{ parts: [{ type: "text", text: partial.prompt }] }] }))?.fullContext, false, "unkeyed submissions are not attributable")
-  const body = JSON.stringify({ model: "gemini-3.1-flash-lite", instruction_mode: "preserve", messages: [
+  const body = JSON.stringify({ model: "gemini-3.1-flash-lite", messages: [
     { role: "system", content: "Synthetic instruction.\n".repeat(450) + "<available_skills>readme-writer</available_skills>" },
     { role: "user", content: "Reply ready." },
   ] })
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const trace = await project(request, 1)
     assert(trace && trace.prompt.length > 0)
-    assert.equal(trace.startup?.prompts.length, 2)
-    assert(trace.startup?.prompts[1]?.length > 8_000)
-    assert(trace.startup?.prompts[1]?.includes("<available_skills>readme-writer</available_skills>"))
+    assert.equal(trace.startup?.prompts.length, 1)
+    const startup = trace.startup!.prompts[0]!
+    assert(startup.length > 8_000)
+    assert(startup.includes("<available_skills>readme-writer</available_skills>"))
+    assert(startup.indexOf("CLIENT INSTRUCTIONS") < startup.indexOf("HARNESS INSTRUCTIONS"))
+    assert(startup.indexOf("HARNESS INSTRUCTIONS") < startup.indexOf("SYSTEM: Synthetic instruction."))
     assert.equal(await request.text(), body)
     for (const startup of trace.startup?.prompts ?? [])
       assert.equal(nativeSubmission(startupBody(startup), trace)?.exact, true, "startup prompts must be captured in projection order")
@@ -288,17 +333,15 @@ async function selfTest() {
   } finally { await server.stop(true) }
 }
 
-async function run(managedClient = false) {
-  const fixture = process.env.AIPASS_LIVE_FIXTURE
-  if (process.env.AIPASS_LIVE_SMOKE !== "1" || !fixture) throw new Error("explicit live opt-in and fixture required")
-  const command = parseCommand(["start"], { ...process.env, AIPASS_BROWSER_HEADED: "1" })
-  if (command.type !== "serve") throw new Error("settings unavailable")
+async function run(managedClient: boolean, configPath: string, clientConfigDir: string, fixture: string) {
+  const parsed = parseCommand(["start", "--config", configPath], { verifyChrome: false })
+  if (parsed.type !== "serve") throw new Error("settings unavailable")
+  const command = await loadCommandConfiguration(parsed)
   const expected = await Bun.file(join(fixture, "notes.txt")).text()
-  const root = join(process.env.XDG_CONFIG_HOME ?? join(process.env.HOME!, ".config"), "ycoding")
-  const hash = async (name: string) => createHash("sha256").update(Buffer.from(await Bun.file(join(root, name)).arrayBuffer())).digest("hex")
+  const hash = async (name: string) => createHash("sha256").update(Buffer.from(await Bun.file(join(clientConfigDir, name)).arrayBuffer())).digest("hex")
   const originals = new Map<string, string>()
   for (const name of ["ycoding.json", "ycoding.jsonc", "config.json", "config.jsonc"])
-    if (await Bun.file(join(root, name)).exists()) originals.set(name, await hash(name))
+    if (await Bun.file(join(clientConfigDir, name)).exists()) originals.set(name, await hash(name))
   if (!originals.size) throw new Error("normal configuration guard unavailable")
   const traces: Trace[] = []
   const checks: Promise<void>[] = []
@@ -389,7 +432,7 @@ async function run(managedClient = false) {
     } })
     if (managedClient) originalLog(`OpenAI-compatible endpoint: ${new URL("/v1", proxy.url).href}`)
     else {
-      const overlay = JSON.stringify({ providers: { aipass: { body: { instruction_mode: "preserve" }, settings: { baseURL: new URL("/v1", proxy.url).href } } } })
+      const overlay = JSON.stringify({ providers: { aipass: { settings: { baseURL: new URL("/v1", proxy.url).href } } } })
       const client = Bun.spawn(["tmux", "new-window", "-d", "-t", "yce2e", "-n", "catalog-trace-checked", "env", `YCODING_CONFIG_CONTENT=${overlay}`, "ycoding", "--standalone", fixture], { stdout: "ignore", stderr: "ignore" })
       if (await client.exited !== 0) throw new Error("isolated client launch failed")
       report({ providerReady: true, isolatedClientCreated: true })
@@ -412,7 +455,6 @@ async function run(managedClient = false) {
   }
 }
 
-if (Bun.argv[2] === "--self-test") await selfTest()
-else if (Bun.argv[2] === "--run") await run()
-else if (Bun.argv[2] === "--provider") await run(true)
-else throw new Error("use --self-test, --run, or --provider")
+const command = parseDiagnosticCommand(Bun.argv.slice(2))
+if (command.type === "self-test") await selfTest()
+else await run(command.type === "provider", command.configPath, command.clientConfigDir, command.fixture)

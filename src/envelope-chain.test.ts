@@ -17,6 +17,14 @@ import {
   serializeToolDefinitions,
 } from "./protocol.ts";
 
+function forwardedToolContent(turn: ProjectedTurn, name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name);
+  expect(schema).toBeDefined();
+  const content = JSON.stringify(schema);
+  expect(turn.primingPrompts.join("\n")).toContain(content);
+  return content;
+}
+
 describe("envelope-chain upgrade", () => {
   for (const endpoint of ["chat/completions", "responses"] as const) {
     test(`${endpoint} preserves executed tool-skill continuations then ordered reasoning and final response`, async () => {
@@ -210,7 +218,7 @@ describe("envelope-chain upgrade", () => {
     expect(shim.finish()).toEqual([{ type: "text", delta: chain }]);
   });
 
-  test("one startup submission supplies the complete schema catalog while task prompts stay compact", () => {
+  test("one startup submission supplies complete effective schemas while task prompts stay compact", () => {
     const tools = ["read", "glob", "grep", "shell", "write", "edit", "question"].map((name) => ({
       type: "function" as const,
       function: {
@@ -226,9 +234,9 @@ describe("envelope-chain upgrade", () => {
     // Complete schemas share the one ordered initialization submission, never a task.
     expect(parsed.turn.primingPrompts).toHaveLength(1);
     for (const tool of tools) {
-      expect(parsed.turn.primingPrompts[0]).toContain(JSON.stringify({
+      expect(JSON.parse(forwardedToolContent(parsed.turn, tool.function.name))).toEqual({
         name: tool.function.name, description: tool.function.description, inputSchema: tool.function.parameters,
-      }));
+      });
     }
     expect(parsed.turn.initialPrompt).not.toContain('"inputSchema"');
     expect(parsed.turn.initialPrompt).toBe("USER: hello");
@@ -259,12 +267,12 @@ describe("envelope-chain upgrade", () => {
   });
 
   test("parsed turn carries the current contract version", () => {
-    expect(PROMPT_CONTRACT_VERSION).toBe(25);
+    expect(PROMPT_CONTRACT_VERSION).toBe(27);
     const parsed = parseOpenAIChatRequest(
       { model: "gpt-5.6-terra", messages: [{ role: "user", content: "hello" }] },
       new Headers(),
     );
-    expect(parsed.turn.promptContractVersion).toBe(25);
+    expect(parsed.turn.promptContractVersion).toBe(27);
   });
 
   test("submit-time fill adds attribution and preserves a guard exactly once", () => {

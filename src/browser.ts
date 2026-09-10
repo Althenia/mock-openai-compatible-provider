@@ -493,17 +493,6 @@ export function responseEvidenceTimeoutMs(prompt: string, toolContinuation = fal
   return Math.min(45_000, minimum + Math.max(0, estimatedTokens - 2_000))
 }
 
-export function shouldResetActionOnlyContext(
-  bound: boolean,
-  expectedVersion: number,
-  expectedDigest: string,
-  currentVersion: number | undefined,
-  currentDigest: string | undefined,
-) {
-  return bound && expectedDigest.startsWith("a0") &&
-    (currentVersion !== expectedVersion || !currentDigest?.startsWith("a0"))
-}
-
 export interface AttemptPreparation {
   readonly id: string
   readonly promptHash: string
@@ -2543,27 +2532,10 @@ export class PlaywrightBrowserAdapter<Frame extends BrowserFrame, Attempt extend
         const existing = this.pages.get(input.sessionMarker)
         if (existing) await this.evict(input.sessionMarker, existing, signal)
       }
-      let binding = await this.lifecycle.binding(input.sessionMarker)
-      let bound = binding !== undefined && sameOrigin(binding, this.config.chatURL)
-      let currentVersion = await this.lifecycle.promptContractVersion?.(input.sessionMarker)
-      let currentDigest = await this.lifecycle.actionEnvelopeDigest?.(input.sessionMarker)
-      if (
-        shouldResetActionOnlyContext(
-          bound,
-          input.promptContractVersion,
-          input.actionEnvelopeDigest,
-          currentVersion,
-          currentDigest,
-        )
-      ) {
-        const existing = this.pages.get(input.sessionMarker)
-        if (existing) await this.evict(input.sessionMarker, existing, signal)
-        await this.lifecycle.discard?.(input.sessionMarker)
-        binding = undefined
-        bound = false
-        currentVersion = undefined
-        currentDigest = undefined
-      }
+      const binding = await this.lifecycle.binding(input.sessionMarker)
+      const bound = binding !== undefined && sameOrigin(binding, this.config.chatURL)
+      const currentVersion = await this.lifecycle.promptContractVersion?.(input.sessionMarker)
+      const currentDigest = await this.lifecycle.actionEnvelopeDigest?.(input.sessionMarker)
       const contractCurrent = promptContractCurrent(
         input.promptContractVersion,
         input.actionEnvelopeDigest,

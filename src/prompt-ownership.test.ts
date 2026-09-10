@@ -8,8 +8,16 @@ const mcps = "<mcp_instructions>\nMCP_CATALOG\n</mcp_instructions>"
 const rules = `AGENT_RULE\n\n${skills}\n\n${mcps}`
 const tools = [{ type: "function", function: { name: "read", description: "READ_DESCRIPTION", parameters: { type: "object", properties: { path: { type: "string" } } } } }]
 
+function forwardedToolContent(turn: ReturnType<typeof parseOpenAIChatRequest>["turn"], name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name)
+  expect(schema).toBeDefined()
+  const content = JSON.stringify(schema)
+  expect(turn.primingPrompts.join("\n")).toContain(content)
+  return content
+}
+
 for (const endpoint of ["chat", "responses"] as const) {
-  test(`${endpoint} declares exact instruction and catalog repeats once, separate from turn data`, async () => {
+  test(`${endpoint} declares exact instruction and schema content once, separate from turn data`, async () => {
     const messages = [
       { role: "system", content: rules },
       { role: "developer", content: rules },
@@ -24,7 +32,13 @@ for (const endpoint of ["chat", "responses"] as const) {
     const startup = parsed.turn.primingPrompts.join("\n")
     expect(startup).toContain("HARNESS INSTRUCTIONS")
     expect(startup).toContain("CLIENT INSTRUCTIONS")
-    for (const marker of ["AGENT_RULE", "WORKSPACE_RULE", "SKILL_CATALOG", "MCP_CATALOG", "READ_DESCRIPTION", EVERY_TURN_ENVELOPE_GUARD]) {
+    expect(startup).toContain("READ_DESCRIPTION")
+    expect(JSON.parse(forwardedToolContent(parsed.turn, "read"))).toEqual({
+      name: "read",
+      description: "READ_DESCRIPTION",
+      inputSchema: tools[0]!.function.parameters,
+    })
+    for (const marker of ["AGENT_RULE", "WORKSPACE_RULE", "SKILL_CATALOG", "MCP_CATALOG", EVERY_TURN_ENVELOPE_GUARD]) {
       expect(startup.split(marker)).toHaveLength(2)
       for (const task of [parsed.turn.initialPrompt, parsed.turn.incrementalPrompt, parsed.turn.recoveryPrompt]) {
         expect(task).not.toContain(marker)
@@ -71,7 +85,7 @@ test("escaped lowered instruction repeats are removed without rewriting surround
   expect(parsed.turn.incrementalPrompt).toContain("Next.")
 })
 
-test("mixed repeated catalogs preserve novel update bytes", () => {
+test("mixed repeated skill and MCP blocks preserve novel update bytes", () => {
   const progress = "\n  PROGRESS  \n"
   const parsed = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", messages: [
     { role: "system", content: skills },
@@ -116,12 +130,13 @@ for (const offered of [[], tools]) test(`client initialization owns the type enu
   }
 })
 
-test("initialization catalog does not override per-turn action restrictions", () => {
+test("initialized schemas do not override per-turn action restrictions", () => {
   const parsed = parseOpenAIChatRequest({ model: "gemini-3.1-flash-lite", tools: [
     ...tools, { type: "function", function: { name: "write", parameters: { type: "object" } } },
   ], tool_choice: { type: "function", function: { name: "read" } }, messages: [{ role: "user", content: "Inspect." }] }, new Headers())
-  expect(parsed.turn.primingPrompts[0]).toContain('"name":"write"')
-  expect(parsed.turn.primingPrompts[0]).toContain("Per-turn action restrictions override catalog availability.")
+  expect(parsed.turn.primingPrompts[0]).not.toContain('"name":"write"')
+  expect(JSON.parse(forwardedToolContent(parsed.turn, "read"))).toEqual({ name: "read", description: "READ_DESCRIPTION", inputSchema: tools[0]!.function.parameters })
+  expect(parsed.turn.primingPrompts[0]).toContain("Per-turn action restrictions override the initialized action set.")
   expect(parsed.turn.initialPrompt).toContain("You may request only these actions on this turn: read.")
   expect(() => parseTypedEnvelope({ type: "tool", key: "key", id: "write_1", name: "write", input: {} }, parsed.offered)).toThrow("tool write was not offered")
 })

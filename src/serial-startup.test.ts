@@ -7,6 +7,19 @@ const parse = (messages: unknown[]) => parseOpenAIChatRequest({
   model: "gemini-3.1-flash-lite", session_id: "serial-startup", messages,
 }, new Headers()).turn
 
+function forwardedToolContent(turn: ReturnType<typeof parseOpenAIChatRequest>["turn"], name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name)
+  expect(schema).toBeDefined()
+  const content = JSON.stringify(schema)
+  expect(turn.primingPrompts.join("\n")).toContain(content)
+  return content
+}
+
+function forwardedToolNames(turn: ReturnType<typeof parseOpenAIChatRequest>["turn"]) {
+  for (const schema of turn.offeredToolSchemas) expect(turn.primingPrompts.join("\n")).toContain(JSON.stringify(schema))
+  return turn.offeredToolSchemas.map((schema) => schema.name)
+}
+
 test("one startup submission preserves ordered instruction boundaries separately from the task", () => {
   const turn = parse([
     { role: "system", content: "HARNESS" },
@@ -35,7 +48,7 @@ test("startup identity includes instruction message boundaries", () => {
   expect(one.actionEnvelopeDigest).not.toBe(two.actionEnvelopeDigest)
 })
 
-test("startup alone carries all schemas and one acknowledgement instruction", () => {
+test("startup carries every effective schema and one acknowledgement", () => {
   const tools = ["read", "question"].map(name => ({ type: "function", function: {
     name, description: `SCHEMA ${name}`, parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
   } }))
@@ -48,9 +61,10 @@ test("startup alone carries all schemas and one acknowledgement instruction", ()
   expect(startup.match(/READY/g)).toHaveLength(1)
   expect(startup.match(/You are a text-generation assistant/g)).toHaveLength(1)
   expect(startup.match(/Response type matrix/g)).toHaveLength(1)
-  for (const name of ["read", "question"]) expect(startup).toContain(`"name":"${name}"`)
+  expect(startup).toContain("SCHEMA read")
+  expect(forwardedToolContent(turn, "read")).toContain("SCHEMA read")
   expect(turn.primingPrompts).toHaveLength(1)
-  expect(turn.provisionedActions).toEqual(["read", "question"])
+  expect(["read", "question"].map((name) => JSON.parse(forwardedToolContent(turn, name)).name)).toEqual(["read", "question"])
   for (const prompt of [turn.initialPrompt, turn.incrementalPrompt, turn.recoveryPrompt]) expect(prompt).toBe("USER: read the file")
   expect(project("ask a question").actionEnvelopeDigest).toBe(turn.actionEnvelopeDigest)
   expect(project("read the file", tools.map(tool => ({ ...tool, function: { ...tool.function, description: "CHANGED" } }))).actionEnvelopeDigest).not.toBe(turn.actionEnvelopeDigest)
@@ -66,7 +80,7 @@ test("ordinary preserve-mode bound user turns send only the new task", () => {
   expect(turn.recoveryPrompt).toBe(turn.initialPrompt)
 })
 
-test("the full startup catalog is independent of per-turn tool choice", () => {
+test("startup schema identity follows the effective per-turn tool choice", () => {
   const tool = (name: string) => ({ type: "function", function: { name, parameters: { type: "object" } } })
   const project = (tools: unknown[], tool_choice?: string) => parseOpenAIChatRequest({
     model: "gemini-3.1-flash-lite", tools, tool_choice, messages: [{ role: "user", content: "Continue" }],
@@ -77,18 +91,18 @@ test("the full startup catalog is independent of per-turn tool choice", () => {
   for (const [turn, names, prompt] of [
     [initial, ["read", "question"], "USER: Continue"],
     [removed, ["question"], "USER: Continue"],
-    [disabled, ["read", "question"], "Do not request a client action on this turn; answer without actions.\nUSER: Continue"],
+    [disabled, [], "Do not request a client action on this turn; answer without actions.\nUSER: Continue"],
   ] as const) {
     expect(turn.primingPrompts[0]).toContain(`Active offered actions (complete; replaces every previous offered set): ${JSON.stringify(names)}`)
     expect(turn.primingPrompts[0]).toContain("Request only names in this list.")
     expect(turn.initialPrompt).toBe(prompt)
   }
   expect(removed.primingPrompts.join("\n")).not.toContain('"name":"read"')
-  expect(disabled.primingPrompts).toEqual(initial.primingPrompts)
-  expect(disabled.provisionedActions).toEqual(["read", "question"])
+  expect(disabled.primingPrompts).not.toEqual(initial.primingPrompts)
+  expect(forwardedToolNames(disabled)).toEqual([])
   expect(disabled.offeredActions).toEqual([])
   expect(removed.actionEnvelopeDigest).not.toBe(initial.actionEnvelopeDigest)
-  expect(disabled.actionEnvelopeDigest).toBe(initial.actionEnvelopeDigest)
+  expect(disabled.actionEnvelopeDigest).not.toBe(initial.actionEnvelopeDigest)
 })
 
 test("single-flight identity includes startup, model, variant, and compaction", async () => {

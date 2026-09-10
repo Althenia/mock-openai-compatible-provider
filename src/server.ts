@@ -12,8 +12,10 @@ import { MODELS } from "./config.ts"
 import { NoResponseEvidenceError, WebchatSafetyBlockError } from "./browser.ts"
 import { streamingFrames } from "./stream-progress.ts"
 import {
+  SESSION_INITIALIZATION_MAX_BYTES,
   SessionInitializationCapacityError,
   SessionInitializationStore,
+  sessionInitializationBytes,
   type SessionInitialization,
 } from "./session-initialization.ts"
 
@@ -187,9 +189,9 @@ function responsesObject(
     output,
     parallel_tool_calls: true,
     usage: {
-      input_tokens: promptTokens,
+      input_tokens: promptTokens + result.promptTokens,
       output_tokens: result.completionTokens,
-      total_tokens: promptTokens + result.completionTokens,
+      total_tokens: promptTokens + result.promptTokens + result.completionTokens,
       estimated: true,
     },
   }
@@ -292,25 +294,21 @@ function effectiveChatInitialization(
   const instructions = explicitInstructions ?? retainedInstructions
   const toolsPresent = hasOwn(input, "tools")
   const tools = toolsPresent ? input.tools : retained?.tools
-  const modePresent = hasOwn(input, "instruction_mode")
-  const instructionMode = modePresent ? input.instruction_mode : retained?.instructionMode
   const effective = {
     ...input,
     ...(!explicitInstructions && instructions && Array.isArray(input.messages)
       ? { messages: [...instructions, ...input.messages] }
       : {}),
     ...(!toolsPresent && tools !== undefined ? { tools } : {}),
-    ...(!modePresent && instructionMode !== undefined ? { instruction_mode: instructionMode } : {}),
   }
   const initialization: SessionInitialization = {
     ...(instructions ? { instructions } : {}),
     ...(Array.isArray(tools) ? { tools } : {}),
-    ...(instructionMode === "preserve" || instructionMode === "action-only" ? { instructionMode } : {}),
   }
   return {
     input: effective,
     initialization,
-    shouldRetain: retained !== undefined || explicitInstructions !== undefined || toolsPresent || modePresent,
+    shouldRetain: retained !== undefined || explicitInstructions !== undefined || toolsPresent,
   }
 }
 
@@ -324,26 +322,27 @@ function effectiveResponsesInitialization(
     typeof retained?.instructions === "string" ? retained.instructions : undefined
   const toolsPresent = hasOwn(input, "tools")
   const tools = toolsPresent ? input.tools : retained?.tools
-  const modePresent = hasOwn(input, "instruction_mode")
-  const instructionMode = modePresent ? input.instruction_mode : retained?.instructionMode
   const effective = {
     ...input,
     ...(!instructionsPresent && instructions !== undefined ? { instructions } : {}),
     ...(!toolsPresent && tools !== undefined ? { tools } : {}),
-    ...(!modePresent && instructionMode !== undefined ? { instruction_mode: instructionMode } : {}),
   }
   return {
     input: effective,
     initialization: {
       ...(instructions !== undefined ? { instructions } : {}),
       ...(Array.isArray(tools) ? { tools } : {}),
-      ...(instructionMode === "preserve" || instructionMode === "action-only" ? { instructionMode } : {}),
     },
   }
 }
 
 function initializationCapacityError() {
   return json({ error: sessionCapacityError() }, 507)
+}
+
+function preflightRetainedInitialization(initialization: SessionInitialization): void {
+  if (sessionInitializationBytes(initialization) > SESSION_INITIALIZATION_MAX_BYTES)
+    throw new SessionInitializationCapacityError()
 }
 
 export function createRequestHandler(dependencies: RequestHandlerDependencies) {
@@ -427,6 +426,7 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
         const initialized = effectiveResponsesInitialization(recordValue(responseInput), continuation?.initialization)
         const body = initialized.input
         responseInitialization = initialized.initialization
+        if (body.store !== false) preflightRetainedInitialization(responseInitialization)
         const currentItems = typeof body.input === "string"
           ? [{ role: "user", content: body.input }]
           : Array.isArray(body.input) ? body.input : undefined
@@ -532,6 +532,8 @@ export function createRequestHandler(dependencies: RequestHandlerDependencies) {
           ? chatInitializations.get(identified.marker)
           : undefined
         const initialized = effectiveChatInitialization(input, retained)
+        if (identified && !identified.ephemeral && initialized.shouldRetain)
+          preflightRetainedInitialization(initialized.initialization)
         parsed = parseOpenAIChatRequest(initialized.input, request.headers)
         // Admission is independent of upstream availability: once a valid
         // logical-session request updates initialization, a browser failure

@@ -17,8 +17,9 @@ async function fixture() {
   await mkdir(join(root, "docs"), { recursive: true })
   await mkdir(join(root, "scripts"), { recursive: true })
   await mkdir(join(root, "output", "prompt-order", "actual"), { recursive: true })
-  await writeFile(join(root, "site", "index.html"), "<!doctype html><a href=\"/docs/readme\"><a href=\"/docs/runtime-guide\"><a href=\"/scripts/live-smoke\"><a href=\"/scripts/live-catalog-trace\"><video src=\"/review/review.webm\">")
+  await writeFile(join(root, "site", "index.html"), "<!doctype html><a href=\"/docs/readme\"><a href=\"/docs/configuration\"><a href=\"/docs/runtime-guide\"><a href=\"/scripts/live-smoke\"><a href=\"/scripts/live-catalog-trace\"><video src=\"/review/review.webm\">")
   await writeFile(join(root, "docs", "runtime-guide.md"), "# Runtime guide\n\nSafe details.")
+  await writeFile(join(root, "docs", "configuration.md"), "# Runtime configuration\n\nNo private values.")
   await writeFile(join(root, "README.md"), "# AIPass\n\nOverview.")
   await writeFile(join(root, "scripts", "live-smoke.ts"), "const safe = true\n")
   await writeFile(join(root, "scripts", "live-catalog-trace.ts"), "const catalog = true\n")
@@ -34,7 +35,7 @@ test("serves the review shell and allowlisted readable documentation", async () 
   expect(home.status).toBe(200)
   expect(home.headers.get("content-type")).toContain("text/html")
   const shell = await home.text()
-  for (const href of ["/docs/readme", "/docs/runtime-guide", "/scripts/live-smoke", "/scripts/live-catalog-trace", "/review/review.webm"]) {
+  for (const href of ["/docs/readme", "/docs/configuration", "/docs/runtime-guide", "/scripts/live-smoke", "/scripts/live-catalog-trace", "/review/review.webm"]) {
     expect(shell).toContain(href)
   }
 
@@ -42,6 +43,10 @@ test("serves the review shell and allowlisted readable documentation", async () 
   expect(guide.status).toBe(200)
   expect(guide.headers.get("content-type")).toContain("text/html")
   expect(await guide.text()).toContain("Runtime guide")
+
+  const configuration = await handler(new Request("http://127.0.0.1/docs/configuration"))
+  expect(configuration.status).toBe(200)
+  expect(await configuration.text()).toContain("Runtime configuration")
 
   const source = await handler(new Request("http://127.0.0.1/scripts/live-smoke"))
   expect(source.status).toBe(200)
@@ -55,6 +60,8 @@ test("rejects non-GET/HEAD requests, traversal, unknown routes, and arbitrary ou
     new Request("http://127.0.0.1/docs/runtime-guide", { method: "POST" }),
     new Request("http://127.0.0.1/docs/%2e%2e/README.md"),
     new Request("http://127.0.0.1/scripts/docs-site.ts"),
+    new Request("http://127.0.0.1/config.json"),
+    new Request("http://127.0.0.1/catalog"),
     new Request("http://127.0.0.1/output/prompt-order/actual/review.webm"),
     new Request("http://127.0.0.1/unknown"),
   ]) expect((await handler(request)).status).toBe(404)

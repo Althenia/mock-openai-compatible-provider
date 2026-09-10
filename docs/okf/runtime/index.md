@@ -5,4 +5,4 @@
 
 # Workflow
 
-* [Client action loop](client-action-loop.md) - Turn-key action envelopes that convert validated webchat output into client-executed tool calls.
+* [Client action loop](client-action-loop.md) - Turn-key envelopes with directly supplied schemas and client-executed offered actions.

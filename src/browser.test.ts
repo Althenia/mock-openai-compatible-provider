@@ -16,7 +16,6 @@ import {
   sameOrigin,
   sameThinkingSegments,
   selectModel,
-  shouldResetActionOnlyContext,
   stageAttachments,
   uploadStagedFiles,
   promptContractCurrent,
@@ -120,16 +119,9 @@ test("response evidence safety deadline grows conservatively for large instructi
   expect(responseEvidenceTimeoutMs("x".repeat(1_000_000))).toBeLessThanOrEqual(45_000)
 })
 
-test("action-only mode resets a preserved binding but reuses its own context", () => {
-  expect(shouldResetActionOnlyContext(true, 10, "a0digest", 9, "legacy")).toBe(true)
-  expect(shouldResetActionOnlyContext(true, 10, "a0digest", 10, "b0preserved")).toBe(true)
-  expect(shouldResetActionOnlyContext(true, 10, "a0digest", 10, "a0previous")).toBe(false)
-  expect(shouldResetActionOnlyContext(false, 10, "a0digest", 10, "b0preserved")).toBe(false)
-})
-
 test("prompt contract requires both the current version and action envelope digest", () => {
-  const digestA = `b0${"1".repeat(32)}${"a".repeat(30)}`
-  const digestB = `b0${"1".repeat(32)}${"b".repeat(30)}`
+  const digestA = `${"1".repeat(34)}${"a".repeat(30)}`
+  const digestB = `${"1".repeat(34)}${"b".repeat(30)}`
   expect(promptContractCurrent(1, digestA, 1, digestA)).toBe(true)
   expect(promptContractCurrent(1, digestA, 0, digestA)).toBe(false)
   expect(promptContractCurrent(1, digestA, 1, digestB)).toBe(false)

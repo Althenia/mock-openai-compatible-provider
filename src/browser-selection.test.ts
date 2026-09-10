@@ -72,7 +72,7 @@ for (const sibling of ["terminal", "error"] as const) test(`ignores an unrelated
       </script></body></html>`, { headers: { "content-type": "text/html" } })
   } })
   const profilePath = await mkdtemp(join(tmpdir(), "aipass-selection-test-"))
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected serve settings")
   const protocol: BrowserProtocol<BrowserFrame> = {
     decoder: () => new StreamFrameParser(), text: delta => ({ type: "text", delta }),

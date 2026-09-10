@@ -33,7 +33,6 @@ const read = () => ({
 })
 
 function chatTurn(instructions: string, options: {
-  readonly mode?: "preserve" | "action-only"
   readonly tools?: readonly ReturnType<typeof skill | typeof read>[]
   readonly request?: string
   readonly declaredRead?: boolean
@@ -41,7 +40,6 @@ function chatTurn(instructions: string, options: {
   return parseOpenAIChatRequest(
     {
       model: "gemini-3.1-flash-lite",
-      ...(options.mode ? { instruction_mode: options.mode } : {}),
       messages: [
         { role: "system", content: instructions },
         { role: "developer", content: "Use only installed skill IDs." },
@@ -120,23 +118,33 @@ function expectStartupInstructions(turn: ProjectedTurn, instructions: readonly s
     expect(index).toBeGreaterThan(previous)
     previous = index
   }
-  for (const name of turn.provisionedActions) {
-    const index = startup.indexOf(`"name":"${name}"`)
-    expect(index).toBeGreaterThan(previous)
-    previous = index
-  }
+  expect(startup).toContain("Use the full schemas supplied during startup")
+  expect(forwardedToolNames(turn)).toEqual([...turn.offeredActions])
+}
+
+function forwardedToolNames(turn: ProjectedTurn) {
+  for (const schema of turn.offeredToolSchemas) expect(turn.primingPrompts.join("\n")).toContain(JSON.stringify(schema))
+  return turn.offeredToolSchemas.map((schema) => schema.name)
+}
+
+function forwardedToolContent(turn: ProjectedTurn, name: string) {
+  const schema = turn.offeredToolSchemas.find((candidate) => candidate.name === name)
+  expect(schema).toBeDefined()
+  const content = JSON.stringify(schema)
+  expect(turn.primingPrompts.join("\n")).toContain(content)
+  return content
 }
 
 describe("instruction fidelity is independent of session affinity", () => {
   for (const endpoint of ["chat", "responses"] as const) {
-    const parse = (instructions: string, affinity: boolean, mode?: "preserve" | "action-only") => {
+    const parse = (instructions: string, affinity: boolean) => {
       const headers = new Headers(affinity ? { "x-session-affinity": "fidelity-session" } : {})
       const messages = [
         { role: "user", content: "Inspect the synthetic fixture." },
         { role: "assistant", content: "Checking the fixture." },
         { role: "user", content: "<system-update>\nKEEP_CLIENT_UPDATE\n</system-update>\nReturn the result." },
       ]
-      const common = { model: "gemini-3.1-flash-lite", ...(mode ? { instruction_mode: mode } : {}) }
+      const common = { model: "gemini-3.1-flash-lite" }
       return endpoint === "chat"
         ? parseOpenAIChatRequest({
             ...common,
@@ -170,22 +178,6 @@ describe("instruction fidelity is independent of session affinity", () => {
       })
     }
 
-    test(`${endpoint} keeps explicit action-only behavior with or without affinity`, () => {
-      for (const affinity of [false, true]) {
-        const explicit = parse("KEEP_SYSTEM_RULE", affinity, "action-only")
-        expectStartupInstructions(explicit.turn, [])
-        expect(explicit.turn.initialPrompt).not.toContain("KEEP_SYSTEM_RULE")
-        expect(explicit.turn.initialPrompt).not.toContain("KEEP_DEVELOPER_RULE")
-        expect(explicit.turn.initialPrompt).not.toContain("KEEP_CLIENT_UPDATE")
-        expect(explicit.turn.incrementalPrompt).toContain("Return the result.")
-        expect(explicit.turn.incrementalPrompt).not.toContain("KEEP_CLIENT_UPDATE")
-        const preserved = parse("KEEP_SYSTEM_RULE", affinity, "preserve")
-        expectStartupInstructions(preserved.turn, ["KEEP_SYSTEM_RULE", "KEEP_DEVELOPER_RULE"])
-        expect(preserved.turn.initialPrompt).not.toContain("KEEP_SYSTEM_RULE")
-        expect(preserved.turn.initialPrompt).not.toContain("KEEP_DEVELOPER_RULE")
-        expect(preserved.turn.incrementalPrompt).toContain("KEEP_CLIENT_UPDATE")
-      }
-    })
   }
 })
 
@@ -225,12 +217,12 @@ describe("instruction changes during tool continuations", () => {
         expect(routed.prompt).not.toContain('TOOL CALL call_skill skill: {"id":"fixture"}')
         expect(routed.prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
         expect(routed.prompt).not.toContain('"inputSchema"')
-        expect(turn.primingPrompts.join("\n")).toContain('"name":"skill"')
+        expect(forwardedToolNames(turn)).toContain("skill")
         expect(routed.prompt).not.toContain("Apply every stored CLIENT INSTRUCTIONS part")
       })
     }
 
-    test(`${endpoint} refreshes a bound tool continuation when preserved catalog instructions change`, () => {
+    test(`${endpoint} refreshes a bound tool continuation when preserved skill instructions change`, () => {
       const before = endpoint === "chat"
         ? chatTurn("<available_skills>CATALOG_OLD</available_skills>")
         : responsesTurn("<available_skills>CATALOG_OLD</available_skills>", "responses-instruction-continuation")
@@ -249,31 +241,6 @@ describe("instruction changes during tool continuations", () => {
     })
   }
 
-  test("action-only to preserve refreshes the omitted catalog on a tool continuation", () => {
-    const before = chatTurn("<available_skills>CATALOG_OLD</available_skills>", { mode: "action-only" })
-    const after = chatTurn("<available_skills>CATALOG_NEW</available_skills>", { mode: "preserve" })
-    expect(before.initialPrompt).not.toContain("CATALOG_OLD")
-    expectStartupInstructions(after, ["<available_skills>CATALOG_NEW</available_skills>", "Use only installed skill IDs."])
-    expect(after.recoveryPrompt).not.toContain("CATALOG_NEW")
-    const routed = selectedPrompt(after, before.actionEnvelopeDigest)
-    expect(routed.current).toBe(false)
-    expect(routed.prompt).not.toContain("CATALOG_NEW")
-    expect(routed.prompt).toContain(originalRequest)
-    expect(routed.prompt).toContain(toolResult)
-  })
-
-  test("action-only catalog changes remain omitted and retain incremental tool-result routing", () => {
-    const before = chatTurn("<available_skills>CATALOG_OLD</available_skills>", { mode: "action-only" })
-    const after = chatTurn("<available_skills>CATALOG_NEW</available_skills>", { mode: "action-only" })
-    expect(after.initialPrompt).not.toContain("CATALOG_NEW")
-    expect(after.recoveryPrompt).not.toContain("CATALOG_NEW")
-    expect(after.actionEnvelopeDigest).toBe(before.actionEnvelopeDigest)
-    const routed = selectedPrompt(after, before.actionEnvelopeDigest)
-    expect(routed.current).toBe(true)
-    expect(routed.prompt).toBe(after.incrementalPrompt)
-    expect(routed.prompt).toContain(toolResult)
-  })
-
   test("declaring another primed tool retains startup identity and delta-only routing", () => {
     const request = "Use the installed skill fixture."
     const before = chatTurn("<available_skills>CATALOG</available_skills>", { tools: [skill(), read()], request })
@@ -288,7 +255,11 @@ describe("instruction changes during tool continuations", () => {
     // Delta-only: latest result; both schemas and the earlier
     // call/result chain stays in remote history instead of being replayed.
     expect(provisionRoute.prompt).toContain(`TOOL RESULT call_skill: ${toolResult}`)
-    for (const text of ['"name":"read"', '"name":"skill"']) expect(provisionGrowth.primingPrompts.join("\n")).toContain(text)
+    for (const tool of [read(), skill()]) expect(JSON.parse(forwardedToolContent(provisionGrowth, tool.function.name))).toEqual({
+      name: tool.function.name,
+      description: tool.function.description,
+      inputSchema: tool.function.parameters,
+    })
     expect(provisionRoute.prompt).not.toContain('"inputSchema"')
     expect(provisionRoute.prompt).not.toContain(request)
     expect(provisionRoute.prompt).not.toContain('TOOL CALL call_read read: {"path":"fixture-alpha.txt"}')
@@ -311,13 +282,13 @@ describe("instruction changes during tool continuations", () => {
     expect(routed.prompt).toContain("Use skill fixture.")
   })
 
-  test("action-only changed schemas refresh a tool continuation with current schemas", () => {
-    const before = chatTurn("OMITTED", { mode: "action-only", tools: [skill()] })
-    const after = chatTurn("OMITTED_CHANGED", { mode: "action-only", tools: [skill(true)] })
+  test("changed schemas refresh a tool continuation with current schemas", () => {
+    const before = chatTurn("CLIENT_RULE", { tools: [skill()] })
+    const after = chatTurn("CLIENT_RULE", { tools: [skill(true)] })
     expect(after.toolContinuation).toBe(true)
-    expectStartupInstructions(after, [])
+    expectStartupInstructions(after, ["CLIENT_RULE", "Use only installed skill IDs."])
     expect(after.actionEnvelopeDigest).not.toBe(before.actionEnvelopeDigest)
-    expect(after.primingPrompts.join("\n")).toContain('"revision":{"type":"string"}')
+    expect(forwardedToolContent(after, "skill")).toContain('"revision":{"type":"string"}')
     expect(after.incrementalPrompt).not.toContain('"inputSchema"')
     const routed = selectedPrompt(after, before.actionEnvelopeDigest)
     expect(routed.current).toBe(false)
@@ -335,14 +306,12 @@ describe("instruction changes during tool continuations", () => {
   })
 })
 
-test("estimated prompt usage describes the exposed projection without charging omitted action-only instructions", () => {
-  for (const mode of ["preserve", "action-only"] as const) {
-    const parsed = parseOpenAIChatRequest({
-      model: "gemini-3.1-flash-lite", instruction_mode: mode,
-      messages: [{ role: "system", content: "RULE ".repeat(3_000) }, { role: "user", content: "Reply ready." }],
-    }, new Headers())
-    expect(parsed.promptTokens).toBe(
-      estimateTokens(parsed.turn.initialPrompt) + parsed.turn.primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0),
-    )
-  }
+test("estimated prompt usage accounts for startup instructions and task projection", () => {
+  const parsed = parseOpenAIChatRequest({
+    model: "gemini-3.1-flash-lite",
+    messages: [{ role: "system", content: "RULE ".repeat(3_000) }, { role: "user", content: "Reply ready." }],
+  }, new Headers())
+  expect(parsed.promptTokens).toBe(
+    estimateTokens(parsed.turn.initialPrompt) + parsed.turn.primingPrompts.reduce((total, prompt) => total + estimateTokens(prompt), 0),
+  )
 })

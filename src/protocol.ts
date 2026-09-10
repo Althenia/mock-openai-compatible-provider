@@ -9,6 +9,7 @@ export type BrowserFrame =
   | { readonly type: "finish"; readonly reason: FinishReason }
   | { readonly type: "auth-required" }
   | { readonly type: "error"; readonly message: string }
+  | { readonly type: "usage"; readonly promptTokens: number; readonly completionTokens: number }
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -119,9 +120,7 @@ export class StreamFrameParser {
 
 const OPEN = "<aipass-action>"
 const CLOSE = "</aipass-action>"
-export const PROMPT_CONTRACT_VERSION = 25
-// Mode (2 hex characters) plus a 128-bit fingerprint of projected instructions.
-export const INSTRUCTION_DIGEST_PREFIX_LENGTH = 34
+export const PROMPT_CONTRACT_VERSION = 27
 const MAX_TOOL_FRAME = 64 * 1024
 const NAME = /^[A-Za-z0-9_.:-]{1,128}$/
 
@@ -201,6 +200,7 @@ function toolNamedEnvelope(item: Record<string, unknown>): boolean {
 }
 
 class ToolNamedEnvelopeError extends Error {}
+export class EnvelopeResponseFormatError extends Error {}
 
 function envelopeInput(value: unknown): Record<string, unknown> {
   const input = record(value)
@@ -349,7 +349,7 @@ export function parseTypedEnvelope(value: unknown, offered: ReadonlySet<string>)
           : typeof item.content === "string"
             ? item.content
             : undefined
-    if (typeof text !== "string" || !text) throw new Error("typed envelope chat text must be a string")
+    if (typeof text !== "string" || !text) throw new EnvelopeResponseFormatError("typed envelope chat text must be a string")
     console.error(`aipass envelope type=${type}`)
     return [{ type: "text", delta: text }]
   }
@@ -362,7 +362,7 @@ export function parseTypedEnvelope(value: unknown, offered: ReadonlySet<string>)
           : typeof item.content === "string"
             ? item.content
             : undefined
-    if (typeof text !== "string" || !text) throw new Error("typed envelope thinking text must be a string")
+    if (typeof text !== "string" || !text) throw new EnvelopeResponseFormatError("typed envelope thinking text must be a string")
     console.error(`aipass envelope type=${type}`)
     return [{ type: "reasoning", delta: text }]
   }
@@ -630,7 +630,11 @@ export class TypedEnvelopeShim {
   private buffer = ""
   private leading = true
 
-  constructor(private readonly allowed: ReadonlySet<string>, private readonly strictBareChains = false) {}
+  constructor(
+    private readonly allowed: ReadonlySet<string>,
+    private readonly strictBareChains = false,
+    private readonly strictCoverage = false,
+  ) {}
 
   push(chunk: string): BrowserFrame[] {
     this.buffer += chunk
@@ -658,8 +662,9 @@ export class TypedEnvelopeShim {
         if (before.trim()) {
           const bare = this.tryBare(before.trim()) ?? this.tryBareChain(before.trim())
           if (bare) output.push(...bare)
+          else if (this.strictCoverage) throw new EnvelopeResponseFormatError("browser response contains text outside envelopes")
           else output.push({ type: "text", delta: before })
-        } else if (before) output.push({ type: "text", delta: before })
+        } else if (before && !this.strictCoverage) output.push({ type: "text", delta: before })
         continue
       }
       const close = this.buffer.indexOf(ENVELOPE_CLOSE, ENVELOPE_OPEN.length)
@@ -673,6 +678,7 @@ export class TypedEnvelopeShim {
       try {
         parsed = JSON.parse(raw)
       } catch {
+        if (this.strictCoverage) throw new EnvelopeResponseFormatError("typed envelope JSON is invalid")
         // Narrow repair for model-malformed chat/thinking envelopes whose
         // text contains unescaped quotes. Tool-bearing envelopes stay strict
         // and fall through to the prose path below.
@@ -695,6 +701,7 @@ export class TypedEnvelopeShim {
       }
       const frames = parseTypedEnvelope(parsed, this.allowed)
       if (frames) output.push(...frames)
+      else if (this.strictCoverage) throw new EnvelopeResponseFormatError("typed envelope payload is invalid")
       else output.push({ type: "text", delta: raw })
     }
     if (this.buffer.includes(ENVELOPE_OPEN)) return output
@@ -710,7 +717,9 @@ export class TypedEnvelopeShim {
     }
     const emit = this.buffer.slice(0, this.buffer.length - keep)
     this.buffer = this.buffer.slice(this.buffer.length - keep)
-    if (emit) output.push({ type: "text", delta: emit })
+    if (emit && this.strictCoverage && emit.trim())
+      throw new EnvelopeResponseFormatError("browser response contains text outside envelopes")
+    if (emit && !this.strictCoverage) output.push({ type: "text", delta: emit })
     return output
   }
 
@@ -726,9 +735,14 @@ export class TypedEnvelopeShim {
         if (bare) return bare
         if (echo.body.startsWith(ENVELOPE_OPEN)) return [...this.push(echo.body), ...this.finish()]
       }
+      if (original.trim() && this.strictCoverage)
+        throw new EnvelopeResponseFormatError("browser response contains text outside envelopes")
       return original.trim() ? [{ type: "text", delta: original }] : []
     }
-    if (this.buffer.includes(ENVELOPE_OPEN)) throw new Error("typed envelope frame is incomplete")
+    if (this.buffer.includes(ENVELOPE_OPEN)) {
+      if (this.strictCoverage) throw new EnvelopeResponseFormatError("typed envelope frame is incomplete")
+      throw new Error("typed envelope frame is incomplete")
+    }
     const trimmed = this.buffer.trim()
     this.buffer = ""
     if (!trimmed) return []
@@ -739,6 +753,7 @@ export class TypedEnvelopeShim {
     if (chain) return chain
     const bare = this.tryBare(trimmed)
     if (bare) return bare
+    if (this.strictCoverage) throw new EnvelopeResponseFormatError("browser response contains invalid or uncovered envelope content")
     if (trimmed.startsWith("{")) {
       try {
         JSON.parse(trimmed)
@@ -817,6 +832,7 @@ export class TypedEnvelopeShim {
     try {
       parsed = JSON.parse(candidate)
     } catch {
+      if (this.strictCoverage) throw new EnvelopeResponseFormatError("typed envelope JSON is invalid")
       // Narrow repair for model-malformed chat/thinking envelopes whose text
       // contains unescaped quotes (live evidence: a rating answer containing
       // "Version 1" broke JSON.parse, so the raw envelope leaked to the
@@ -847,6 +863,14 @@ export class TypedEnvelopeShim {
   }
 }
 
+export function validateStrictEnvelopeResponse(text: string, offered: ReadonlySet<string>): void {
+  const shim = new TypedEnvelopeShim(offered, true, true)
+  const frames = [...shim.push(text), ...shim.finish()]
+  const terminal = frames.at(-1)
+  if (!terminal || terminal.type === "reasoning")
+    throw new EnvelopeResponseFormatError("browser response has no terminal answer or action envelope")
+}
+
 export const EVERY_TURN_ENVELOPE_GUARD =
   "EVERY TURN: reply with only <aipass-envelope>{...}</aipass-envelope> envelope(s) carrying the current turn key; put results into envelope fields and emit no text outside envelopes. The envelope is strict JSON: escape every double quote inside text as \\\" so the envelope always parses."
 
@@ -875,7 +899,7 @@ export const WEBCHAT_ROLE_INSTRUCTION = [
   "The last four action types default to the same-named offered tool; supply name only when the offered action uses a different exact name. They are not native webchat capabilities. Use the full schemas supplied during startup. Every action input must satisfy its schema, including all required fields.",
   "Working flow:",
   "1. Read the current task or result delta together with the initialized harness instructions and conversation context.",
-  "2. Decide whether context already supports an answer or an offered client action is needed. Per-turn action restrictions override catalog availability. Optional thinking may explain the decision.",
+  "2. Decide whether context already supports an answer or an offered client action is needed. Per-turn action restrictions override the initialized action set. Optional thinking may explain the decision.",
   "3. Respond with thinking* followed by one final chat or one action group, and nothing else. Do not emit legacy <aipass-action> wrappers. Stop after requesting actions; do not fabricate their results or append a premature final answer.",
   "4. Wait for actual client results or permission/question decisions. Continue on the next submission using its new turn key, including after a failure or denial.",
   "5. When evidence supports completion, emit chat. Do not copy initialization declarations into task answers. Respond in English unless the user explicitly requests another language in their message.",
@@ -945,6 +969,8 @@ export async function* openAIChatSSEChunks(
   let text = ""
   let reasoning = ""
   let toolOutput = ""
+  let hiddenPromptTokens = 0
+  let hiddenCompletionTokens = 0
   const keepReasoning = reasoningSourceFilter()
   yield chunk(id, created, model, { role: "assistant" })
   const emit = (frame: BrowserFrame) => {
@@ -973,6 +999,10 @@ export async function* openAIChatSSEChunks(
         }),
       ]
     }
+    if (frame.type === "usage") {
+      hiddenPromptTokens += frame.promptTokens
+      hiddenCompletionTokens += frame.completionTokens
+    }
     return []
   }
   for await (const frame of iterable(input)) {
@@ -1000,8 +1030,8 @@ export async function* openAIChatSSEChunks(
   const reason = toolIndex > 0 || terminal === "tool-calls" ? "tool_calls" : terminal
   yield chunk(id, created, model, {}, reason)
   if (options.includeUsage) {
-    const promptTokens = options.promptTokens ?? 0
-    const completionTokens = estimateTokens(`${reasoning}${text}${toolOutput}`)
+    const promptTokens = (options.promptTokens ?? 0) + hiddenPromptTokens
+    const completionTokens = estimateTokens(`${reasoning}${text}${toolOutput}`) + hiddenCompletionTokens
     yield `data: ${JSON.stringify({
       id,
       object: "chat.completion.chunk",
@@ -1058,6 +1088,8 @@ export async function* openAIResponsesSSEChunks(
   let text = ""
   let reasoning = ""
   let toolCalls = 0
+  let hiddenPromptTokens = 0
+  let hiddenCompletionTokens = 0
   const keepReasoning = reasoningSourceFilter()
   const base = {
     id: responseID,
@@ -1163,6 +1195,9 @@ export async function* openAIResponsesSSEChunks(
       events.push(
         responsesEvent("response.output_item.done", sequence++, { output_index: outputIndex, item: completed }),
       )
+    } else if (frame.type === "usage") {
+      hiddenPromptTokens += frame.promptTokens
+      hiddenCompletionTokens += frame.completionTokens
     }
     return events
   }
@@ -1226,11 +1261,12 @@ export async function* openAIResponsesSSEChunks(
     })
     yield responsesEvent("response.output_item.done", sequence++, { output_index: messageIndex, item: completed })
   }
-  const completionTokens = estimateTokens(`${reasoning}${text}${toolOutput}`)
+  const completionTokens = estimateTokens(`${reasoning}${text}${toolOutput}`) + hiddenCompletionTokens
+  const promptTokens = options.promptTokens + hiddenPromptTokens
   const usage = {
-    input_tokens: options.promptTokens,
+    input_tokens: promptTokens,
     output_tokens: completionTokens,
-    total_tokens: options.promptTokens + completionTokens,
+    total_tokens: promptTokens + completionTokens,
     estimated: true,
   }
   options.onCompletedOutput?.(output)
@@ -1248,6 +1284,7 @@ export interface OpenAIChatResult {
     readonly input: Record<string, unknown>
   }[]
   readonly finishReason: FinishReason
+  readonly promptTokens: number
   readonly completionTokens: number
 }
 
@@ -1263,6 +1300,8 @@ export async function collectOpenAIChatResult(
   let reasoning = ""
   const toolCalls: Array<{ id: string; name: string; input: Record<string, unknown> }> = []
   let terminal: FinishReason | undefined
+  let hiddenPromptTokens = 0
+  let hiddenCompletionTokens = 0
   const keepReasoning = reasoningSourceFilter()
   const collect = (frame: BrowserFrame) => {
     if (!keepReasoning(frame)) return
@@ -1274,6 +1313,10 @@ export async function collectOpenAIChatResult(
     } else if (frame.type === "finish") terminal ??= frame.reason
     else if (frame.type === "auth-required") throw new Error("browser authentication is required")
     else if (frame.type === "error") throw new Error(frame.message)
+    else if (frame.type === "usage") {
+      hiddenPromptTokens += frame.promptTokens
+      hiddenCompletionTokens += frame.completionTokens
+    }
   }
   for await (const frame of iterable(input)) {
     const legacy = frame.type === "text" ? shim.push(frame.delta) : [frame]
@@ -1290,10 +1333,10 @@ export async function collectOpenAIChatResult(
   if (!terminal) throw new Error("browser stream ended without a terminal finish event")
   if (requireTool && toolCalls.length === 0) throw new Error("tool_choice required but no tool call was produced")
   const finish = toolCalls.length ? "tool-calls" : terminal
-  const completionTokens = estimateTokens(
+  const completionTokens = hiddenCompletionTokens + estimateTokens(
     `${reasoning}${text}${toolCalls.map((call) => `${call.name}${JSON.stringify(call.input)}`).join("")}`,
   )
-  return { text, reasoning, toolCalls, finishReason: finish, completionTokens }
+  return { text, reasoning, toolCalls, finishReason: finish, promptTokens: hiddenPromptTokens, completionTokens }
 }
 
 export async function openAIChatCompletion(
@@ -1328,9 +1371,9 @@ export async function openAIChatCompletion(
       },
     ],
     usage: {
-      prompt_tokens: promptTokens,
+      prompt_tokens: promptTokens + result.promptTokens,
       completion_tokens: result.completionTokens,
-      total_tokens: promptTokens + result.completionTokens,
+      total_tokens: promptTokens + result.promptTokens + result.completionTokens,
       estimated: true,
     },
   }

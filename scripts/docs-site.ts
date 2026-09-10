@@ -59,6 +59,7 @@ export function createDocsSiteHandler(root = process.cwd()) {
   const resources: Readonly<Record<string, Resource>> = {
     "/": { file: "site/index.html", type: "text/html; charset=utf-8" },
     "/docs/runtime-guide": { file: "docs/runtime-guide.md", type: "text/markdown", readable: true },
+    "/docs/configuration": { file: "docs/configuration.md", type: "text/markdown", readable: true },
     "/docs/operations": { file: "docs/operations.md", type: "text/markdown", readable: true },
     "/docs/model-matrix": { file: "docs/model-matrix.md", type: "text/markdown", readable: true },
     ...releaseRoutes,

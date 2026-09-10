@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs"
 import { chmod, mkdir, open, readFile, rename } from "node:fs/promises"
-import { homedir, platform } from "node:os"
+import { platform } from "node:os"
 import { createServer } from "node:net"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 
 import { MODELS } from "./model-catalog.ts"
 
@@ -11,7 +11,6 @@ export { MODELS } from "./model-catalog.ts"
 export const LOOPBACK_HOST = "127.0.0.1" as const
 export const DEFAULT_CHAT_URL = "https://de.aipass.net/chat?temporary-chat=true"
 
-export type Environment = Record<string, string | undefined>
 export type Reasoning = "none" | "low" | "medium" | "high" | "max"
 
 export interface Paths {
@@ -33,6 +32,10 @@ export interface Settings {
   readonly streamURLPattern?: string
   readonly browserHeaded: boolean
   readonly screenshotDir?: string
+  readonly installDir?: string
+  readonly defaultInstallDir: string
+  readonly config: ProviderConfig
+  readonly overrides?: ConfigOverrides
 }
 
 export type Command =
@@ -45,10 +48,28 @@ export type Command =
   | { readonly type: "login"; readonly settings: Settings }
   | { readonly type: "print-token"; readonly settings: Settings }
 
-export interface RuntimeConfig {
+export interface ProviderConfig {
   readonly version: 1
   readonly host: typeof LOOPBACK_HOST
-  readonly port: number
+  readonly port?: number
+  readonly stateRoot: string
+  readonly chromeExecutable: string
+  readonly chatURL: string
+  readonly navigationTimeoutMs: number
+  readonly streamIdleTimeoutMs: number
+  readonly streamURLPattern?: string
+  readonly browserHeaded: boolean
+  readonly screenshotDir?: string
+  readonly installDir?: string
+}
+
+export interface RuntimeConfig extends ProviderConfig { readonly port: number }
+
+export interface ConfigOverrides {
+  readonly port?: number
+  readonly stateRoot?: string
+  readonly chromeExecutable?: string
+  readonly installDir?: string
 }
 
 export type SelectionAction =
@@ -75,18 +96,20 @@ function defaultChromeExecutable() {
   return "/usr/bin/google-chrome"
 }
 
-function xdgPath(environment: Environment, kind: "config" | "state") {
-  const explicit = environment[kind === "config" ? "XDG_CONFIG_HOME" : "XDG_STATE_HOME"]?.trim()
-  if (explicit) return explicit
-  const home = environment.HOME?.trim() || homedir()
-  if (!home) throw new Error("HOME or XDG paths are required")
-  return join(home, kind === "config" ? ".config" : ".local/state")
-}
-
-function positiveInteger(value: string | undefined, fallback: number) {
-  if (!value) return fallback
-  const parsed = Number(value)
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
+function nativeAccountHome() {
+  if (platform() !== "darwin" || typeof process.getuid !== "function")
+    throw new Error("native macOS account home is unavailable")
+  const result = Bun.spawnSync(["/usr/bin/dscacheutil", "-q", "user", "-a", "uid", String(process.getuid())], {
+    env: {},
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 2_000,
+  })
+  if (result.exitCode !== 0) throw new Error("could not determine the native macOS account home")
+  const homes = result.stdout.toString().split(/\r?\n/).flatMap((line) => line.startsWith("dir: ") ? [line.slice(5)] : [])
+  if (homes.length !== 1 || !isAbsolute(homes[0]!) || homes[0]!.includes("\0"))
+    throw new Error("native macOS account home is missing or invalid")
+  return homes[0]!
 }
 
 function port(value: string) {
@@ -96,13 +119,51 @@ function port(value: string) {
   return parsed
 }
 
+function defaultProviderConfig(home: string): ProviderConfig {
+  return {
+    version: 1,
+    host: LOOPBACK_HOST,
+    stateRoot: join(home, ".local/state/aipass-browser-provider"),
+    chromeExecutable: defaultChromeExecutable(),
+    chatURL: DEFAULT_CHAT_URL,
+    navigationTimeoutMs: 90_000,
+    streamIdleTimeoutMs: 120_000,
+    browserHeaded: true,
+  }
+}
+
+function settingsFromConfig(configPath: string, config: ProviderConfig, defaultInstallDir: string, overrides?: ConfigOverrides): Settings {
+  const effective = {
+    ...config,
+    ...(overrides?.port === undefined ? {} : { port: overrides.port }),
+    ...(overrides?.stateRoot === undefined ? {} : { stateRoot: overrides.stateRoot }),
+    ...(overrides?.chromeExecutable === undefined ? {} : { chromeExecutable: overrides.chromeExecutable }),
+    ...(overrides?.installDir === undefined ? {} : { installDir: overrides.installDir }),
+  }
+  return {
+    configPath,
+    requestedPort: overrides?.port,
+    paths: pathsFromRoot(effective.stateRoot),
+    chatURL: effective.chatURL,
+    chromeExecutable: effective.chromeExecutable,
+    navigationTimeoutMs: effective.navigationTimeoutMs,
+    streamIdleTimeoutMs: effective.streamIdleTimeoutMs,
+    streamURLPattern: effective.streamURLPattern,
+    browserHeaded: effective.browserHeaded,
+    screenshotDir: effective.screenshotDir,
+    installDir: effective.installDir,
+    defaultInstallDir,
+    config,
+    overrides,
+  }
+}
+
 export function usage() {
   return "usage: aipass-browser-provider <command> [options]\n\ncommands:\n  start        run the provider server in the foreground\n  serve        alias for start\n  stop         request graceful shutdown of the active server\n  update       install the latest verified release (stop the provider first)\n  endpoint     print the configured OpenAI-compatible endpoint\n  login        open the signed-in Chrome profile to sign in and verify access (window stays open)\n  print-token  print the provider bearer token\n  version      print the release version (--version is an alias)\n  help         print this help\n\noptions:\n  --config PATH\n  --state-root PATH\n  --chrome PATH\n  --port PORT\n\nupdate options:\n  --version VERSION       select a release instead of latest\n  --install-dir DIRECTORY override the executable installation directory\n  --state-root PATH       use the same profile lock as the provider\n\nUse `aipass-browser-provider help`, `--help`, or `-h` for this text."
 }
 
 export function parseCommand(
   arguments_: readonly string[],
-  environment: Environment = process.env,
   options: { readonly verifyChrome?: boolean } = {},
 ): Command {
   const [command, ...rest] = arguments_
@@ -117,12 +178,13 @@ export function parseCommand(
   if (!command || !["start", "serve", "stop", "update", "endpoint", "login", "print-token"].includes(command))
     throw new Error(usage())
 
-  let configPath = environment.AIPASS_CONFIG_PATH?.trim() || join(xdgPath(environment, "config"), "aipass-browser-provider/config.json")
-  let stateRoot = environment.AIPASS_STATE_ROOT?.trim() || join(xdgPath(environment, "state"), "aipass-browser-provider")
-  let chromeExecutable = environment.AIPASS_BROWSER_EXECUTABLE?.trim() || defaultChromeExecutable()
-  let requestedPort = command !== "update" && environment.AIPASS_PORT ? port(environment.AIPASS_PORT) : undefined
+  const home = nativeAccountHome()
+  let configPath = join(home, ".config/aipass-browser-provider/config.json")
+  let stateRoot: string | undefined
+  let chromeExecutable: string | undefined
+  let requestedPort: number | undefined
   let updateVersion: string | undefined
-  let installDir = environment.AIPASS_INSTALL_DIR?.trim() || undefined
+  let installDir: string | undefined
   for (let index = 0; index < rest.length; index += 2) {
     const option = rest[index]
     const value = rest[index + 1]
@@ -139,32 +201,19 @@ export function parseCommand(
     else throw new Error(`unknown option ${option}\n${usage()}`)
   }
   if (rest.length % 2 !== 0) throw new Error(`missing option value\n${usage()}`)
-  if (
-    options.verifyChrome !== false &&
-    ["start", "serve", "login"].includes(command) &&
-    !existsSync(chromeExecutable)
-  )
-    throw new Error(`Chrome executable does not exist: ${chromeExecutable}`)
-
-  const settings: Settings = {
-    configPath,
-    requestedPort,
-    paths: pathsFromRoot(stateRoot),
-    chatURL: environment.AIPASS_CHAT_URL?.trim() || DEFAULT_CHAT_URL,
-    chromeExecutable,
-    navigationTimeoutMs: positiveInteger(environment.AIPASS_NAVIGATION_TIMEOUT_MS, 90_000),
-    streamIdleTimeoutMs: positiveInteger(environment.AIPASS_STREAM_IDLE_TIMEOUT_MS, 120_000),
-    streamURLPattern: environment.AIPASS_STREAM_URL_PATTERN?.trim() || undefined,
-    // Headed by default: the user owns the Chrome window, watches turns live,
-    // and closes tabs themselves. Set AIPASS_BROWSER_HEADED=0 to run headless.
-    browserHeaded: /^(0|false|no|off)$/i.test(environment.AIPASS_BROWSER_HEADED?.trim() ?? "")
-      ? false
-      : true,
-    screenshotDir: environment.AIPASS_SCREENSHOT_DIR?.trim() || undefined,
+  const defaults = defaultProviderConfig(home)
+  const overrides: ConfigOverrides = {
+    ...(requestedPort === undefined ? {} : { port: requestedPort }),
+    ...(stateRoot === undefined ? {} : { stateRoot }),
+    ...(chromeExecutable === undefined ? {} : { chromeExecutable }),
+    ...(installDir === undefined ? {} : { installDir }),
   }
+  const settings = settingsFromConfig(configPath, defaults, join(home, ".local/bin"), overrides)
+  if (options.verifyChrome !== false && ["start", "serve", "login"].includes(command) && !existsSync(settings.chromeExecutable))
+    throw new Error(`Chrome executable does not exist: ${settings.chromeExecutable}`)
   if (command === "start" || command === "serve") return { type: "serve", settings }
   if (command === "stop") return { type: "stop", settings }
-  if (command === "update") return { type: "update", settings, version: updateVersion, installDir }
+  if (command === "update") return { type: "update", settings, version: updateVersion, installDir: settings.installDir }
   if (command === "endpoint") return { type: "endpoint", settings }
   if (command === "login") return { type: "login", settings }
   return { type: "print-token", settings }
@@ -185,33 +234,81 @@ export function selectionPlan(id: string, reasoning: Reasoning): readonly Select
   return [{ type: "choose-thinking", index }, { type: "confirm" }]
 }
 
-export function endpointURL(config: RuntimeConfig) {
+export function endpointURL(config: Pick<RuntimeConfig, "host" | "port">) {
   return `http://${config.host}:${config.port}/v1`
 }
 
-export function validateRuntimeConfig(value: unknown): RuntimeConfig {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    (value as Partial<RuntimeConfig>).version !== 1 ||
-    (value as Partial<RuntimeConfig>).host !== LOOPBACK_HOST ||
-    !Number.isSafeInteger((value as Partial<RuntimeConfig>).port) ||
-    Number((value as Partial<RuntimeConfig>).port) < 1 ||
-    Number((value as Partial<RuntimeConfig>).port) > 65_535
-  )
-    throw new Error("runtime config is invalid")
-  return value as RuntimeConfig
+function configRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("config must be a JSON object")
+  return value as Record<string, unknown>
 }
 
-export async function readRuntimeConfig(path: string) {
+function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== "string" || !value.trim()) throw new Error(`config ${field} must be a non-empty string`)
+  return value
+}
+
+function positiveConfigInteger(value: unknown, field: string, fallback: number): number {
+  if (value === undefined) return fallback
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) throw new Error(`config ${field} must be a positive integer`)
+  return Number(value)
+}
+
+export function validateProviderConfig(value: unknown, defaults: ProviderConfig): ProviderConfig {
+  const input = configRecord(value)
+  if (input.version !== 1) throw new Error("config version must be 1")
+  if (input.host !== LOOPBACK_HOST) throw new Error(`config host must be ${LOOPBACK_HOST}`)
+  let configuredPort: number | undefined
+  if (input.port !== undefined) {
+    if (!Number.isSafeInteger(input.port) || Number(input.port) < 1 || Number(input.port) > 65_535)
+      throw new Error("config port must be an integer from 1 through 65535")
+    configuredPort = Number(input.port)
+  }
+  const boolean = (field: string, fallback: boolean) => {
+    const candidate = input[field]
+    if (candidate === undefined) return fallback
+    if (typeof candidate !== "boolean") throw new Error(`config ${field} must be a boolean`)
+    return candidate
+  }
+  return {
+    version: 1,
+    host: LOOPBACK_HOST,
+    ...(configuredPort === undefined ? {} : { port: configuredPort }),
+    stateRoot: optionalString(input.stateRoot, "stateRoot") ?? defaults.stateRoot,
+    chromeExecutable: optionalString(input.chromeExecutable, "chromeExecutable") ?? defaults.chromeExecutable,
+    chatURL: optionalString(input.chatURL, "chatURL") ?? defaults.chatURL,
+    navigationTimeoutMs: positiveConfigInteger(input.navigationTimeoutMs, "navigationTimeoutMs", defaults.navigationTimeoutMs),
+    streamIdleTimeoutMs: positiveConfigInteger(input.streamIdleTimeoutMs, "streamIdleTimeoutMs", defaults.streamIdleTimeoutMs),
+    streamURLPattern: optionalString(input.streamURLPattern, "streamURLPattern"),
+    browserHeaded: boolean("browserHeaded", defaults.browserHeaded),
+    screenshotDir: optionalString(input.screenshotDir, "screenshotDir"),
+    installDir: optionalString(input.installDir, "installDir"),
+  }
+}
+
+export async function readProviderConfig(path: string, defaults: ProviderConfig) {
   try {
-    const value = validateRuntimeConfig(JSON.parse(await readFile(path, "utf8")))
+    const value = validateProviderConfig(JSON.parse(await readFile(path, "utf8")), defaults)
     await chmod(path, 0o600)
     return value
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined
     throw error
   }
+}
+
+export async function loadCommandConfiguration(
+  command: Exclude<Command, { readonly type: "help" | "version" }>,
+  options: { readonly verifyChrome?: boolean } = {},
+): Promise<typeof command> {
+  const file = await readProviderConfig(command.settings.configPath, command.settings.config)
+  const config = file ?? command.settings.config
+  const settings = settingsFromConfig(command.settings.configPath, config, command.settings.defaultInstallDir, command.settings.overrides)
+  if (options.verifyChrome !== false && (command.type === "serve" || command.type === "login") && !existsSync(settings.chromeExecutable))
+    throw new Error(`Chrome executable does not exist: ${settings.chromeExecutable}`)
+  if (command.type === "update") return { ...command, settings, installDir: command.settings.overrides?.installDir ?? settings.installDir }
+  return { ...command, settings }
 }
 
 export async function persistPrivate(path: string, content: string | Uint8Array) {
@@ -229,8 +326,10 @@ export async function persistPrivate(path: string, content: string | Uint8Array)
   await chmod(path, 0o600)
 }
 
-export async function persistRuntimeConfig(path: string, config: RuntimeConfig) {
-  await persistPrivate(path, JSON.stringify(validateRuntimeConfig(config)))
+export async function persistRuntimeConfig(path: string, config: ProviderConfig) {
+  const validated = validateProviderConfig(config, config)
+  if (validated.port === undefined) throw new Error("config port is required")
+  await persistPrivate(path, JSON.stringify(validated))
 }
 
 async function availablePort(requested = 0) {
@@ -251,8 +350,7 @@ async function availablePort(requested = 0) {
 }
 
 export async function ensureEndpointConfig(settings: Settings) {
-  const persisted = await readRuntimeConfig(settings.configPath)
-  if (settings.requestedPort === undefined && persisted) return persisted
+  if (settings.requestedPort === undefined && settings.config.port !== undefined) return settings.config as RuntimeConfig
   let selected: number
   try {
     selected = await availablePort(settings.requestedPort)
@@ -264,7 +362,7 @@ export async function ensureEndpointConfig(settings: Settings) {
         : `cannot select an available loopback port: ${error instanceof Error ? error.message : "port unavailable"}`,
     )
   }
-  const config: RuntimeConfig = { version: 1, host: LOOPBACK_HOST, port: selected }
+  const config: RuntimeConfig = { ...settings.config, version: 1, host: LOOPBACK_HOST, port: selected }
   await persistRuntimeConfig(settings.configPath, config)
   return config
 }

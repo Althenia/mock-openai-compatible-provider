@@ -5,7 +5,7 @@ import { parseCommand } from "./config.ts"
 import { StreamFrameParser, openAIChatSSEChunks, type BrowserFrame } from "./protocol.ts"
 
 test("current DOM guardrail is captured without waiting for answer stability or send controls", async () => {
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected serve settings")
   const browser = await chromium.launch({ executablePath: command.settings.chromeExecutable, headless: true })
   try {
@@ -48,7 +48,7 @@ test("interleaved fetch readers retain each UTF-8 body and the native reasoning/
     if (path === "/quota") return new Response(quota, { headers: { "content-type": "application/json" } })
     return new Response("<!doctype html><html><body>Local capture fixture</body></html>", { headers: { "content-type": "text/html" } })
   } })
-  const command = parseCommand(["start"], {}, { verifyChrome: false })
+  const command = parseCommand(["start"], { verifyChrome: false })
   if (command.type !== "serve") throw Error("expected serve settings")
   const browser = await chromium.launch({ executablePath: command.settings.chromeExecutable, headless: true })
   try {

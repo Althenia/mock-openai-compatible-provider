@@ -24,8 +24,8 @@ sources:
   resource: repo:///docs/releases/v0.1.4.md
   title: v0.1.4 validation boundary
 - id: current-release
-  resource: repo:///docs/releases/v0.1.5.md
-  title: v0.1.5 release scope and validation
+  resource: repo:///docs/releases/v0.1.6.md
+  title: v0.1.6 release scope and validation
 ---
 
 # Agreement
@@ -38,11 +38,11 @@ The v0.1.3 note records the local checks actually run, the single bounded real-c
 
 The v0.1.4 note separates selected local checks from its completed GitHub candidate workflow, which passed the full suite including browser fixtures; those results describe that historical release, not later changes.[^unit-boundary]
 
-The v0.1.5 note records request-driven tool-envelope normalization, fresh derived keys, reference-only retries, and local validation. The title/main-session initialization issue remains a stated limitation because caller-side isolation was not installed. Publication still requires version/tag agreement and successful gated workflows.[^current-release][^release-ci]
+The v0.1.6 note records native-home file configuration, direct ordered caller instructions and effective offered schemas, and a key-referenced envelope-format correction that preserves authorization, safety, action authorization, and cancellation behavior. Its local checks do not establish live-model reliability or billing accuracy; publication still requires version/tag agreement and successful gated workflows.[^current-release][^release-ci]
 
 # Rollback
 
-Rollback stops the provider, reinstalls the pinned prior version, and restarts with the same configuration and state directories without deleting browser credentials or session state; in-memory Responses IDs do not survive a restart.[^releases]
+Rollback stops the provider, reinstalls the pinned prior version, and restarts only after reviewing that version's configuration and default-path behavior; do not delete browser credentials or session state.[^current-release]
 
 See also: [CLI lifecycle](../operations/cli-lifecycle.md) and [Model catalog](../runtime/model-catalog.md).
 
@@ -50,4 +50,4 @@ See also: [CLI lifecycle](../operations/cli-lifecycle.md) and [Model catalog](..
 [^operations]: Operations and client setup
 [^releases]: v0.1.3 release notes
 [^unit-boundary]: v0.1.4 validation boundary
-[^current-release]: v0.1.5 release scope and validation
+[^current-release]: v0.1.6 release scope and validation
