@@ -38,7 +38,7 @@ Exact complete instruction-body repeats and exact available_skills/mcp_instructi
 
 # Replay and omission
 
-Unchanged bound turns send only the latest task/result delta with a turn key and any required tool-choice constraint. The recurring envelope guard is declared only during initialization; submission wrapping adds the key, not protocol text.[^runtime-guide][^submission] Initialization replays after recovery, changed instructions or schemas, model or reasoning-variant switches, compaction, and newly opened pages; task and correction prompts do not repeat the role or schema catalog.[^runtime-guide] Explicit instruction_mode: action-only omits caller instruction text, and switching an existing affinity from preserve to action-only starts a fresh remote conversation.[^runtime-guide] Serial startup delivery was introduced in v0.1.3.[^releases]
+Unchanged bound turns send only the latest task/result delta with a fresh turn key, the short every-turn guard, and any required tool-choice constraint. Submission wrapping adds the guard when absent and does not repeat the full initialization.[^runtime-guide][^submission] Initialization replays after recovery, changed instructions or schemas, model or reasoning-variant switches, compaction, and newly opened pages; task and correction prompts do not repeat the role or schema catalog.[^runtime-guide] Explicit instruction_mode: action-only omits caller instruction text, and switching an existing affinity from preserve to action-only starts a fresh remote conversation.[^runtime-guide] Serial startup delivery was introduced in v0.1.3.[^releases]
 
 # Compaction and estimate
 

@@ -361,6 +361,9 @@ function withRetryReference(failed: ProjectedTurn): ProjectedTurn {
 function declaredFromEnvelopeValue(value: unknown): Array<{ readonly name: string; readonly input: unknown }> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return []
   const item = value as Record<string, unknown>
+  // Tool-named envelopes are normalized by the protocol parser. Their
+  // arguments belong to the harness validator, not schema provisioning.
+  if (typeof item.type === "string" && !isActionEnvelopeType(item.type)) return []
   if (typeof item.type !== "string") {
     // Typeless tool envelope (live terra omits "type"): same rule as
     // protocol — valid name plus id/key/input presence.
@@ -368,7 +371,6 @@ function declaredFromEnvelopeValue(value: unknown): Array<{ readonly name: strin
     if (item.id === undefined && item.key === undefined && item.input === undefined) return []
     return [{ name: item.name, input: item.input ?? {} }]
   }
-  if (item.type === "chat") return []
   if (item.type === "plan") {
     if (!Array.isArray(item.steps)) return []
     const steps: Array<{ readonly name: string; readonly input: unknown }> = []
@@ -969,10 +971,11 @@ export async function* repairToolRefusal(
     yield* buffered
     return
   }
+  const offered = new Set(offeredActions)
   const typedAction = extractJsonObjects(responseText(buffered)).some((value) => {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return false
     const type = (value as Record<string, unknown>).type
-    return isActionEnvelopeType(type)
+    return isActionEnvelopeType(type, offered)
   })
   if (typedAction) {
     yield* buffered

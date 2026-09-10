@@ -459,6 +459,32 @@ async function launchFixture(pages: FixturePage[], overrides: Partial<AttemptLif
   return { adapter, collect, created, contextCloses: () => contextCloses, restore: () => launch.mockRestore() }
 }
 
+test("completed tool-named response settles its browser attempt without DOM fallback or resubmission", async () => {
+  const page = new FixturePage("capture", "complete")
+  const text = [
+    { type: "thinking", key: "fixture-key", id: "r", text: "Preparing changes." },
+    { type: "edit", key: "fixture-key", id: "e", filePath: "fixture.md", oldString: "before", newString: "after" },
+  ].map(value => JSON.stringify(value)).join("")
+  const send = spyOn(page, "send").mockImplementation(async () => {
+    page.sendCalls++
+    page.submitted.resolve()
+    await page.reply(text)
+  })
+  const statuses: string[] = []
+  const fixture = await launchFixture([page], {
+    async pending() { statuses.push("pending") },
+    async complete() { statuses.push("complete") },
+    async fail() { statuses.push("failed") },
+  })
+  try {
+    expect(await fixture.collect({ ...turn, promptKey: "fixture-key" })).toEqual([
+      { type: "text", delta: text }, { type: "finish", reason: "stop" },
+    ])
+    expect(statuses).toEqual(["pending", "complete"])
+    expect(page.sendCalls).toBe(1)
+  } finally { await fixture.adapter.close(); fixture.restore(); send.mockRestore() }
+})
+
 for (const priming of [false, true]) test(`incomplete DOM guardrail stops ${priming ? "startup" : "task"} before any fallback read`, async () => {
   const page = new FixturePage("capture", "complete")
   const fixture = await launchFixture([page])

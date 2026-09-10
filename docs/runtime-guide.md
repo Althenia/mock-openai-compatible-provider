@@ -70,6 +70,21 @@ single-envelope malformed-text recovery. After reasoning progress, strict
 runtime validation rejects invalid trailing actions rather than absorbing them
 into chat prose. Single chat/thinking envelopes with unescaped prose quotes
 retain narrow text recovery; non-strict fallback behavior is unchanged.
+Tool names are supplied by the calling harness, not a provider-maintained list.
+The canonical action shape remains `type: "tool"`, `name`, and object-valued
+`input`. A model response may also use an exact offered tool name as `type`,
+with the current `key`, a valid call `id`, and either object-valued `input` or
+flattened arguments. AIPass normalizes that shape into a standard tool call;
+it rejects unoffered names, invalid transport fields, and mixed nested/flattened
+arguments rather than guessing. Reserved envelope types keep their existing
+meaning; a tool sharing a reserved name must use the canonical tool shape.
+Normalized tool-named arguments pass unchanged to the harness for schema
+validation, permissions, execution, and results, without a provider argument-
+correction submission. Receiving a call is not evidence of successful execution.
+Completed tool-named chains are recognized by browser completion tracking before
+runtime validation; they do not wait for DOM fallback solely because their type
+is a tool name. Ambiguous submitted attempts still fail closed.
+
 An answer-shaped object that omits only `type` is decoded as chat text when it
 has a nonempty turn key, an `answer_*` ID, nonempty text, and no action fields.
 Turn-key validation still applies; arbitrary JSON is not treated as an answer
@@ -102,8 +117,8 @@ initialization/contracts, model or reasoning-variant switches, compaction, and
 newly opened pages require initialization again before the task. This relies on
 the webchat retaining initialization context; it is not a guarantee of model
 compliance. Each initialization, task, result, repair, and correction submission
-carries its current `TURN KEY`. The envelope guard is declared in initialization
-only; submission wrapping never injects it into task or progress data. Prompt
+carries its current `TURN KEY` and the short every-turn envelope guard. Submission
+wrapping adds the guard when absent without repeating the full initialization. Prompt
 projection logs contain only action names and character counts, never prompt
 content.
 

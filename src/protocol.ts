@@ -188,9 +188,19 @@ export const ENVELOPE_OPEN = "<aipass-envelope>"
 export const ENVELOPE_CLOSE = "</aipass-envelope>"
 const ENVELOPE_TYPES = new Set(["chat", "tool", "plan", "subagent", "skill", "question", "permission", "thinking"])
 
-export function isActionEnvelopeType(value: unknown): boolean {
-  return typeof value === "string" && ENVELOPE_TYPES.has(value) && value !== "chat" && value !== "thinking"
+export function isActionEnvelopeType(value: unknown, offered?: ReadonlySet<string>): boolean {
+  return typeof value === "string" && value !== "chat" && value !== "thinking" &&
+    (ENVELOPE_TYPES.has(value) || offered?.has(value) === true)
 }
+
+// Shape recognition does not authorize dispatch. The request's offered names
+// are checked by parseTypedEnvelope before a tool-named object becomes a call.
+function toolNamedEnvelope(item: Record<string, unknown>): boolean {
+  return typeof item.type === "string" && NAME.test(item.type) && !ENVELOPE_TYPES.has(item.type) &&
+    (item.key !== undefined || item.id !== undefined)
+}
+
+class ToolNamedEnvelopeError extends Error {}
 
 function envelopeInput(value: unknown): Record<string, unknown> {
   const input = record(value)
@@ -297,6 +307,21 @@ export function parseTypedEnvelope(value: unknown, offered: ReadonlySet<string>)
   if (!item) return undefined
   const rawType = item.type
   if (typeof rawType !== "string" || !ENVELOPE_TYPES.has(rawType)) {
+    if (toolNamedEnvelope(item)) {
+      // Preserve the existing ordinary answer-shaped JSON fallback when its
+      // unknown type is not an offered tool; never turn it into an action.
+      if (typeof rawType === "string" && !offered.has(rawType) && missingTypeAnswerText({ ...item, type: undefined }) !== undefined)
+        return undefined
+      if (typeof rawType !== "string" || !offered.has(rawType)) throw new ToolNamedEnvelopeError(`tool ${String(rawType)} was not offered`)
+      if (typeof item.key !== "string" || !item.key || typeof item.id !== "string" || !NAME.test(item.id))
+        throw new ToolNamedEnvelopeError("tool-named envelope key and id must be non-empty valid strings")
+      const { type: _type, key: _key, id: _id, input, ...flat } = item
+      if (Object.hasOwn(item, "input") && Object.keys(flat).length)
+        throw new ToolNamedEnvelopeError("tool-named envelope has conflicting nested and flattened input")
+      if (Object.hasOwn(item, "input") && !record(input))
+        throw new ToolNamedEnvelopeError("tool-named envelope input must be an object")
+      return [{ type: "tool-call", id: item.id, name: rawType, input: Object.hasOwn(item, "input") ? envelopeInput(input) : flat }]
+    }
     const answer = missingTypeAnswerText(item)
     if (answer !== undefined) {
       console.error("aipass envelope type=chat missing-type")
@@ -410,7 +435,7 @@ export function envelopeKeys(text: string): string[] {
     if (!item) continue
     const itemType = item.type
     if (typeof itemType !== "string" || !ENVELOPE_TYPES.has(itemType)) {
-      if (missingTypeAnswerText(item) !== undefined) {
+      if (missingTypeAnswerText(item) !== undefined || toolNamedEnvelope(item)) {
         const key = item.key
         if (typeof key === "string" && key) keys.push(key)
         continue
@@ -469,6 +494,7 @@ export function hasEnvelopeShape(text: string): boolean {
     if (!shaped) return false
     const type = shaped.type
     if (typeof type === "string" && ENVELOPE_TYPES.has(type)) return true
+    if (toolNamedEnvelope(shaped)) return true
     if (missingTypeAnswerText(shaped) !== undefined) return true
     // Typeless tool envelope (live terra omits "type").
     if (typeof shaped.name !== "string" || !NAME.test(shaped.name)) return false
@@ -493,6 +519,7 @@ function completionEnvelopes(text: string): Record<string, unknown>[] {
   if (!values.length) return []
   if (!values.every((item) => item && (
     typeof item.type === "string" && ENVELOPE_TYPES.has(item.type) ||
+    toolNamedEnvelope(item) && typeof item.key === "string" && !!item.key && typeof item.id === "string" && NAME.test(item.id) ||
     missingTypeAnswerText(item) !== undefined ||
     typeof item.name === "string" && NAME.test(item.name) &&
       (item.id !== undefined || item.key !== undefined || item.input !== undefined)
@@ -563,9 +590,10 @@ function hasIncompleteBareEnvelope(text: string): boolean {
     }
     const candidate = text.slice(i)
     const typed = /"type"\s*:\s*"(?:chat|tool|plan|subagent|skill|question|permission|thinking)"/.test(candidate)
+    const toolNamed = /"type"\s*:\s*"[A-Za-z0-9_.:-]{1,128}"/.test(candidate) && /"(?:key|id)"\s*:/.test(candidate)
     const typeless = /"name"\s*:\s*"[A-Za-z][A-Za-z0-9_-]*"/.test(candidate) &&
       /"(?:id|key|input)"\s*:/.test(candidate)
-    return typed || typeless
+    return typed || toolNamed || typeless
   }
   return false
 }
@@ -589,7 +617,7 @@ export function envelopesMatchTurnKey(text: string, expectedKey: string): boolea
   for (const value of scanJsonObjects(remaining)) {
     const item = record(value)
     if (!item) continue
-    const typed = typeof item.type === "string" && ENVELOPE_TYPES.has(item.type)
+    const typed = typeof item.type === "string" && ENVELOPE_TYPES.has(item.type) || toolNamedEnvelope(item)
     const typeless = missingTypeAnswerText(item) !== undefined ||
       typeof item.name === "string" && NAME.test(item.name) &&
       (item.id !== undefined || item.key !== undefined || item.input !== undefined)
@@ -766,7 +794,7 @@ export class TypedEnvelopeShim {
       try {
         parsed = parseTypedEnvelope(value, this.allowed)
       } catch (error) {
-        if (this.strictBareChains) throw error
+        if (this.strictBareChains || error instanceof ToolNamedEnvelopeError) throw error
         // Fail-open: a bare chain naming an unoffered/invalid tool is model
         // prose, not a stream-killing error. Live evidence: a hallucinated
         // {"type":"tool","name":"document_fetcher"} inside a bare chain threw
